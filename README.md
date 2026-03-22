@@ -66,13 +66,9 @@ The CLI auto-generates a Nostr identity at `~/.paygress/identity` on first use.
 ssh -p <PORT> root@<PROVIDER_IP>
 ```
 
-### 4. Top up or check status
+### 4. Check status
 
 ```bash
-# Extend your workload
-paygress-cli topup --pod-id <ID> --provider <NPUB> --token "cashuA..."
-
-# Check remaining time
 paygress-cli status --pod-id <ID> --provider <NPUB>
 ```
 
