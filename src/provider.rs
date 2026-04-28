@@ -605,7 +605,7 @@ async fn handle_spawn_request(
     };
 
     // 5. Generate credentials
-    let password = crate::sidecar_service::SidecarState::generate_password();
+    let password = generate_password();
 
     // Calculate host port for forwarding
     let host_port = match config.ssh_port_start {
@@ -914,6 +914,22 @@ async fn handle_topup_request(
         request.pod_npub, extension_secs, new_expires_at
     );
     Ok(())
+}
+
+/// Generate a 16-character alphanumeric SSH password. Lives here
+/// (rather than `sidecar_service`) so the Nostr-DM canonical path
+/// doesn't depend on the legacy K8s pipeline that Unit 7 gates
+/// behind the `kubernetes` Cargo feature.
+fn generate_password() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..16)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
 /// Parse a pod identifier emitted by the spawn handler back into the

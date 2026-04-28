@@ -1,23 +1,36 @@
 // Paygress Library
 //
-// Exports modules for use in binaries
-// Payment verification handled by ngx_l402 at nginx layer
+// Exports modules for use in binaries.
+//
+// Architecture notes:
+// - **Canonical control plane (default)**: Nostr NIP-17 →
+//   `ProviderService` → `ProxmoxClient` / `LxdBackend`. Always
+//   compiled.
+// - **Legacy K8s + ngx_l402 + HTTP control plane** (gated behind the
+//   `kubernetes` Cargo feature, off by default since Unit 7): nginx
+//   + ngx_l402 → `PodProvisioningService`. Kept compilable so
+//   existing K8s users can opt back in with
+//   `--features kubernetes`, but no longer in the default build
+//   path so engineering capacity flows to the canonical plane.
 
-// Core modules
+// Core modules — always compiled.
 pub mod cashu;
 pub mod nostr;
-pub mod pod_provisioning;
-pub mod sidecar_service;
 
-// Proxmox integration modules
+// Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;
 pub mod discovery;
 pub mod lxd;
 pub mod provider;
 pub mod proxmox;
 
-// Re-export public types and functions
-pub use cashu::initialize_cashu;
+// Legacy K8s pipeline — feature-gated behind `kubernetes`.
+#[cfg(feature = "kubernetes")]
+pub mod pod_provisioning;
+#[cfg(feature = "kubernetes")]
+pub mod sidecar_service;
+
+// Re-export public types and functions (always-compiled surface).
 pub use compute::{ComputeBackend, ContainerConfig, NodeStatus};
 pub use discovery::DiscoveryClient;
 pub use lxd::LxdBackend;
@@ -31,6 +44,6 @@ pub use nostr::{
 pub use provider::{ProviderConfig, ProviderService};
 pub use proxmox::ProxmoxClient;
 
-// Architecture notes:
-// - K8s mode: nginx + ngx_l402 → PodProvisioningService
-// - Proxmox mode: Nostr NIP-17 → ProviderService → ProxmoxClient
+// K8s-only re-export.
+#[cfg(feature = "kubernetes")]
+pub use cashu::initialize_cashu;
