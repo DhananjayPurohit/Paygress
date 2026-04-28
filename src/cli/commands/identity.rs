@@ -14,7 +14,8 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 
 pub fn parse_relays(relays: Option<String>) -> Vec<String> {
     match relays {
-        Some(r) => r.split(',')
+        Some(r) => r
+            .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect(),
@@ -27,7 +28,8 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
         return Ok(key);
     }
 
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        std::env::var("HOME").map_err(|_| anyhow::anyhow!("Could not determine home directory"))?;
     let paygress_dir = Path::new(&home).join(".paygress");
     if !paygress_dir.exists() {
         std::fs::create_dir_all(&paygress_dir)?;
@@ -36,12 +38,18 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
     let identity_file = paygress_dir.join("identity");
     if identity_file.exists() {
         let key = std::fs::read_to_string(&identity_file)?.trim().to_string();
-        println!("  Using identity from {}", identity_file.display().to_string().dimmed());
+        println!(
+            "  Using identity from {}",
+            identity_file.display().to_string().dimmed()
+        );
         return Ok(key);
     }
 
     // Generate new key
-    println!("{}", "  No identity found. Generating new Nostr identity...".yellow());
+    println!(
+        "{}",
+        "  No identity found. Generating new Nostr identity...".yellow()
+    );
     let keys = Keys::generate();
     let nsec = keys.secret_key()?.to_bech32()?;
 
@@ -58,7 +66,11 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
         file.set_permissions(perms)?;
     }
 
-    println!("  {} Created new identity at {}", "✓".green(), identity_file.display());
+    println!(
+        "  {} Created new identity at {}",
+        "✓".green(),
+        identity_file.display()
+    );
     println!("  {} {}", "NSEC:".bold(), nsec.red());
     println!("  {}", "Make sure to back up this key!".yellow());
     println!();

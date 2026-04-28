@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::nostr::{
-    NostrRelaySubscriber, RelayConfig, ProviderOfferContent, ProviderInfo, 
-    ProviderFilter, PodSpec,
+    NostrRelaySubscriber, PodSpec, ProviderFilter, ProviderInfo, ProviderOfferContent, RelayConfig,
 };
 
 /// Discovery client for finding providers
@@ -24,9 +23,9 @@ impl DiscoveryClient {
             relays,
             private_key: None, // Read-only client doesn't need a key
         };
-        
+
         let nostr = NostrRelaySubscriber::new(config).await?;
-        
+
         Ok(Self { nostr })
     }
 
@@ -36,9 +35,9 @@ impl DiscoveryClient {
             relays,
             private_key: Some(private_key),
         };
-        
+
         let nostr = NostrRelaySubscriber::new(config).await?;
-        
+
         Ok(Self { nostr })
     }
 
@@ -48,15 +47,21 @@ impl DiscoveryClient {
     }
 
     /// List all available providers
-    pub async fn list_providers(&self, filter: Option<ProviderFilter>) -> Result<Vec<ProviderInfo>> {
+    pub async fn list_providers(
+        &self,
+        filter: Option<ProviderFilter>,
+    ) -> Result<Vec<ProviderInfo>> {
         let offers = self.nostr.query_providers().await?;
-        
+
         let mut providers = Vec::new();
-        
+
         // Optimisation: Fetch all heartbeats in parallel (batch query)
         let provider_npubs: Vec<String> = offers.iter().map(|o| o.provider_npub.clone()).collect();
-        let heartbeats = self.nostr.get_latest_heartbeats_multi(provider_npubs).await?;
-        
+        let heartbeats = self
+            .nostr
+            .get_latest_heartbeats_multi(provider_npubs)
+            .await?;
+
         for offer in offers {
             // Check if provider is online (has recent heartbeat)
             let (is_online, last_seen) = match heartbeats.get(&offer.provider_npub) {
@@ -70,8 +75,6 @@ impl DiscoveryClient {
                 }
                 None => (false, 0),
             };
-
-
 
             let provider = ProviderInfo {
                 npub: offer.provider_npub.clone(),
@@ -135,7 +138,8 @@ impl DiscoveryClient {
 
         // try prefix match if long enough
         if lookup_hex.len() >= 8 {
-            let matches: Vec<&ProviderInfo> = providers.iter()
+            let matches: Vec<&ProviderInfo> = providers
+                .iter()
                 .filter(|p| p.npub.starts_with(&lookup_hex))
                 .collect();
 
@@ -176,14 +180,24 @@ impl DiscoveryClient {
         match sort_by {
             "price" => {
                 providers.sort_by(|a, b| {
-                    let a_rate = a.specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(u64::MAX);
-                    let b_rate = b.specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(u64::MAX);
+                    let a_rate = a
+                        .specs
+                        .first()
+                        .map(|s| s.rate_msats_per_sec)
+                        .unwrap_or(u64::MAX);
+                    let b_rate = b
+                        .specs
+                        .first()
+                        .map(|s| s.rate_msats_per_sec)
+                        .unwrap_or(u64::MAX);
                     a_rate.cmp(&b_rate)
                 });
             }
             "uptime" => {
                 providers.sort_by(|a, b| {
-                    b.uptime_percent.partial_cmp(&a.uptime_percent).unwrap_or(std::cmp::Ordering::Equal)
+                    b.uptime_percent
+                        .partial_cmp(&a.uptime_percent)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
             "capacity" => {
@@ -203,26 +217,34 @@ impl DiscoveryClient {
     /// Format provider list for display
     pub fn format_provider_table(providers: &[ProviderInfo]) -> String {
         use std::fmt::Write;
-        
+
         let mut output = String::new();
-        
+
         writeln!(&mut output, "┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
-        writeln!(&mut output, "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^6} │", 
-            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "LXC/VM", "ONLINE").unwrap();
+        writeln!(
+            &mut output,
+            "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^6} │",
+            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "LXC/VM", "ONLINE"
+        )
+        .unwrap();
         writeln!(&mut output, "├──────────────────────────────────────────────────────────────────────────────────────────────────────┤").unwrap();
-        
+
         for p in providers {
             let id = truncate_str(&p.npub, 16);
             let location = p.location.as_deref().unwrap_or("Unknown");
-            let cheapest = p.specs.iter()
+            let cheapest = p
+                .specs
+                .iter()
                 .map(|s| s.rate_msats_per_sec)
                 .min()
                 .map(|r| format!("{}m/s", r))
                 .unwrap_or_else(|| "-".to_string());
             let capabilities = p.capabilities.join("/");
             let online = if p.is_online { "✓" } else { "✗" };
-            
-            writeln!(&mut output, "│ {:16} │ {:18} │ {:^10} │ {:>6.1}% │ {:>8} │ {:^10} │ {:^6} │",
+
+            writeln!(
+                &mut output,
+                "│ {:16} │ {:18} │ {:^10} │ {:>6.1}% │ {:>8} │ {:^10} │ {:^6} │",
                 id,
                 truncate_str(&p.hostname, 18),
                 truncate_str(location, 10),
@@ -230,46 +252,105 @@ impl DiscoveryClient {
                 cheapest,
                 capabilities,
                 online
-            ).unwrap();
+            )
+            .unwrap();
         }
-        
+
         writeln!(&mut output, "└──────────────────────────────────────────────────────────────────────────────────────────────────────┘").unwrap();
-        
+
         output
     }
 
     /// Format single provider details
     pub fn format_provider_details(provider: &ProviderInfo) -> String {
         use std::fmt::Write;
-        
+
         let mut output = String::new();
-        
-        writeln!(&mut output, "┌────────────────────────────────────────────────────────────┐").unwrap();
-        writeln!(&mut output, "│ Provider: {}",  provider.hostname).unwrap();
-        writeln!(&mut output, "├────────────────────────────────────────────────────────────┤").unwrap();
-        writeln!(&mut output, "│ NPUB:       {}", truncate_str(&provider.npub, 45)).unwrap();
-        writeln!(&mut output, "│ Location:   {}", provider.location.as_deref().unwrap_or("Unknown")).unwrap();
+
+        writeln!(
+            &mut output,
+            "┌────────────────────────────────────────────────────────────┐"
+        )
+        .unwrap();
+        writeln!(&mut output, "│ Provider: {}", provider.hostname).unwrap();
+        writeln!(
+            &mut output,
+            "├────────────────────────────────────────────────────────────┤"
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "│ NPUB:       {}",
+            truncate_str(&provider.npub, 45)
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "│ Location:   {}",
+            provider.location.as_deref().unwrap_or("Unknown")
+        )
+        .unwrap();
         writeln!(&mut output, "│ Uptime:     {:.1}%", provider.uptime_percent).unwrap();
-        writeln!(&mut output, "│ Jobs Done:  {}", provider.total_jobs_completed).unwrap();
-        writeln!(&mut output, "│ Status:     {}", if provider.is_online { "🟢 Online" } else { "🔴 Offline" }).unwrap();
-        writeln!(&mut output, "│ Supports:   {}", provider.capabilities.join(", ")).unwrap();
-        writeln!(&mut output, "├────────────────────────────────────────────────────────────┤").unwrap();
+        writeln!(
+            &mut output,
+            "│ Jobs Done:  {}",
+            provider.total_jobs_completed
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "│ Status:     {}",
+            if provider.is_online {
+                "🟢 Online"
+            } else {
+                "🔴 Offline"
+            }
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "│ Supports:   {}",
+            provider.capabilities.join(", ")
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "├────────────────────────────────────────────────────────────┤"
+        )
+        .unwrap();
         writeln!(&mut output, "│ Available Tiers:").unwrap();
-        
+
         for spec in &provider.specs {
-            writeln!(&mut output, "│   • {} ({}) - {} msat/sec",
-                spec.name, spec.id, spec.rate_msats_per_sec).unwrap();
-            writeln!(&mut output, "│     {} vCPU, {} MB RAM",
-                spec.cpu_millicores / 1000, spec.memory_mb).unwrap();
+            writeln!(
+                &mut output,
+                "│   • {} ({}) - {} msat/sec",
+                spec.name, spec.id, spec.rate_msats_per_sec
+            )
+            .unwrap();
+            writeln!(
+                &mut output,
+                "│     {} vCPU, {} MB RAM",
+                spec.cpu_millicores / 1000,
+                spec.memory_mb
+            )
+            .unwrap();
         }
-        
-        writeln!(&mut output, "├────────────────────────────────────────────────────────────┤").unwrap();
+
+        writeln!(
+            &mut output,
+            "├────────────────────────────────────────────────────────────┤"
+        )
+        .unwrap();
         writeln!(&mut output, "│ Accepted Mints:").unwrap();
         for mint in &provider.whitelisted_mints {
             writeln!(&mut output, "│   • {}", mint).unwrap();
         }
-        writeln!(&mut output, "└────────────────────────────────────────────────────────────┘").unwrap();
-        
+        writeln!(
+            &mut output,
+            "└────────────────────────────────────────────────────────────┘"
+        )
+        .unwrap();
+
         output
     }
 }
@@ -289,27 +370,25 @@ mod tests {
 
     #[test]
     fn test_format_provider_table() {
-        let providers = vec![
-            ProviderInfo {
-                npub: "npub123".to_string(),
-                hostname: "Test Provider".to_string(),
-                location: Some("US-East".to_string()),
-                capabilities: vec!["lxc".to_string()],
-                specs: vec![PodSpec {
-                    id: "basic".to_string(),
-                    name: "Basic".to_string(),
-                    description: "Test".to_string(),
-                    cpu_millicores: 1000,
-                    memory_mb: 1024,
-                    rate_msats_per_sec: 50,
-                }],
-                whitelisted_mints: vec![],
-                uptime_percent: 99.5,
-                total_jobs_completed: 10,
-                last_seen: 0,
-                is_online: true,
-            }
-        ];
+        let providers = vec![ProviderInfo {
+            npub: "npub123".to_string(),
+            hostname: "Test Provider".to_string(),
+            location: Some("US-East".to_string()),
+            capabilities: vec!["lxc".to_string()],
+            specs: vec![PodSpec {
+                id: "basic".to_string(),
+                name: "Basic".to_string(),
+                description: "Test".to_string(),
+                cpu_millicores: 1000,
+                memory_mb: 1024,
+                rate_msats_per_sec: 50,
+            }],
+            whitelisted_mints: vec![],
+            uptime_percent: 99.5,
+            total_jobs_completed: 10,
+            last_seen: 0,
+            is_online: true,
+        }];
 
         let table = DiscoveryClient::format_provider_table(&providers);
         assert!(table.contains("Test Provider"));

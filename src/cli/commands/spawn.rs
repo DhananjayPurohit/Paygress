@@ -10,18 +10,20 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 
-use super::identity::{parse_relays, get_or_create_identity};
+use super::identity::{get_or_create_identity, parse_relays};
 use crate::api::{PaygressClient, SpawnRequest};
 use paygress::discovery::DiscoveryClient;
-use paygress::nostr::{EncryptedSpawnPodRequest, AccessDetailsContent, ErrorResponseContent};
+use paygress::nostr::{AccessDetailsContent, EncryptedSpawnPodRequest, ErrorResponseContent};
 
 fn generate_password(len: usize) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
-    (0..len).map(|_| {
-        let idx = rng.gen_range(0..CHARSET.len());
-        CHARSET[idx] as char
-    }).collect()
+    (0..len)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
 #[derive(Args)]
@@ -66,7 +68,10 @@ pub struct SpawnArgs {
 pub async fn execute(mut args: SpawnArgs, verbose: bool) -> Result<()> {
     // Auto-generate SSH credentials if not provided
     let ssh_user = args.ssh_user.take().unwrap_or_else(|| "user".to_string());
-    let ssh_pass = args.ssh_pass.take().unwrap_or_else(|| generate_password(16));
+    let ssh_pass = args
+        .ssh_pass
+        .take()
+        .unwrap_or_else(|| generate_password(16));
 
     // If --provider is given, use Nostr mode
     if args.provider.is_some() {
@@ -75,13 +80,20 @@ pub async fn execute(mut args: SpawnArgs, verbose: bool) -> Result<()> {
     }
 
     // Otherwise require --server for HTTP mode
-    let server = args.server.clone()
-        .ok_or_else(|| anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required"))?;
+    let server = args.server.clone().ok_or_else(|| {
+        anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required")
+    })?;
 
     execute_http_spawn(&server, args, ssh_user, ssh_pass, verbose).await
 }
 
-async fn execute_http_spawn(server: &str, args: SpawnArgs, ssh_user: String, ssh_pass: String, verbose: bool) -> Result<()> {
+async fn execute_http_spawn(
+    server: &str,
+    args: SpawnArgs,
+    ssh_user: String,
+    ssh_pass: String,
+    verbose: bool,
+) -> Result<()> {
     if verbose {
         println!("{} Spawning pod via HTTP...", "->".blue());
         println!("  Server: {}", server);
@@ -93,7 +105,7 @@ async fn execute_http_spawn(server: &str, args: SpawnArgs, ssh_user: String, ssh
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     spinner.set_message("Connecting to Paygress server...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -125,7 +137,8 @@ async fn execute_http_spawn(server: &str, args: SpawnArgs, ssh_user: String, ssh
         }
         if let Some(host) = &response.ssh_host {
             if let Some(port) = response.ssh_port {
-                println!("  {} ssh {}@{} -p {}",
+                println!(
+                    "  {} ssh {}@{} -p {}",
                     "SSH:".bold(),
                     response.ssh_username.as_deref().unwrap_or("user"),
                     host,
@@ -143,17 +156,32 @@ async fn execute_http_spawn(server: &str, args: SpawnArgs, ssh_user: String, ssh
         }
 
         println!();
-        println!("{}", "Tip: Use 'paygress-cli status --pod-id <ID> --server <URL>' to check status".dimmed());
-        println!("{}", "Tip: Use 'paygress-cli topup --pod-id <ID> --server <URL> --token <TOKEN>' to extend".dimmed());
+        println!(
+            "{}",
+            "Tip: Use 'paygress-cli status --pod-id <ID> --server <URL>' to check status".dimmed()
+        );
+        println!(
+            "{}",
+            "Tip: Use 'paygress-cli topup --pod-id <ID> --server <URL> --token <TOKEN>' to extend"
+                .dimmed()
+        );
     } else {
-        let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+        let error_msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
         return Err(anyhow::anyhow!("Failed to spawn pod: {}", error_msg));
     }
 
     Ok(())
 }
 
-async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, ssh_user: String, ssh_pass: String, verbose: bool) -> Result<()> {
+async fn execute_nostr_spawn(
+    provider_npub: String,
+    args: SpawnArgs,
+    ssh_user: String,
+    ssh_pass: String,
+    verbose: bool,
+) -> Result<()> {
     println!("{}", "Spawning Workload".blue().bold());
     println!("{}", "-".repeat(50).blue());
     println!();
@@ -178,17 +206,31 @@ async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, ssh_user: S
     println!("{}", "ONLINE".green());
 
     // Get provider info and verify tier
-    let provider = client.get_provider(&provider_npub).await?
+    let provider = client
+        .get_provider(&provider_npub)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
 
-    let spec = provider.specs.iter()
+    let spec = provider
+        .specs
+        .iter()
         .find(|s| s.id == args.tier)
         .ok_or_else(|| anyhow::anyhow!("Tier '{}' not available on this provider", args.tier))?;
 
-    println!("  {} Found tier: {} ({} msat/sec)", "OK".green(), spec.name, spec.rate_msats_per_sec);
+    println!(
+        "  {} Found tier: {} ({} msat/sec)",
+        "OK".green(),
+        spec.name,
+        spec.rate_msats_per_sec
+    );
 
     // Build and send spawn request
-    println!("  {} user: {}, pass: {}", "SSH Credentials:".bold(), ssh_user.cyan(), ssh_pass.cyan());
+    println!(
+        "  {} user: {}, pass: {}",
+        "SSH Credentials:".bold(),
+        ssh_user.cyan(),
+        ssh_pass.cyan()
+    );
 
     let request = EncryptedSpawnPodRequest {
         cashu_token: args.token.clone(),
@@ -202,17 +244,20 @@ async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, ssh_user: S
     print!("  Sending spawn request... ");
 
     let request_json = serde_json::to_string(&request)?;
-    let _event_id = client.nostr().send_encrypted_private_message(
-        &provider.npub,
-        request_json,
-        "nip04",
-    ).await?;
+    let _event_id = client
+        .nostr()
+        .send_encrypted_private_message(&provider.npub, request_json, "nip04")
+        .await?;
 
     println!("{}", "SENT".green());
     println!();
     println!("  Waiting for provider to provision container (timeout: 120s)...");
 
-    match client.nostr().wait_for_decrypted_message(&provider.npub, 120).await {
+    match client
+        .nostr()
+        .wait_for_decrypted_message(&provider.npub, 120)
+        .await
+    {
         Ok(response) => {
             println!();
             println!("{}", "-".repeat(50).blue());
@@ -222,13 +267,19 @@ async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, ssh_user: S
                 println!();
                 println!("  {}   {}", "Pod ID:".bold(), access.pod_npub.cyan());
                 println!("  {}   {}", "Expires:".bold(), access.expires_at.yellow());
-                println!("  {}   {} vCPU, {} MB RAM", "Spec:".bold(), access.cpu_millicores / 1000, access.memory_mb);
+                println!(
+                    "  {}   {} vCPU, {} MB RAM",
+                    "Spec:".bold(),
+                    access.cpu_millicores / 1000,
+                    access.memory_mb
+                );
                 println!();
                 println!("{}", "Connection Instructions:".bold());
                 for inst in access.instructions {
                     println!("  - {}", inst);
                 }
-            } else if let Ok(err) = serde_json::from_str::<ErrorResponseContent>(&response.content) {
+            } else if let Ok(err) = serde_json::from_str::<ErrorResponseContent>(&response.content)
+            {
                 println!("{}", "Provider Error".red().bold());
                 println!();
                 println!("  Type:    {}", err.error_type);

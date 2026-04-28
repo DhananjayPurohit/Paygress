@@ -3,8 +3,8 @@
 // Provides token amount extraction only
 // Payment verification handled by ngx_l402 at nginx layer
 
-use std::sync::{Arc, OnceLock};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 const MSAT_PER_SAT: u64 = 1000;
 
@@ -18,7 +18,7 @@ pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
             tracing::debug!("Cashu database initialized at: {}", db_path);
             let _ = CASHU_DB.set(Arc::new(db));
             Ok(())
-        },
+        }
         Err(e) => {
             let error = format!("Failed to create Cashu database: {:?}", e);
             tracing::error!("{}", error);
@@ -33,21 +33,25 @@ pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
 /// Process a Cashu token and extract its total value in msats
 pub async fn extract_token_value(token_str: &str) -> anyhow::Result<u64> {
     use std::str::FromStr;
-    
+
     // Decode the token to get its value
     let token = cdk::nuts::Token::from_str(token_str)
         .map_err(|e| anyhow::anyhow!("Failed to decode Cashu token: {}", e))?;
-    
+
     // Check if the token is valid
     if token.proofs().is_empty() {
         return Err(anyhow::anyhow!("Token has no proofs"));
     }
-    
+
     // Calculate total token amount
-    let total_amount: u64 = token.proofs().iter().map(|p| { 
-        let amt: u64 = p.amount.into();
-        amt
-    }).sum();
+    let total_amount: u64 = token
+        .proofs()
+        .iter()
+        .map(|p| {
+            let amt: u64 = p.amount.into();
+            amt
+        })
+        .sum();
 
     // Unit handling
     let total_amount_msats: u64 = match token.unit().unwrap_or(cdk::nuts::CurrencyUnit::Sat) {
@@ -55,6 +59,6 @@ pub async fn extract_token_value(token_str: &str) -> anyhow::Result<u64> {
         cdk::nuts::CurrencyUnit::Msat => total_amount,
         unit => return Err(anyhow::anyhow!("Unsupported token unit: {:?}", unit)),
     };
-    
+
     Ok(total_amount_msats)
 }

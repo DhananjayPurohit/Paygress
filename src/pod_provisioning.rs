@@ -1,10 +1,10 @@
 // Unified Pod Provisioning Service
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::{info, error};
+use tracing::{error, info};
 
-use crate::sidecar_service::{SidecarState, SidecarConfig, PodInfo, extract_token_value};
 use crate::nostr::{EncryptedSpawnPodRequest, EncryptedTopUpPodRequest, PodSpec};
+use crate::sidecar_service::{extract_token_value, PodInfo, SidecarConfig, SidecarState};
 
 /// Request for spawning a new pod
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +23,6 @@ pub struct TopUpPodTool {
     pub pod_npub: String,
     pub cashu_token: String,
 }
-
 
 /// Request for getting available pod specifications/offers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +61,6 @@ pub struct TopUpPodResponse {
     pub new_expires_at: Option<String>,
 }
 
-
 /// Response for getting offers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetOffersResponse {
@@ -94,9 +92,10 @@ pub struct PodProvisioningService {
 
 impl PodProvisioningService {
     pub async fn new(config: SidecarConfig) -> Result<Self> {
-        let state = SidecarState::new(config).await
+        let state = SidecarState::new(config)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to initialize sidecar state: {}", e))?;
-        
+
         Ok(Self { state })
     }
 
@@ -107,7 +106,10 @@ impl PodProvisioningService {
 
     /// Handle spawn pod request
     pub async fn spawn_pod(&self, request: SpawnPodTool) -> Result<SpawnPodResponse> {
-        info!("Pod spawn request received for image: {}", request.pod_image);
+        info!(
+            "Pod spawn request received for image: {}",
+            request.pod_image
+        );
 
         // Convert request to internal format
         let spawn_request = EncryptedSpawnPodRequest {
@@ -119,7 +121,15 @@ impl PodProvisioningService {
         };
 
         // Use the existing logic from main.rs handle_spawn_pod_request
-        match self.handle_spawn_pod_internal(spawn_request, &request.user_pubkey.unwrap_or_else(|| "mcp-client".to_string())).await {
+        match self
+            .handle_spawn_pod_internal(
+                spawn_request,
+                &request
+                    .user_pubkey
+                    .unwrap_or_else(|| "mcp-client".to_string()),
+            )
+            .await
+        {
             Ok(response) => Ok(response),
             Err(e) => {
                 error!("Failed to spawn pod: {}", e);
@@ -167,7 +177,6 @@ impl PodProvisioningService {
         }
     }
 
-
     /// Handle get offers request
     pub async fn get_offers(&self, _request: GetOffersTool) -> Result<GetOffersResponse> {
         info!("Get offers request received");
@@ -181,11 +190,14 @@ impl PodProvisioningService {
 
     /// Handle get pod status request
     pub async fn get_pod_status(&self, request: GetPodStatusTool) -> Result<GetPodStatusResponse> {
-        info!("Get pod status request received for NPUB: {}", request.pod_npub);
+        info!(
+            "Get pod status request received for NPUB: {}",
+            request.pod_npub
+        );
 
-        use kube::{Api, api::ListParams};
-        use k8s_openapi::api::core::v1::Pod;
         use chrono::Utc;
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::{api::ListParams, Api};
 
         // First check our internal tracking
         let active_pods = self.state.active_pods.read().await;
@@ -214,11 +226,18 @@ impl PodProvisioningService {
                 pod_spec_name: pod_spec.map(|s| s.name.clone()),
                 cpu_millicores: pod_spec.map(|s| s.cpu_millicores),
                 memory_mb: pod_spec.map(|s| s.memory_mb),
-                status: Some(if time_remaining.unwrap_or(0) > 0 { "running".to_string() } else { "expired".to_string() }),
+                status: Some(if time_remaining.unwrap_or(0) > 0 {
+                    "running".to_string()
+                } else {
+                    "expired".to_string()
+                }),
             })
         } else {
             // Pod not found in our tracking, check if it exists in Kubernetes but expired
-            let pods_api: Api<Pod> = Api::namespaced(self.state.k8s_client.client.clone(), &self.state.config.pod_namespace);
+            let pods_api: Api<Pod> = Api::namespaced(
+                self.state.k8s_client.client.clone(),
+                &self.state.config.pod_namespace,
+            );
             let pods = match pods_api.list(&ListParams::default()).await {
                 Ok(pods) => pods,
                 Err(_) => {
@@ -241,7 +260,9 @@ impl PodProvisioningService {
 
             // Check if pod exists in Kubernetes
             let target_pod = pods.items.iter().find(|pod| {
-                pod.metadata.labels.as_ref()
+                pod.metadata
+                    .labels
+                    .as_ref()
                     .and_then(|labels| labels.get("pod-npub"))
                     .map(|stored_hex| {
                         let requested_hex = if request.pod_npub.starts_with("npub1") {
@@ -266,7 +287,9 @@ impl PodProvisioningService {
 
             if let Some(pod) = target_pod {
                 // Pod exists in Kubernetes but not in our tracking (likely expired)
-                let status = pod.status.as_ref()
+                let status = pod
+                    .status
+                    .as_ref()
                     .and_then(|status| status.phase.as_ref())
                     .cloned()
                     .unwrap_or_else(|| "unknown".to_string());
@@ -276,7 +299,10 @@ impl PodProvisioningService {
                     message: "Pod found but not tracked (likely expired)".to_string(),
                     pod_npub: request.pod_npub.clone(),
                     found: true,
-                    created_at: pod.metadata.creation_timestamp.as_ref()
+                    created_at: pod
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
                         .map(|ts| ts.0.to_rfc3339()),
                     expires_at: None,
                     time_remaining_seconds: Some(0), // Assume expired
@@ -305,23 +331,34 @@ impl PodProvisioningService {
     }
 
     /// Internal handler for spawning pods (adapted from main.rs)
-    async fn handle_spawn_pod_internal(&self, request: EncryptedSpawnPodRequest, user_pubkey: &str) -> Result<SpawnPodResponse> {
+    async fn handle_spawn_pod_internal(
+        &self,
+        request: EncryptedSpawnPodRequest,
+        user_pubkey: &str,
+    ) -> Result<SpawnPodResponse> {
         use chrono::Utc;
         use nostr_sdk::{Keys, ToBech32};
 
         // Select pod specification
         let pod_spec = if let Some(spec_id) = &request.pod_spec_id {
-            self.state.config.pod_specs.iter().find(|s| s.id == *spec_id)
+            self.state
+                .config
+                .pod_specs
+                .iter()
+                .find(|s| s.id == *spec_id)
         } else {
             self.state.config.pod_specs.first()
         };
-        
+
         let pod_spec = match pod_spec {
             Some(spec) => spec,
             None => {
                 return Ok(SpawnPodResponse {
                     success: false,
-                    message: format!("Pod specification '{}' not found", request.pod_spec_id.as_deref().unwrap_or("default")),
+                    message: format!(
+                        "Pod specification '{}' not found",
+                        request.pod_spec_id.as_deref().unwrap_or("default")
+                    ),
                     pod_npub: None,
                     ssh_host: None,
                     ssh_port: None,
@@ -331,7 +368,9 @@ impl PodProvisioningService {
                     pod_spec_name: None,
                     cpu_millicores: None,
                     memory_mb: None,
-                    instructions: vec!["Please check available specifications in the offer".to_string()],
+                    instructions: vec![
+                        "Please check available specifications in the offer".to_string()
+                    ],
                 });
             }
         };
@@ -356,9 +395,10 @@ impl PodProvisioningService {
                 });
             }
         };
-        
+
         // Check if payment is sufficient for minimum duration with selected spec
-        let minimum_payment = self.state.config.minimum_pod_duration_seconds * pod_spec.rate_msats_per_sec;
+        let minimum_payment =
+            self.state.config.minimum_pod_duration_seconds * pod_spec.rate_msats_per_sec;
         if payment_amount_msats < minimum_payment {
             return Ok(SpawnPodResponse {
                 success: false,
@@ -372,13 +412,13 @@ impl PodProvisioningService {
                 pod_spec_name: Some(pod_spec.name.clone()),
                 cpu_millicores: Some(pod_spec.cpu_millicores),
                 memory_mb: Some(pod_spec.memory_mb),
-                instructions: vec![
-                    format!("Minimum required: {} msats for {} seconds with {} spec (rate: {} msats/sec)", 
-                        minimum_payment,
-                        self.state.config.minimum_pod_duration_seconds,
-                        pod_spec.name,
-                        pod_spec.rate_msats_per_sec)
-                ],
+                instructions: vec![format!(
+                    "Minimum required: {} msats for {} seconds with {} spec (rate: {} msats/sec)",
+                    minimum_payment,
+                    self.state.config.minimum_pod_duration_seconds,
+                    pod_spec.name,
+                    pod_spec.rate_msats_per_sec
+                )],
             });
         }
 
@@ -386,15 +426,25 @@ impl PodProvisioningService {
         let duration_seconds = payment_amount_msats / pod_spec.rate_msats_per_sec;
 
         // Token verification handled by ngx_l402 at nginx layer
-        info!("✅ Using payment: {} msats for {} seconds (verified by ngx_l402)", payment_amount_msats, duration_seconds);
+        info!(
+            "✅ Using payment: {} msats for {} seconds (verified by ngx_l402)",
+            payment_amount_msats, duration_seconds
+        );
 
         // Generate NPUB first and use it as pod name
         let pod_keys = Keys::generate();
         let pod_npub = pod_keys.public_key().to_bech32().unwrap();
         let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
-        
+
         // Create Kubernetes-safe pod name from NPUB (take first 8 chars after npub1 prefix)
-        let pod_name = format!("pod-{}", pod_npub.replace("npub1", "").chars().take(8).collect::<String>());
+        let pod_name = format!(
+            "pod-{}",
+            pod_npub
+                .replace("npub1", "")
+                .chars()
+                .take(8)
+                .collect::<String>()
+        );
         let username = request.ssh_username;
         let password = request.ssh_password;
         let image = request.pod_image;
@@ -421,21 +471,26 @@ impl PodProvisioningService {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(duration_seconds as i64);
 
-        match self.state.k8s_client.create_ssh_pod(
-            &self.state.config,
-            &self.state.config.pod_namespace,
-            &pod_name,
-            &pod_npub,
-            &pod_nsec,
-            &image,
-            ssh_port,
-            &username,
-            &password,
-            duration_seconds,
-            pod_spec.memory_mb,
-            pod_spec.cpu_millicores,
-            user_pubkey,
-        ).await {
+        match self
+            .state
+            .k8s_client
+            .create_ssh_pod(
+                &self.state.config,
+                &self.state.config.pod_namespace,
+                &pod_name,
+                &pod_npub,
+                &pod_nsec,
+                &image,
+                ssh_port,
+                &username,
+                &password,
+                duration_seconds,
+                pod_spec.memory_mb,
+                pod_spec.cpu_millicores,
+                user_pubkey,
+            )
+            .await
+        {
             Ok(node_port) => {
                 let pod_info = PodInfo {
                     pod_npub: pod_npub.clone(),
@@ -451,7 +506,11 @@ impl PodProvisioningService {
                     nostr_public_key: pod_npub.clone(),
                     nostr_private_key: pod_nsec,
                 };
-                self.state.active_pods.write().await.insert(pod_npub.clone(), pod_info.clone());
+                self.state
+                    .active_pods
+                    .write()
+                    .await
+                    .insert(pod_npub.clone(), pod_info.clone());
 
                 let instructions = vec![
                     "🚀 SSH access available:".to_string(),
@@ -474,7 +533,10 @@ impl PodProvisioningService {
 
                 Ok(SpawnPodResponse {
                     success: true,
-                    message: format!("Pod created successfully. SSH access available for {} seconds", duration_seconds),
+                    message: format!(
+                        "Pod created successfully. SSH access available for {} seconds",
+                        duration_seconds
+                    ),
                     pod_npub: Some(pod_npub),
                     ssh_host: Some(self.state.config.ssh_host.clone()),
                     ssh_port: Some(node_port),
@@ -487,35 +549,39 @@ impl PodProvisioningService {
                     instructions,
                 })
             }
-            Err(e) => {
-                Ok(SpawnPodResponse {
-                    success: false,
-                    message: "Failed to create pod".to_string(),
-                    pod_npub: None,
-                    ssh_host: None,
-                    ssh_port: None,
-                    ssh_username: None,
-                    ssh_password: None,
-                    expires_at: None,
-                    pod_spec_name: Some(pod_spec.name.clone()),
-                    cpu_millicores: Some(pod_spec.cpu_millicores),
-                    memory_mb: Some(pod_spec.memory_mb),
-                    instructions: vec![format!("Pod creation error: {}", e)],
-                })
-            }
+            Err(e) => Ok(SpawnPodResponse {
+                success: false,
+                message: "Failed to create pod".to_string(),
+                pod_npub: None,
+                ssh_host: None,
+                ssh_port: None,
+                ssh_username: None,
+                ssh_password: None,
+                expires_at: None,
+                pod_spec_name: Some(pod_spec.name.clone()),
+                cpu_millicores: Some(pod_spec.cpu_millicores),
+                memory_mb: Some(pod_spec.memory_mb),
+                instructions: vec![format!("Pod creation error: {}", e)],
+            }),
         }
     }
 
     /// Internal handler for topping up pods (adapted from main.rs)
-    async fn handle_topup_pod_internal(&self, request: EncryptedTopUpPodRequest) -> Result<TopUpPodResponse> {
-        use kube::{Api, api::ListParams};
-        use k8s_openapi::api::core::v1::Pod;
+    async fn handle_topup_pod_internal(
+        &self,
+        request: EncryptedTopUpPodRequest,
+    ) -> Result<TopUpPodResponse> {
         use chrono::Utc;
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::{api::ListParams, Api};
 
         info!("Pod top-up request received for NPUB: {}", request.pod_npub);
 
         // Find pod by NPUB label in Kubernetes
-        let pods_api: Api<Pod> = Api::namespaced(self.state.k8s_client.client.clone(), &self.state.config.pod_namespace);
+        let pods_api: Api<Pod> = Api::namespaced(
+            self.state.k8s_client.client.clone(),
+            &self.state.config.pod_namespace,
+        );
         let pods = match pods_api.list(&ListParams::default()).await {
             Ok(pods) => pods,
             Err(e) => {
@@ -532,7 +598,9 @@ impl PodProvisioningService {
 
         // Find pod by NPUB label (compare truncated hex parts)
         let target_pod = match pods.items.iter().find(|pod| {
-            pod.metadata.labels.as_ref()
+            pod.metadata
+                .labels
+                .as_ref()
                 .and_then(|labels| labels.get("pod-npub"))
                 .map(|stored_hex| {
                     // Extract hex from the requested NPUB
@@ -560,7 +628,10 @@ impl PodProvisioningService {
             None => {
                 return Ok(TopUpPodResponse {
                     success: false,
-                    message: format!("Pod with NPUB '{}' not found or already expired", request.pod_npub),
+                    message: format!(
+                        "Pod with NPUB '{}' not found or already expired",
+                        request.pod_npub
+                    ),
                     pod_npub: request.pod_npub,
                     extended_duration_seconds: None,
                     new_expires_at: None,
@@ -597,12 +668,14 @@ impl PodProvisioningService {
         };
 
         // Calculate additional duration from payment
-        let additional_duration_seconds = self.state.calculate_duration_from_payment(payment_amount_msats);
-        
+        let additional_duration_seconds = self
+            .state
+            .calculate_duration_from_payment(payment_amount_msats);
+
         if additional_duration_seconds == 0 {
             return Ok(TopUpPodResponse {
                 success: false,
-                message: format!("Insufficient payment: {} msats. Minimum required: {} msats for 1 second extension", 
+                message: format!("Insufficient payment: {} msats. Minimum required: {} msats for 1 second extension",
                     payment_amount_msats, self.state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100)),
                 pod_npub: request.pod_npub,
                 extended_duration_seconds: None,
@@ -611,11 +684,17 @@ impl PodProvisioningService {
         }
 
         // Token verification handled by ngx_l402 at nginx layer
-        info!("✅ Top-up payment: {} msats for {} additional seconds (verified by ngx_l402)", payment_amount_msats, additional_duration_seconds);
+        info!(
+            "✅ Top-up payment: {} msats for {} additional seconds (verified by ngx_l402)",
+            payment_amount_msats, additional_duration_seconds
+        );
 
         // Get current pod configuration before restarting
-        
-        let pods_api: Api<Pod> = Api::namespaced(self.state.k8s_client.client.clone(), &self.state.config.pod_namespace);
+
+        let pods_api: Api<Pod> = Api::namespaced(
+            self.state.k8s_client.client.clone(),
+            &self.state.config.pod_namespace,
+        );
         let current_pod = match pods_api.get(&pod_name).await {
             Ok(pod) => pod,
             Err(e) => {
@@ -631,7 +710,16 @@ impl PodProvisioningService {
         };
 
         // Use the proper deadline extension method instead of recreating the pod
-        if let Err(e) = self.state.k8s_client.extend_pod_deadline(&self.state.config.pod_namespace, &pod_name, additional_duration_seconds).await {
+        if let Err(e) = self
+            .state
+            .k8s_client
+            .extend_pod_deadline(
+                &self.state.config.pod_namespace,
+                &pod_name,
+                additional_duration_seconds,
+            )
+            .await
+        {
             error!("Failed to extend pod deadline: {}", e);
             return Ok(TopUpPodResponse {
                 success: false,
@@ -648,22 +736,24 @@ impl PodProvisioningService {
             .as_ref()
             .and_then(|spec| spec.active_deadline_seconds)
             .unwrap_or(0);
-        
+
         // Calculate new expiration time from pod creation time + new deadline
         let new_expires_at = match &current_pod.metadata.creation_timestamp {
             Some(creation_time) => {
                 let creation_utc = creation_time.0;
-                let new_deadline_seconds = current_deadline_seconds + additional_duration_seconds as i64;
+                let new_deadline_seconds =
+                    current_deadline_seconds + additional_duration_seconds as i64;
                 creation_utc + chrono::Duration::seconds(new_deadline_seconds)
             }
             None => Utc::now() + chrono::Duration::seconds(additional_duration_seconds as i64), // Fallback
         };
-        
+
         // Update the pod info in our tracking with the new deadline
         let mut active_pods = self.state.active_pods.write().await;
         if let Some(pod_info) = active_pods.get_mut(&request.pod_npub) {
             pod_info.expires_at = new_expires_at;
-            pod_info.duration_seconds = current_deadline_seconds as u64 + additional_duration_seconds;
+            pod_info.duration_seconds =
+                current_deadline_seconds as u64 + additional_duration_seconds;
         }
         drop(active_pods);
 

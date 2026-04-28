@@ -9,10 +9,10 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{info, error};
+use tracing::{error, info};
 
-use crate::mcp::protocol::*;
 use crate::mcp::http_client::PaywalledHttpClient;
+use crate::mcp::protocol::*;
 
 /// MCP Server for handling Model Context Protocol requests
 pub struct MCPServer {
@@ -29,7 +29,7 @@ impl MCPServer {
     /// Run the MCP server with stdio transport
     pub async fn run(self) -> Result<()> {
         info!("Starting MCP server with stdio transport");
-        
+
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin);
@@ -80,7 +80,7 @@ impl MCPServer {
                 // This is a notification, no response needed
                 info!("Received cancellation notification");
                 return Ok(());
-            },
+            }
             _ => {
                 // Check if this is a notification (no id field) or a request
                 if id.is_null() {

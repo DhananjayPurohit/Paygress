@@ -1,6 +1,6 @@
 // API client for Paygress HTTP endpoints
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +114,8 @@ impl PaygressClient {
     /// Check server health
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/health", self.base_url);
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -124,14 +125,17 @@ impl PaygressClient {
             return Err(anyhow!("Server returned error: {}", response.status()));
         }
 
-        response.json().await
+        response
+            .json()
+            .await
             .map_err(|e| anyhow!("Failed to parse response: {}", e))
     }
 
     /// Get available offers
     pub async fn get_offers(&self) -> Result<OffersResponse> {
         let url = format!("{}/offers", self.base_url);
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -141,16 +145,18 @@ impl PaygressClient {
             return Err(anyhow!("Server returned error: {}", response.status()));
         }
 
-        response.json().await
+        response
+            .json()
+            .await
             .map_err(|e| anyhow!("Failed to parse response: {}", e))
     }
 
     /// Spawn a new pod
     pub async fn spawn_pod(&self, request: SpawnRequest) -> Result<SpawnResponse> {
         let url = format!("{}/pods/spawn", self.base_url);
-        
+
         let mut req_builder = self.client.post(&url);
-        
+
         // Add Cashu token as Authorization header if provided
         if let Some(ref token) = request.cashu_token {
             req_builder = req_builder.header("Authorization", format!("Cashu {}", token));
@@ -168,16 +174,18 @@ impl PaygressClient {
             return Err(anyhow!("Server returned error {}: {}", status, body));
         }
 
-        response.json().await
+        response
+            .json()
+            .await
             .map_err(|e| anyhow!("Failed to parse response: {}", e))
     }
 
     /// Top up an existing pod
     pub async fn topup_pod(&self, request: TopupRequest) -> Result<TopupResponse> {
         let url = format!("{}/pods/topup", self.base_url);
-        
+
         let mut req_builder = self.client.post(&url);
-        
+
         // Add Cashu token as Authorization header if provided
         if let Some(ref token) = request.cashu_token {
             req_builder = req_builder.header("Authorization", format!("Cashu {}", token));
@@ -195,19 +203,22 @@ impl PaygressClient {
             return Err(anyhow!("Server returned error {}: {}", status, body));
         }
 
-        response.json().await
+        response
+            .json()
+            .await
             .map_err(|e| anyhow!("Failed to parse response: {}", e))
     }
 
     /// Get pod status
     pub async fn get_pod_status(&self, pod_id: &str) -> Result<StatusResponse> {
         let url = format!("{}/pods/status", self.base_url);
-        
+
         let request = PodStatusRequest {
             pod_id: pod_id.to_string(),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&request)
             .send()
@@ -220,7 +231,9 @@ impl PaygressClient {
             return Err(anyhow!("Server returned error {}: {}", status, body));
         }
 
-        response.json().await
+        response
+            .json()
+            .await
             .map_err(|e| anyhow!("Failed to parse response: {}", e))
     }
 }

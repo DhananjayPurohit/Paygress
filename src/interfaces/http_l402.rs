@@ -1,7 +1,7 @@
 // HTTP Interface with L402 Payment Support via ngx_l402
 //
 // This module provides L402-aware HTTP endpoints that work with ngx_l402 module.
-// 
+//
 // Flow:
 // 1. Client makes request → nginx (with ngx_l402)
 // 2. ngx_l402 validates Cashu payment and returns 402 if invalid/missing
@@ -16,16 +16,16 @@
 // - Authorization: Cashu cashuAeyJ0b2tlbiI6...
 
 use anyhow::Result;
-use std::sync::Arc;
-use tracing::{info, error, warn};
 use axum::{
     extract::State,
-    http::{StatusCode, HeaderMap},
-    response::{Json, IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 use crate::pod_provisioning::PodProvisioningService;
 
@@ -37,14 +37,14 @@ pub struct L402Payment {
 }
 
 /// Extract Cashu token and decode amount from request headers
-/// 
+///
 /// Supports format from ngx_l402:
 /// - Authorization: Cashu <token>
 async fn extract_l402_payment(headers: &HeaderMap) -> Result<Option<L402Payment>, String> {
     use crate::sidecar_service::extract_token_value;
-    
+
     let mut cashu_token: Option<String> = None;
-    
+
     // Try Authorization header: "Cashu <token>" (ngx_l402 format)
     if let Some(auth_header) = headers.get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
@@ -64,7 +64,7 @@ async fn extract_l402_payment(headers: &HeaderMap) -> Result<Option<L402Payment>
             }
         }
     }
-    
+
     // If we found a token, decode it to get the amount
     if let Some(token) = cashu_token {
         match extract_token_value(&token).await {
@@ -81,7 +81,7 @@ async fn extract_l402_payment(headers: &HeaderMap) -> Result<Option<L402Payment>
             }
         }
     }
-    
+
     Ok(None)
 }
 
@@ -89,10 +89,12 @@ async fn extract_l402_payment(headers: &HeaderMap) -> Result<Option<L402Payment>
 pub async fn run_http_l402_interface(service: Arc<PodProvisioningService>) -> Result<()> {
     info!("🌐 Starting HTTP interface with L402 support...");
 
-    let bind_addr = std::env::var("HTTP_BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let bind_addr = std::env::var("HTTP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
-    info!("✅ HTTP+L402 interface ready - listening on http://{}", bind_addr);
+    info!(
+        "✅ HTTP+L402 interface ready - listening on http://{}",
+        bind_addr
+    );
 
     // Create the router
     let app = Router::new()
@@ -104,10 +106,12 @@ pub async fn run_http_l402_interface(service: Arc<PodProvisioningService>) -> Re
         .with_state(service);
 
     // Start the HTTP server
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", bind_addr, e))?;
 
-    axum::serve(listener, app).await
+    axum::serve(listener, app)
+        .await
         .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))?;
 
     Ok(())
@@ -123,9 +127,11 @@ async fn health_check() -> Json<serde_json::Value> {
 }
 
 /// Get available offers (no payment required)
-async fn get_offers(State(service): State<Arc<PodProvisioningService>>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn get_offers(
+    State(service): State<Arc<PodProvisioningService>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let request = crate::pod_provisioning::GetOffersTool {};
-    
+
     match service.get_offers(request).await {
         Ok(response) => {
             let offers_json = serde_json::json!({
@@ -182,7 +188,7 @@ async fn get_pod_status(
 }
 
 /// Spawn a new pod with L402 payment support
-/// 
+///
 /// Note: ngx_l402 validates payment before this endpoint is reached
 /// If this function is called, payment has already been verified by nginx
 async fn spawn_pod_l402(
@@ -197,33 +203,38 @@ async fn spawn_pod_l402(
 
     match extracted_payment {
         Ok(Some(l402_payment)) => {
-            info!("✅ L402 payment from Authorization header: {} msats", l402_payment.amount_msats);
+            info!(
+                "✅ L402 payment from Authorization header: {} msats",
+                l402_payment.amount_msats
+            );
             request.cashu_token = l402_payment.token.clone();
         }
         Ok(None) => {
-             // Check if body has token
-             if !request.cashu_token.is_empty() {
-                 info!("✅ Using Cashu token from request body (direct call, bypassing nginx)");
-             } else {
-                 error!("❌ No payment token found in headers or body");
-                 return (
-                     StatusCode::BAD_REQUEST,
-                     Json(serde_json::json!({
-                         "error": "Payment token missing",
-                         "message": "Provide payment via Authorization header or cashu_token in body"
-                     }))
-                 ).into_response();
-             }
+            // Check if body has token
+            if !request.cashu_token.is_empty() {
+                info!("✅ Using Cashu token from request body (direct call, bypassing nginx)");
+            } else {
+                error!("❌ No payment token found in headers or body");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Payment token missing",
+                        "message": "Provide payment via Authorization header or cashu_token in body"
+                    })),
+                )
+                    .into_response();
+            }
         }
         Err(e) => {
-             error!("❌ Invalid payment token in header: {}", e);
-             return (
-                 StatusCode::BAD_REQUEST,
-                 Json(serde_json::json!({
-                     "error": "Invalid Payment Token",
-                     "message": e
-                 }))
-             ).into_response();
+            error!("❌ Invalid payment token in header: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid Payment Token",
+                    "message": e
+                })),
+            )
+                .into_response();
         }
     }
 
@@ -239,7 +250,10 @@ async fn spawn_pod_l402(
 
     match service.spawn_pod(spawn_tool).await {
         Ok(response) => {
-            info!("✅ Pod spawned successfully: {}", response.pod_npub.as_deref().unwrap_or("unknown"));
+            info!(
+                "✅ Pod spawned successfully: {}",
+                response.pod_npub.as_deref().unwrap_or("unknown")
+            );
             let response_json = serde_json::json!({
                 "success": response.success,
                 "message": response.message,
@@ -263,14 +277,15 @@ async fn spawn_pod_l402(
                 Json(serde_json::json!({
                     "error": "Failed to spawn pod",
                     "message": e.to_string()
-                }))
-            ).into_response()
+                })),
+            )
+                .into_response()
         }
     }
 }
 
 /// Top up an existing pod with L402 payment support
-/// 
+///
 /// Note: ngx_l402 validates payment before this endpoint is reached
 async fn topup_pod_l402(
     State(service): State<Arc<PodProvisioningService>>,
@@ -281,25 +296,29 @@ async fn topup_pod_l402(
 
     // Extract payment from Authorization: Cashu <token> header (from ngx_l402 or MCP client)
     let extracted_payment = extract_l402_payment(&headers).await;
-    
+
     match extracted_payment {
         Ok(Some(l402_payment)) => {
-             info!("✅ L402 payment from Authorization header for top-up: {} msats", l402_payment.amount_msats);
-             request.cashu_token = l402_payment.token;
+            info!(
+                "✅ L402 payment from Authorization header for top-up: {} msats",
+                l402_payment.amount_msats
+            );
+            request.cashu_token = l402_payment.token;
         }
         Ok(None) => {
-             if !request.cashu_token.is_empty() {
-                 info!("✅ Using Cashu token from request body for top-up (direct call, bypassing nginx)");
-             } else {
-                 error!("❌ No payment token found in headers or body");
-                 return (
-                     StatusCode::BAD_REQUEST,
-                     Json(serde_json::json!({
-                         "error": "Payment token missing",
-                         "message": "Provide payment via Authorization header or cashu_token in body"
-                     }))
-                 ).into_response();
-             }
+            if !request.cashu_token.is_empty() {
+                info!("✅ Using Cashu token from request body for top-up (direct call, bypassing nginx)");
+            } else {
+                error!("❌ No payment token found in headers or body");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Payment token missing",
+                        "message": "Provide payment via Authorization header or cashu_token in body"
+                    })),
+                )
+                    .into_response();
+            }
         }
         Err(e) => {
             error!("❌ Invalid payment token in header: {}", e);
@@ -308,8 +327,9 @@ async fn topup_pod_l402(
                 Json(serde_json::json!({
                     "error": "Invalid Payment Token",
                     "message": e
-                }))
-            ).into_response();
+                })),
+            )
+                .into_response();
         }
     }
 
@@ -338,8 +358,9 @@ async fn topup_pod_l402(
                 Json(serde_json::json!({
                     "error": "Failed to topup pod",
                     "message": e.to_string()
-                }))
-            ).into_response()
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -367,4 +388,3 @@ struct TopUpPodHttpRequest {
 struct GetPodStatusHttpRequest {
     pub pod_npub: String,
 }
-

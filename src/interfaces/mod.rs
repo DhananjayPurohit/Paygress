@@ -1,16 +1,16 @@
 // Unified Paygress Service Interfaces
 //
 // This module contains the interface implementations (MCP, HTTP with L402).
-// 
+//
 // MCP interface calls HTTP endpoints (with L402 paywall support).
 // HTTP interface always uses L402 payment validation via ngx_l402.
 
-pub mod mcp;
 pub mod http_l402;
+pub mod mcp;
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::pod_provisioning::PodProvisioningService;
 
@@ -20,9 +20,7 @@ pub async fn run_all_interfaces(service: Arc<PodProvisioningService>) -> Result<
 
     // Check which interfaces are enabled via environment variables
     if is_interface_enabled("MCP") {
-        tasks.push(tokio::spawn(async move {
-            mcp::run_mcp_interface().await
-        }));
+        tasks.push(tokio::spawn(async move { mcp::run_mcp_interface().await }));
     }
 
     if is_interface_enabled("HTTP") {
@@ -62,7 +60,8 @@ fn is_interface_enabled(interface: &str) -> bool {
     let env_var = format!("ENABLE_{}", interface);
     std::env::var(&env_var)
         .unwrap_or_else(|_| "true".to_string()) // Default to enabled
-        .to_lowercase() == "true"
+        .to_lowercase()
+        == "true"
 }
 
 /// Get interface-specific configuration

@@ -3,11 +3,11 @@
 // This module provides HTTP client functionality for the MCP server
 // to call paywalled HTTP endpoints using L402 (Lightning HTTP 402) protocol.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 /// HTTP client for calling paywalled endpoints
 pub struct PaywalledHttpClient {
@@ -84,7 +84,8 @@ impl PaywalledHttpClient {
 
         // Handle L402 Payment Required (402 status)
         if response.status() == 402 {
-            let www_authenticate = response.headers()
+            let www_authenticate = response
+                .headers()
                 .get("www-authenticate")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
@@ -97,7 +98,7 @@ impl PaywalledHttpClient {
             warn!("   2. Get the L402 token (preimage)");
             warn!("   3. Set HTTP_L402_TOKEN environment variable");
             warn!("   ");
-            
+
             return Err(anyhow!(
                 "L402 Payment Required. WWW-Authenticate: {}",
                 www_authenticate
@@ -107,8 +108,14 @@ impl PaywalledHttpClient {
         // Check for other errors
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            error!("❌ HTTP request failed with status {}: {}", status, error_text);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!(
+                "❌ HTTP request failed with status {}: {}",
+                status, error_text
+            );
             return Err(anyhow!("HTTP request failed: {} - {}", status, error_text));
         }
 
@@ -130,4 +137,3 @@ pub struct SpawnPodRequest {
     pub ssh_password: String,
     pub user_pubkey: Option<String>,
 }
-
