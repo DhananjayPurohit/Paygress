@@ -121,12 +121,15 @@ async fn execute_nostr_topup(provider_npub: String, args: TopupArgs, _verbose: b
     println!("  Provider: {}", provider_npub);
     println!();
 
-    // Build topup request (same structure as spawn but with just token + pod_id)
-    let request = serde_json::json!({
-        "type": "topup",
-        "pod_id": args.pod_id,
-        "cashu_token": args.token,
-    });
+    // Build topup request as the structured EncryptedTopUpPodRequest
+    // payload — provider.rs uses #[serde(untagged)] PrivateRequest, so
+    // the field set must match the TopUp variant exactly. Sending a
+    // free-form JSON would silently misroute (the provider would
+    // either fail to parse or match the wrong variant).
+    let request = paygress::nostr::EncryptedTopUpPodRequest {
+        pod_npub: args.pod_id.clone(),
+        cashu_token: args.token,
+    };
 
     print!("  Sending topup request... ");
 

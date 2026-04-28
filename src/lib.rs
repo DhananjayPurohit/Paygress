@@ -23,9 +23,10 @@ pub use discovery::DiscoveryClient;
 pub use lxd::LxdBackend;
 pub use nostr::{custom_relay_config, default_relay_config, NostrRelaySubscriber, RelayConfig};
 pub use nostr::{
-    AccessDetailsContent, CapacityInfo, ErrorResponseContent, HeartbeatContent, PrivateRequest,
-    ProviderFilter, ProviderInfo, ProviderOfferContent, StatusRequestContent,
-    StatusResponseContent,
+    AccessDetailsContent, CapacityInfo, EncryptedTopUpPodRequest, ErrorResponseContent,
+    HeartbeatContent, IsolationLevel, PrivateRequest, ProviderFilter, ProviderInfo,
+    ProviderOfferContent, StatusRequestContent, StatusResponseContent, TopUpResponseContent,
+    SCHEMA_VERSION,
 };
 pub use provider::{ProviderConfig, ProviderService};
 pub use proxmox::ProxmoxClient;

@@ -19,8 +19,9 @@ use crate::compute::{ComputeBackend, ContainerConfig};
 use crate::lxd::LxdBackend;
 use crate::nostr::{
     parse_private_message_content, AccessDetailsContent, CapacityInfo, EncryptedSpawnPodRequest,
-    ErrorResponseContent, HeartbeatContent, NostrRelaySubscriber, PodSpec, PrivateRequest,
-    ProviderOfferContent, RelayConfig, StatusRequestContent, StatusResponseContent,
+    EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent, NostrRelaySubscriber,
+    PodSpec, PrivateRequest, ProviderOfferContent, RelayConfig, StatusRequestContent,
+    StatusResponseContent, TopUpResponseContent,
 };
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 
@@ -422,17 +423,20 @@ impl ProviderService {
                                 error!("Failed to handle status request: {}", e);
                             }
                         }
-                        PrivateRequest::TopUp(_) => {
-                            warn!("TopUp request received but not yet fully implemented");
-                            let _ = nostr
-                                .send_error_response(
-                                    &event.pubkey,
-                                    "not_implemented",
-                                    "TopUp is not yet implemented on this provider",
-                                    None,
-                                    &event.message_type,
-                                )
-                                .await;
+                        PrivateRequest::TopUp(topup_req) => {
+                            if let Err(e) = handle_topup_request(
+                                &config,
+                                &nostr,
+                                redeemer.as_ref(),
+                                &workloads,
+                                &event.pubkey,
+                                &event.message_type,
+                                topup_req,
+                            )
+                            .await
+                            {
+                                error!("Failed to handle topup request: {}", e);
+                            }
                         }
                     }
 
@@ -695,6 +699,233 @@ async fn handle_spawn_request(
 
     info!("Workload {} provisioned for {} seconds", id, duration_secs);
     Ok(())
+}
+
+/// Handle a TopUp request (Unit 2 of the 12-month plan).
+///
+/// Looks up the workload by its `pod_npub` (which the spawn handler
+/// returned as `container-<vmid>`), verifies the requester owns it,
+/// redeems the supplied Cashu token at the mint (Unit 1), and
+/// extends `expires_at` by `redeemed_msats / spec.rate_msats_per_sec`
+/// under the existing workloads mutex.
+///
+/// Mutex discipline: redemption (a network call to the mint) happens
+/// BEFORE we re-acquire the workloads lock, so the lock is never held
+/// across an external request.
+async fn handle_topup_request(
+    config: &ProviderConfig,
+    nostr: &NostrRelaySubscriber,
+    redeemer: &dyn MintRedeemer,
+    workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
+    requester_pubkey: &str,
+    message_type: &str,
+    request: EncryptedTopUpPodRequest,
+) -> Result<()> {
+    info!(
+        "Processing topup request from {} for {}",
+        requester_pubkey, request.pod_npub
+    );
+
+    let vmid = match parse_pod_npub(&request.pod_npub) {
+        Some(v) => v,
+        None => {
+            let err_msg = format!(
+                "Could not parse pod identifier `{}`; expected `container-<id>` or numeric id",
+                request.pod_npub
+            );
+            warn!("{}", err_msg);
+            nostr
+                .send_error_response(
+                    requester_pubkey,
+                    "invalid_pod_id",
+                    &err_msg,
+                    None,
+                    message_type,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // 1. Snapshot the workload + spec under a brief read-only lock so
+    //    we know how to bill before we redeem.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let (spec_id, current_expires_at) = {
+        let lock = workloads.lock().await;
+        match lock.get(&vmid) {
+            Some(w) if w.owner_npub == requester_pubkey => (w.spec_id.clone(), w.expires_at),
+            Some(_) => {
+                drop(lock);
+                let err_msg = "Pod not owned by requester";
+                warn!("{}: vmid={}", err_msg, vmid);
+                nostr
+                    .send_error_response(requester_pubkey, "not_owner", err_msg, None, message_type)
+                    .await?;
+                return Ok(());
+            }
+            None => {
+                drop(lock);
+                let err_msg = format!("Pod {} not found", request.pod_npub);
+                warn!("{}", err_msg);
+                nostr
+                    .send_error_response(
+                        requester_pubkey,
+                        "not_found",
+                        &err_msg,
+                        None,
+                        message_type,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    if current_expires_at <= now {
+        let err_msg = format!(
+            "Pod {} lease has already expired; spawn a new pod instead",
+            request.pod_npub
+        );
+        warn!("{}", err_msg);
+        nostr
+            .send_error_response(
+                requester_pubkey,
+                "lease_expired",
+                &err_msg,
+                None,
+                message_type,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let spec = match config.specs.iter().find(|s| s.id == spec_id) {
+        Some(s) => s.clone(),
+        None => {
+            // Spec referenced by the workload no longer exists in
+            // config — provider misconfiguration. Refuse the topup
+            // rather than silently mis-billing.
+            let err_msg = format!(
+                "Pod {} references unknown spec `{}`; provider misconfiguration",
+                request.pod_npub, spec_id
+            );
+            error!("{}", err_msg);
+            nostr
+                .send_error_response(
+                    requester_pubkey,
+                    "spec_unavailable",
+                    &err_msg,
+                    None,
+                    message_type,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // 2. Redeem the topup token (no workloads lock held).
+    let payment_msats = match validate_and_redeem(
+        redeemer,
+        &config.whitelisted_mints,
+        &request.cashu_token,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let (error_type, err_msg) = redeem_error_to_response(&e);
+            error!("Topup redemption failed: {}", err_msg);
+            nostr
+                .send_error_response(requester_pubkey, error_type, &err_msg, None, message_type)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let extension_secs = payment_msats / spec.rate_msats_per_sec;
+    if extension_secs == 0 {
+        let err_msg = format!(
+            "Insufficient topup: {} msats buys 0 seconds at {} msats/sec",
+            payment_msats, spec.rate_msats_per_sec
+        );
+        warn!("{}", err_msg);
+        nostr
+            .send_error_response(
+                requester_pubkey,
+                "insufficient_payment",
+                &err_msg,
+                None,
+                message_type,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    // 3. Apply the extension under the workloads lock. We re-check
+    //    ownership and existence after re-locking to defend against
+    //    cleanup having run between our snapshot and now.
+    let new_expires_at = {
+        let mut lock = workloads.lock().await;
+        match lock.get_mut(&vmid) {
+            Some(w) if w.owner_npub == requester_pubkey => {
+                w.expires_at = w.expires_at.saturating_add(extension_secs);
+                w.expires_at
+            }
+            _ => {
+                // Vanished or ownership changed between snapshots.
+                // The token is already spent at the mint — this is a
+                // race the consumer should retry by spawning a new
+                // pod. We surface a distinct error so the CLI can
+                // explain it.
+                drop(lock);
+                let err_msg =
+                    "Pod was cleaned up before topup could be applied; token has been spent";
+                error!("{}: vmid={}", err_msg, vmid);
+                nostr
+                    .send_error_response(requester_pubkey, "race_lost", err_msg, None, message_type)
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let new_expires_dt =
+        chrono::DateTime::from_timestamp(new_expires_at as i64, 0).unwrap_or_default();
+    let response = TopUpResponseContent {
+        success: true,
+        pod_npub: request.pod_npub.clone(),
+        extended_duration_seconds: extension_secs,
+        new_expires_at: new_expires_dt.to_rfc3339(),
+        message: format!(
+            "Lease extended by {}s ({} msats @ {} msats/sec)",
+            extension_secs, payment_msats, spec.rate_msats_per_sec
+        ),
+    };
+
+    nostr
+        .send_topup_response_private_message(requester_pubkey, response, message_type)
+        .await?;
+
+    info!(
+        "Topup applied to {}: +{}s (now expires at {})",
+        request.pod_npub, extension_secs, new_expires_at
+    );
+    Ok(())
+}
+
+/// Parse a pod identifier emitted by the spawn handler back into the
+/// internal vmid. Accepts both `container-<vmid>` (the format
+/// AccessDetailsContent returns to the consumer) and a bare numeric
+/// id (for callers that already know it).
+pub fn parse_pod_npub(pod_npub: &str) -> Option<u32> {
+    if let Some(rest) = pod_npub.strip_prefix("container-") {
+        rest.parse().ok()
+    } else {
+        pod_npub.parse().ok()
+    }
 }
 
 /// Translate a `RedeemError` into the `(error_type, message)` shape the
