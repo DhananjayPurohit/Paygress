@@ -26,6 +26,19 @@ path = "src/main.rs"
 name = "paygress-cli"
 path = "src/cli/main.rs"
 
+[features]
+# `kubernetes` gates the legacy K8s + ngx_l402 + HTTP control plane
+# (src/sidecar_service.rs, src/pod_provisioning.rs, src/interfaces/http_l402.rs,
+# src/interfaces/mcp.rs, src/mcp/http_client.rs).
+#
+# Currently default-on so existing builds are unchanged. Unit 7 of the
+# 12-month plan (docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md)
+# removes `kubernetes` from default features and adds `#[cfg(feature = "kubernetes")]`
+# annotations across the K8s pipeline. The canonical control plane is
+# Proxmox-LXD + Nostr-DM (src/provider.rs).
+default = ["kubernetes"]
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
+
 [dependencies]
 # Core dependencies
 serde = { version = "1.0", features = ["derive"] }
@@ -43,9 +56,9 @@ nostr-sdk = { version = "0.33", features = ["nip04", "nip44", "nip59"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Kubernetes dependencies
-kube = { version = "0.93", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.22", features = ["v1_28"] }
+# Kubernetes dependencies (optional, gated behind the `kubernetes` feature)
+kube = { version = "0.93", features = ["runtime", "derive"], optional = true }
+k8s-openapi = { version = "0.22", features = ["v1_28"], optional = true }
 uuid = { version = "1.0", features = ["v4"] }
 futures-util = "0.3"
 
@@ -73,8 +86,14 @@ serde_urlencoded = "0.7"
 futures = "0.3"
 num_cpus = "1.0"
 
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.5"
+proptest = "1"
+tempfile = "3"
+
 [profile.release]
-# Optimize for small binary size  
+# Optimize for small binary size
 opt-level = "s"
 lto = true
 codegen-units = 1
