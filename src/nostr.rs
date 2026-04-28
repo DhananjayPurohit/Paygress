@@ -12,9 +12,43 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-// Custom event kinds for Paygress provider discovery
+// Custom event kinds for Paygress provider discovery.
+//
+// `KIND_PROVIDER_OFFER` (38383) is a NIP-33 parameterized-replaceable
+// event keyed by `(pubkey, kind, d-tag)`. We use a versioned `d` tag
+// (`paygress:offer:v1:<npub>`) so future schema bumps can coexist on
+// the same relay without overwriting v1 events.
+//
+// Heartbeats use TWO kinds (Unit 4 of the 12-month plan):
+// - `KIND_PROVIDER_HEARTBEAT` (38384): NIP-33 addressable. We publish
+//   with a *bucketed* `d` tag
+//   (`paygress:heartbeat:v1:<npub>:<minute-bucket>`) so distinct
+//   minutes coexist on the relay and stored history is queryable for
+//   uptime aggregation. This fixes the original "addressable replaces
+//   each heartbeat" bug where `calculate_uptime` saw only one event.
+// - `KIND_PROVIDER_HEARTBEAT_EPHEMERAL` (20384): NIP-16 ephemeral.
+//   Relays do not store these, so they're cheap for live-presence
+//   subscribers but useless for uptime history. We publish on both.
 pub const KIND_PROVIDER_OFFER: u16 = 38383;
 pub const KIND_PROVIDER_HEARTBEAT: u16 = 38384;
+pub const KIND_PROVIDER_HEARTBEAT_EPHEMERAL: u16 = 20384;
+
+/// Schema version for offer + heartbeat payloads. Old payloads
+/// without this field deserialize to `1` via `#[serde(default)]`.
+pub const SCHEMA_VERSION: u8 = 1;
+
+/// Live-presence query window. Ephemeral heartbeats are not stored
+/// at relays, so any "is this provider alive right now?" query is
+/// implicitly bounded to whatever subscribers were live recently.
+/// Stored heartbeats can be queried over arbitrary windows; this
+/// constant only governs the ephemeral / fast-path lookups.
+pub const LIVE_HEARTBEAT_WINDOW_SECS: u64 = 300;
+
+/// Heartbeat bucket size for the addressable (stored) kind. One
+/// bucket per minute matches the 60s heartbeat cadence: every
+/// heartbeat lands in its own `(npub, kind, d-tag)` slot, so relays
+/// preserve history for uptime aggregation.
+pub const HEARTBEAT_BUCKET_SECS: u64 = 60;
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub relays: Vec<String>,
@@ -612,8 +646,29 @@ pub struct CapacityInfo {
     pub storage_gb_available: u64, // Available storage in GB
 }
 
-/// Provider offer content published to Nostr (Kind 38383)
-/// This is a replaceable event that describes what a provider offers
+/// Provider isolation level (Unit 4 surfaces this on offers from
+/// Q1; Unit 22 will populate it with the real research-tier
+/// implementation). `#[serde(default)]` so v0 offers parse cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationLevel {
+    /// Default LXC / shared-kernel container.
+    #[default]
+    SharedKernel,
+    /// Whole-host dedicated to a single workload (no co-tenants).
+    DedicatedHost,
+    /// Attested AMD SEV-SNP / Intel TDX research tier (year-2 R9).
+    AttestedResearchTier,
+}
+
+fn default_schema_version() -> u8 {
+    SCHEMA_VERSION
+}
+
+/// Provider offer content published to Nostr (Kind 38383).
+///
+/// Parameterized-replaceable event addressed by
+/// `(pubkey, 38383, d="paygress:offer:v1:<npub>")`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOfferContent {
     pub provider_npub: String,
@@ -625,16 +680,33 @@ pub struct ProviderOfferContent {
     pub uptime_percent: f32,
     pub total_jobs_completed: u64,
     pub api_endpoint: Option<String>,
+
+    /// Schema version. v0 offers (no field on the wire) deserialize
+    /// to `1` via the default. Bump on any breaking change.
+    #[serde(default = "default_schema_version")]
+    pub version: u8,
+
+    /// Isolation level the provider promises (Unit 4 / Unit 22).
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
 }
 
-/// Heartbeat content published to Nostr (Kind 38384)
-/// Published every 60 seconds to prove liveness
+/// Heartbeat content published to Nostr.
+///
+/// Dual-published on two kinds (see Unit 4):
+/// - `KIND_PROVIDER_HEARTBEAT` (38384, addressable, with bucketed
+///   `d` tag) for stored uptime history.
+/// - `KIND_PROVIDER_HEARTBEAT_EPHEMERAL` (20384) for live presence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatContent {
     pub provider_npub: String,
     pub timestamp: u64,
     pub active_workloads: u32,
     pub available_capacity: CapacityInfo,
+
+    /// Schema version. See `ProviderOfferContent::version`.
+    #[serde(default = "default_schema_version")]
+    pub version: u8,
 }
 
 /// Provider info as seen by discovery clients
@@ -662,16 +734,20 @@ pub struct ProviderFilter {
 }
 
 impl NostrRelaySubscriber {
-    /// Publish a provider offer event (Kind 38383 - replaceable)
+    /// Publish a provider offer event (Kind 38383 — parameterized
+    /// replaceable). The `d` tag is versioned
+    /// (`paygress:offer:v1:<npub>`) so future schema bumps coexist
+    /// with v1 events on the same relay.
     pub async fn publish_provider_offer(&self, offer: ProviderOfferContent) -> Result<String> {
         let content = serde_json::to_string(&offer)?;
         info!("Publishing provider offer for {}", offer.hostname);
 
-        // Use "d" tag for replaceable event (NIP-33 parameterized replaceable)
+        let d_tag = format!("paygress:offer:v{}:{}", offer.version, offer.provider_npub);
         let tags = vec![
             Tag::hashtag("paygress"),
             Tag::hashtag("compute"),
-            Tag::parse(&["d", &offer.provider_npub])?,
+            Tag::parse(&["d", &d_tag])?,
+            Tag::parse(&["v", &offer.version.to_string()])?,
         ];
 
         let builder = EventBuilder::new(Kind::Custom(KIND_PROVIDER_OFFER), content, tags);
@@ -690,29 +766,68 @@ impl NostrRelaySubscriber {
         }
     }
 
-    /// Publish a heartbeat event (Kind 38384)
+    /// Publish a heartbeat event on BOTH the addressable (stored,
+    /// kind 38384) and ephemeral (kind 20384) kinds. Returns the
+    /// addressable event id (the one consumers care about for uptime
+    /// history).
+    ///
+    /// The addressable form uses a per-minute bucketed `d` tag
+    /// (`paygress:heartbeat:v1:<npub>:<bucket>`) so each minute's
+    /// heartbeat lands in its own `(pubkey, kind, d-tag)` slot.
+    /// Without bucketing, every heartbeat replaces the previous one
+    /// at the relay and `calculate_uptime` sees zero history.
     pub async fn publish_heartbeat(&self, heartbeat: HeartbeatContent) -> Result<String> {
         let content = serde_json::to_string(&heartbeat)?;
+        let bucket = heartbeat.timestamp / HEARTBEAT_BUCKET_SECS;
+        let d_tag = format!(
+            "paygress:heartbeat:v{}:{}:{}",
+            heartbeat.version, heartbeat.provider_npub, bucket
+        );
 
-        let tags = vec![
+        let provider_pk = nostr_sdk::PublicKey::parse(&heartbeat.provider_npub)?;
+        let v_tag = heartbeat.version.to_string();
+
+        // 1. Stored, addressable: relays keep this for history-based
+        //    queries (calculate_uptime).
+        let stored_tags = vec![
             Tag::hashtag("paygress-heartbeat"),
-            Tag::public_key(nostr_sdk::PublicKey::parse(&heartbeat.provider_npub)?),
+            Tag::public_key(provider_pk),
+            Tag::parse(&["d", &d_tag])?,
+            Tag::parse(&["v", &v_tag])?,
         ];
+        let stored = EventBuilder::new(
+            Kind::Custom(KIND_PROVIDER_HEARTBEAT),
+            content.clone(),
+            stored_tags,
+        );
+        let stored_event = stored.to_event(&self.keys)?;
+        let stored_id = stored_event.id.to_hex();
 
-        let builder = EventBuilder::new(Kind::Custom(KIND_PROVIDER_HEARTBEAT), content, tags);
-        let event = builder.to_event(&self.keys)?;
-        let event_id = event.id.to_hex();
+        // 2. Ephemeral: relays don't store, but live subscribers see
+        //    it immediately. Cheap and good for dashboards.
+        let ephemeral_tags = vec![
+            Tag::hashtag("paygress-heartbeat"),
+            Tag::public_key(provider_pk),
+            Tag::parse(&["v", &v_tag])?,
+        ];
+        let ephemeral = EventBuilder::new(
+            Kind::Custom(KIND_PROVIDER_HEARTBEAT_EPHEMERAL),
+            content,
+            ephemeral_tags,
+        );
+        let ephemeral_event = ephemeral.to_event(&self.keys)?;
 
-        match self.client.send_event(event).await {
-            Ok(_) => {
-                info!("💓 Heartbeat published: {}", event_id);
-                Ok(event_id)
-            }
-            Err(e) => {
-                warn!("Failed to publish heartbeat: {}", e);
-                Err(e.into())
-            }
+        match self.client.send_event(stored_event).await {
+            Ok(_) => debug!("📦 Stored heartbeat published: {}", stored_id),
+            Err(e) => warn!("Failed to publish stored heartbeat: {}", e),
         }
+        match self.client.send_event(ephemeral_event).await {
+            Ok(_) => debug!("⚡ Ephemeral heartbeat published"),
+            Err(e) => warn!("Failed to publish ephemeral heartbeat: {}", e),
+        }
+
+        info!("💓 Heartbeat published (stored + ephemeral): {}", stored_id);
+        Ok(stored_id)
     }
 
     /// Query all provider offers from relays
@@ -771,23 +886,27 @@ impl NostrRelaySubscriber {
         Ok(heartbeats)
     }
 
-    /// Get the latest heartbeat for a provider (to check if online)
+    /// Get the latest heartbeat for a provider (to check if online).
+    /// Queries the stored kind 38384 (which now retains per-minute
+    /// bucketed history thanks to the `d`-tag fix in Unit 4) within
+    /// the live window. Ephemeral kind 20384 is not queried here
+    /// because relays do not store it; it would only be visible to
+    /// live subscribers.
     pub async fn get_latest_heartbeat(
         &self,
         provider_npub: &str,
     ) -> Result<Option<HeartbeatContent>> {
         let provider_pubkey = nostr_sdk::PublicKey::parse(provider_npub)?;
 
-        // Look for heartbeats in the last 5 minutes
-        let five_mins_ago = std::time::SystemTime::now()
+        let live_since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs()
-            - 300;
+            - LIVE_HEARTBEAT_WINDOW_SECS;
 
         let filter = Filter::new()
             .kind(Kind::Custom(KIND_PROVIDER_HEARTBEAT))
             .author(provider_pubkey)
-            .since(Timestamp::from(five_mins_ago))
+            .since(Timestamp::from(live_since))
             .limit(1);
 
         let events = self
@@ -821,17 +940,19 @@ impl NostrRelaySubscriber {
             }
         }
 
-        // Look for heartbeats in the last 5 minutes
-        let five_mins_ago = std::time::SystemTime::now()
+        let live_since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs()
-            - 300;
+            - LIVE_HEARTBEAT_WINDOW_SECS;
 
-        // Query for ANY heartbeat from ANY of these authors
+        // Query the stored kind 38384 (now retains bucketed history
+        // per Unit 4) for "have any of these providers heartbeat'd
+        // recently?". Ephemeral 20384 isn't queried because relays
+        // do not store it.
         let filter = Filter::new()
             .kind(Kind::Custom(KIND_PROVIDER_HEARTBEAT))
             .authors(pubkeys)
-            .since(Timestamp::from(five_mins_ago));
+            .since(Timestamp::from(live_since));
 
         // Use a short timeout of 3 seconds for fast feedback
         let events = self
@@ -861,7 +982,11 @@ impl NostrRelaySubscriber {
         Ok(heartbeats)
     }
 
-    /// Calculate uptime percentage for a provider over the last N days
+    /// Calculate uptime percentage for a provider over the last N
+    /// days, against the stored kind 38384 (which now retains
+    /// per-minute bucketed history thanks to Unit 4's `d`-tag fix —
+    /// previously every new heartbeat replaced the prior one and
+    /// uptime always returned ~0).
     pub async fn calculate_uptime(&self, provider_npub: &str, days: u32) -> Result<f32> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -874,8 +999,10 @@ impl NostrRelaySubscriber {
             return Ok(0.0);
         }
 
-        // Expected heartbeats (one per minute)
-        let expected = (days as f32) * 24.0 * 60.0;
+        // Expected heartbeats: one per HEARTBEAT_BUCKET_SECS over
+        // the window. Distinct heartbeats coexist on the relay
+        // because each lands in its own bucketed `d`-tag slot.
+        let expected = (days as f32) * 24.0 * 3600.0 / HEARTBEAT_BUCKET_SECS as f32;
         let actual = heartbeats.len() as f32;
 
         Ok((actual / expected * 100.0).min(100.0))

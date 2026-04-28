@@ -274,6 +274,8 @@ impl ProviderService {
             uptime_percent: 100.0, // Will be calculated from heartbeat history
             total_jobs_completed: stats.total_jobs_completed,
             api_endpoint: None, // TODO: Add if supporting direct API
+            version: crate::nostr::SCHEMA_VERSION,
+            isolation_level: crate::nostr::IsolationLevel::SharedKernel,
         };
 
         self.nostr.publish_provider_offer(offer).await?;
@@ -324,6 +326,7 @@ impl ProviderService {
             timestamp: now,
             active_workloads: workloads.len() as u32,
             available_capacity: capacity,
+            version: crate::nostr::SCHEMA_VERSION,
         };
 
         self.nostr.publish_heartbeat(heartbeat).await?;
