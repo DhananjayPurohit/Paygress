@@ -15,12 +15,11 @@ the payment, provisions a container, and the same token is replayed
 to N other providers — all of which also accept it. No double-spend
 detection fires. The mint never sees the proofs.
 
-**Root cause**: `src/provider.rs:455` (and historically
-`src/cashu.rs::extract_token_value`) only *parses* the serialized
-token to read the face value out of its proofs. Parsing is purely
-local; it does not contact the mint, does not swap proofs (NUT-03),
-and does not consume them. A valid-looking token therefore replays
-indefinitely.
+**Root cause**: `src/cashu.rs::extract_token_value` only *parses* a
+serialized token to read the face value out of its proofs. Parsing
+is purely local; it does not contact the mint, does not swap proofs
+(NUT-03), and does not consume them. A valid-looking token therefore
+replays indefinitely.
 
 **Fix / rule**: Before treating a token as paid, perform a
 swap-on-receive against the mint using `cdk::wallet::Wallet::receive`
@@ -30,15 +29,35 @@ fresh proofs owned by the provider's wallet. Reject the request on
 mint outside the configured whitelist. Only after a successful swap
 may `create_container` (or any backend call) run.
 
-**Where it bites**:
-- `src/provider.rs` Nostr-DM handler (currently the canonical path).
-- `src/cashu.rs` token utilities.
-- Any future provider interface that accepts a Cashu token.
+**Status**: **Closed on the Nostr-DM canonical path** (Unit 1,
+2026-04). `src/provider.rs::handle_spawn_request` now calls
+`crate::cashu::validate_and_redeem` against an injected
+`MintRedeemer` (`CdkRedeemer` in production) which performs a real
+NUT-03 swap and surfaces `RedeemError::AlreadySpent` /
+`RedeemError::Pending` / `RedeemError::Network` as structured Nostr
+error responses *before* any backend call. **Still open on the
+K8s + ngx_l402 + HTTP path** (`src/sidecar_service.rs`,
+`src/pod_provisioning.rs`, `src/interfaces/http_l402.rs`), where
+ngx_l402 is responsible for redemption at the nginx layer. That path
+is feature-gated behind the `kubernetes` Cargo feature in Unit 7;
+once gated out of the default build, the legacy `extract_token_value`
+helper can be removed entirely.
+
+**Where it bites today**:
+- Anyone re-introducing a Cashu accept-path on the Nostr-DM side
+  must call `validate_and_redeem`, not `extract_token_value`.
+- HTTP-path callers depend on ngx_l402 being correctly configured
+  (a deployment requirement, not a Rust-level guarantee). If a client
+  hits the axum endpoint directly without going through nginx
+  (`http_l402.rs:215` / `:310` log "Using Cashu token from request
+  body (direct call, bypassing nginx)"), the token is unverified.
 
 **Reference**: Unit 1 of
-`docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md`. Test
-coverage placeholder lives at `tests/cashu_redemption.rs`. Routstr is
-the production precedent for the `Wallet::receive` integration.
+`docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md`. Tests
+covering happy path, already-spent, non-whitelisted mint, pending,
+mint-network-error, in-provider replay, and cross-provider replay
+live in `tests/cashu_redemption.rs`. Routstr is the production
+precedent for the `Wallet::receive` integration.
 
 ---
 

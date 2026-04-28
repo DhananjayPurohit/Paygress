@@ -262,6 +262,7 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         tunnel_interface: None,
         ssh_port_start: None,
         ssh_port_end: None,
+        cashu_wallet_db_path: "./paygress-cashu-wallet.redb".to_string(),
     };
 
     // Save configuration

@@ -12,6 +12,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::cashu::{
+    derive_seed_from_nostr_key, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
+};
 use crate::compute::{ComputeBackend, ContainerConfig};
 use crate::lxd::LxdBackend;
 use crate::nostr::{
@@ -77,6 +80,18 @@ pub struct ProviderConfig {
     pub ssh_port_start: Option<u16>,
     #[serde(default)]
     pub ssh_port_end: Option<u16>,
+
+    // Cashu wallet settings (Unit 1: real mint redemption on the
+    // Nostr-DM path). The wallet stores swapped proofs, keysets, and
+    // quotes; one redb file holds state for every mint the provider
+    // accepts. Defaults to a path next to the binary so existing
+    // operators don't need to update their config.
+    #[serde(default = "default_cashu_wallet_db_path")]
+    pub cashu_wallet_db_path: String,
+}
+
+fn default_cashu_wallet_db_path() -> String {
+    "./paygress-cashu-wallet.redb".to_string()
 }
 
 impl Default for ProviderConfig {
@@ -116,6 +131,7 @@ impl Default for ProviderConfig {
             tunnel_interface: None,
             ssh_port_start: None,
             ssh_port_end: None,
+            cashu_wallet_db_path: default_cashu_wallet_db_path(),
         }
     }
 }
@@ -136,6 +152,7 @@ pub struct ProviderService {
     config: ProviderConfig,
     backend: Arc<dyn ComputeBackend>,
     nostr: NostrRelaySubscriber,
+    redeemer: Arc<dyn MintRedeemer>,
     active_workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: Arc<Mutex<ProviderStats>>,
 }
@@ -164,12 +181,10 @@ impl ProviderService {
                     &config.proxmox_template,
                 ))
             }
-            BackendType::LXD => {
-                Arc::new(LxdBackend::new(
-                    &config.proxmox_storage, // Reuse storage field for pool name
-                    &config.proxmox_bridge,  // Reuse bridge for network
-                ))
-            }
+            BackendType::LXD => Arc::new(LxdBackend::new(
+                &config.proxmox_storage, // Reuse storage field for pool name
+                &config.proxmox_bridge,  // Reuse bridge for network
+            )),
         };
 
         // Initialize Nostr client
@@ -179,6 +194,24 @@ impl ProviderService {
         };
         let nostr = NostrRelaySubscriber::new(relay_config).await?;
 
+        // Initialize the Cashu redeemer. Wallet identity is derived
+        // deterministically from the provider's Nostr private key so
+        // the same provider sees a consistent proof history across
+        // restarts. The redb file holds proofs, keysets, and quotes
+        // for every mint this provider accepts.
+        let wallet_db = cdk_redb::wallet::WalletRedbDatabase::new(std::path::Path::new(
+            &config.cashu_wallet_db_path,
+        ))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open cashu wallet database at {}: {}",
+                config.cashu_wallet_db_path,
+                e
+            )
+        })?;
+        let seed = derive_seed_from_nostr_key(&config.nostr_private_key);
+        let redeemer: Arc<dyn MintRedeemer> = Arc::new(CdkRedeemer::new(Arc::new(wallet_db), seed));
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -187,6 +220,7 @@ impl ProviderService {
             config,
             backend,
             nostr,
+            redeemer,
             active_workloads: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(ProviderStats {
                 total_jobs_completed: 0,
@@ -304,6 +338,7 @@ impl ProviderService {
         let backend = self.backend.clone();
         let config = self.config.clone();
         let nostr = self.nostr.clone();
+        let redeemer = self.redeemer.clone();
         let workloads = self.active_workloads.clone();
         let stats = self.stats.clone();
 
@@ -312,6 +347,7 @@ impl ProviderService {
                 let backend = backend.clone();
                 let config = config.clone();
                 let nostr = nostr.clone();
+                let redeemer = redeemer.clone();
                 let workloads = workloads.clone();
                 let stats = stats.clone();
 
@@ -356,6 +392,7 @@ impl ProviderService {
                                 backend.as_ref(),
                                 &config,
                                 &nostr,
+                                redeemer.as_ref(),
                                 &workloads,
                                 &stats,
                                 &event.pubkey,
@@ -448,11 +485,18 @@ impl ProviderService {
 
 // Clone impl removed as ComputeBackend is Arc'd
 
-/// Handle a spawn request
+/// Handle a spawn request.
+///
+/// Redeems the provided Cashu token at the mint via the supplied
+/// `MintRedeemer` (Unit 1 — see docs/plans/...). On any redemption
+/// failure (invalid token, non-whitelisted mint, already-spent,
+/// pending, network) we reply with a structured error and DO NOT call
+/// the backend — no container is created without a successful swap.
 async fn handle_spawn_request(
     backend: &dyn ComputeBackend,
     config: &ProviderConfig,
     nostr: &NostrRelaySubscriber,
+    redeemer: &dyn MintRedeemer,
     workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: &Arc<Mutex<ProviderStats>>,
     requester_pubkey: &str,
@@ -464,20 +508,20 @@ async fn handle_spawn_request(
         requester_pubkey, request.pod_spec_id
     );
 
-    // 1. Extract Cashu token value
-    let payment_msats = match crate::cashu::extract_token_value(&request.cashu_token).await {
+    // 1. Redeem Cashu token at the mint (Unit 1).
+    let payment_msats = match validate_and_redeem(
+        redeemer,
+        &config.whitelisted_mints,
+        &request.cashu_token,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
-            let err_msg = format!("Invalid Cashu token: {}", e);
-            error!("{}", err_msg);
+            let (error_type, err_msg) = redeem_error_to_response(&e);
+            error!("Cashu redemption failed: {}", err_msg);
             nostr
-                .send_error_response(
-                    requester_pubkey,
-                    "invalid_token",
-                    &err_msg,
-                    None,
-                    message_type,
-                )
+                .send_error_response(requester_pubkey, error_type, &err_msg, None, message_type)
                 .await?;
             return Ok(());
         }
@@ -648,6 +692,39 @@ async fn handle_spawn_request(
 
     info!("Workload {} provisioned for {} seconds", id, duration_secs);
     Ok(())
+}
+
+/// Translate a `RedeemError` into the `(error_type, message)` shape the
+/// Nostr error-response uses. The error-type strings are stable so
+/// consumers can reason about them programmatically (retry on
+/// `network`, give up on `already_spent`, etc.).
+fn redeem_error_to_response(err: &RedeemError) -> (&'static str, String) {
+    match err {
+        RedeemError::InvalidToken(msg) => {
+            ("invalid_token", format!("Invalid Cashu token: {}", msg))
+        }
+        RedeemError::NonWhitelistedMint { mint_url } => (
+            "non_whitelisted_mint",
+            format!("Mint {} is not accepted by this provider", mint_url),
+        ),
+        RedeemError::AlreadySpent => (
+            "token_already_spent",
+            "This Cashu token has already been spent at the mint".to_string(),
+        ),
+        RedeemError::Pending => (
+            "token_pending",
+            "Token is pending at the mint; retry shortly".to_string(),
+        ),
+        RedeemError::Network(msg) => (
+            "mint_network_error",
+            format!("Could not reach mint: {}", msg),
+        ),
+        RedeemError::UnsupportedUnit(unit) => (
+            "unsupported_unit",
+            format!("Token unit {} is not supported", unit),
+        ),
+        RedeemError::MintError(msg) => ("mint_error", format!("Mint rejected redemption: {}", msg)),
+    }
 }
 
 /// Handle a status request
