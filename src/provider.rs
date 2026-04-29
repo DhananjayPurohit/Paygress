@@ -687,6 +687,15 @@ async fn handle_spawn_request(
         })
         .unwrap_or_default();
 
+    let extra_runtime_args: Vec<String> = template
+        .as_ref()
+        .map(|t| t.extra_docker_args.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
+    let data_path: Option<String> = template
+        .as_ref()
+        .and_then(|t| t.data_path.map(|p| p.to_string()));
+
     // 7. Create Container
     let container_config = ContainerConfig {
         id,
@@ -700,6 +709,8 @@ async fn handle_spawn_request(
         host_port: Some(host_port),
         template_ports,
         template_env,
+        extra_runtime_args,
+        data_path,
     };
 
     debug!("Calling backend.create_container for workload {}", id);

@@ -134,6 +134,18 @@ impl ComputeBackend for DockerBackend {
             args.push(format!("{}={}", k, v));
         }
 
+        // Per-template extra flags (ulimits, sysctls, caps).
+        for arg in &config.extra_runtime_args {
+            args.push(arg.clone());
+        }
+
+        // Persistent state volume (vmid-scoped so two instances of
+        // the same template don't share state).
+        if let Some(path) = &config.data_path {
+            args.push("-v".into());
+            args.push(format!("paygress-{}-data:{}", config.id, path));
+        }
+
         // Image must be the last positional arg so docker treats
         // anything after it as the container's CMD (which we don't
         // override — image's default CMD runs).
@@ -175,6 +187,10 @@ impl ComputeBackend for DockerBackend {
     async fn delete_container(&self, id: u32) -> Result<()> {
         let name = Self::name_for(id);
         let _ = self.docker(&["rm", "-f", &name]).await;
+        // Best-effort: also remove the per-vmid data volume so a
+        // re-spawn doesn't inherit stale state.
+        let volume = format!("paygress-{}-data", id);
+        let _ = self.docker(&["volume", "rm", "-f", &volume]).await;
         Ok(())
     }
 
@@ -240,6 +256,8 @@ mod tests {
                 m.insert("FOO".to_string(), "bar".to_string());
                 m
             },
+            extra_runtime_args: vec!["--ulimit".to_string(), "nofile=1024:1024".to_string()],
+            data_path: Some("/var/data".to_string()),
         };
 
         // Mirror the logic in `create_container` for assertion.
