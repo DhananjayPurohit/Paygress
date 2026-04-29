@@ -26,6 +26,56 @@ fn generate_password(len: usize) -> String {
         .collect()
 }
 
+/// Translate the `--replication` + `--standby` CLI flags into the
+/// wire-format `Option<ReplicationMode>` the spawn request carries.
+/// Returns `Ok(None)` for the default (no replication) so the wire
+/// stays empty and old providers don't see a redundant field. Pure
+/// function — exposed for unit-testing the validation matrix.
+pub fn parse_replication_arg(
+    mode: &str,
+    standby_csv: Option<&str>,
+) -> anyhow::Result<Option<paygress::durable_workload::ReplicationMode>> {
+    use paygress::durable_workload::ReplicationMode;
+    match mode {
+        "none" => {
+            if standby_csv.is_some() {
+                anyhow::bail!(
+                    "--standby is only valid with --replication warm-standby (got --replication none)"
+                );
+            }
+            Ok(None)
+        }
+        "checkpointed" => {
+            if standby_csv.is_some() {
+                anyhow::bail!(
+                    "--standby is only valid with --replication warm-standby (got --replication checkpointed)"
+                );
+            }
+            Ok(Some(ReplicationMode::Checkpointed))
+        }
+        "warm-standby" => {
+            let csv = standby_csv.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--replication warm-standby requires --standby <npub1,npub2,...>"
+                )
+            })?;
+            let standby_providers: Vec<String> = csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if standby_providers.is_empty() {
+                anyhow::bail!("--standby must list at least one provider npub");
+            }
+            Ok(Some(ReplicationMode::WarmStandby { standby_providers }))
+        }
+        other => anyhow::bail!(
+            "unknown --replication value `{}` (expected: none | checkpointed | warm-standby)",
+            other
+        ),
+    }
+}
+
 #[derive(Args)]
 pub struct SpawnArgs {
     /// Provider npub (Nostr mode) - if omitted, uses --server for HTTP mode
@@ -70,6 +120,23 @@ pub struct SpawnArgs {
     /// not by users directly.
     #[arg(long, hide = true)]
     pub template_slug: Option<String>,
+
+    /// Replication mode: `none` (default), `checkpointed`, or
+    /// `warm-standby`. Warm-standby additionally requires `--standby`
+    /// listing the standby providers' npubs.
+    ///
+    /// Warm-standby semantics: send the SAME spawn invocation to
+    /// every standby provider too (same `--token` is invalid since
+    /// each pod is paid separately; use `--token <token-i>` per
+    /// provider). The orchestrator on the primary will publish a
+    /// `LeaseRevocation` to the standbys on quorum-loss.
+    #[arg(long, default_value = "none")]
+    pub replication: String,
+
+    /// Comma-separated standby provider npubs (warm-standby only).
+    /// Ignored when `--replication` is not `warm-standby`.
+    #[arg(long)]
+    pub standby: Option<String>,
 }
 
 pub async fn execute(mut args: SpawnArgs, verbose: bool) -> Result<()> {
@@ -239,6 +306,7 @@ async fn execute_nostr_spawn(
         ssh_pass.cyan()
     );
 
+    let replication = parse_replication_arg(&args.replication, args.standby.as_deref())?;
     let request = EncryptedSpawnPodRequest {
         cashu_token: args.token.clone(),
         pod_spec_id: Some(args.tier.clone()),
@@ -246,6 +314,7 @@ async fn execute_nostr_spawn(
         ssh_username: ssh_user,
         ssh_password: ssh_pass,
         template_slug: args.template_slug.clone(),
+        replication,
     };
 
     println!();
@@ -329,4 +398,60 @@ async fn execute_nostr_spawn(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_replication_arg;
+    use paygress::durable_workload::ReplicationMode;
+
+    #[test]
+    fn replication_none_default_returns_no_wire_field() {
+        // Default path: empty wire payload so old providers see
+        // no schema change.
+        assert!(parse_replication_arg("none", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn replication_checkpointed_passes_through() {
+        let r = parse_replication_arg("checkpointed", None).unwrap();
+        assert!(matches!(r, Some(ReplicationMode::Checkpointed)));
+    }
+
+    #[test]
+    fn replication_warm_standby_parses_csv() {
+        let r = parse_replication_arg("warm-standby", Some("npub1a, npub1b ,npub1c"))
+            .unwrap()
+            .unwrap();
+        match r {
+            ReplicationMode::WarmStandby { standby_providers } => {
+                assert_eq!(standby_providers, vec!["npub1a", "npub1b", "npub1c"]);
+            }
+            _ => panic!("expected WarmStandby, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn replication_warm_standby_requires_standby_flag() {
+        let err = parse_replication_arg("warm-standby", None).unwrap_err();
+        assert!(err.to_string().contains("warm-standby requires --standby"));
+    }
+
+    #[test]
+    fn replication_warm_standby_rejects_empty_list() {
+        let err = parse_replication_arg("warm-standby", Some(" , , ")).unwrap_err();
+        assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn replication_none_rejects_standby_flag() {
+        let err = parse_replication_arg("none", Some("npub1x")).unwrap_err();
+        assert!(err.to_string().contains("only valid with --replication warm-standby"));
+    }
+
+    #[test]
+    fn replication_unknown_value_errors() {
+        let err = parse_replication_arg("multi-master", None).unwrap_err();
+        assert!(err.to_string().contains("unknown --replication value"));
+    }
 }
