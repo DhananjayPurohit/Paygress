@@ -35,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use super::batch;
 use super::identity::{get_or_create_identity, parse_relays};
 use super::spawn::{nostr_spawn_round_trip, NostrSpawnOutcome};
+use super::status::{nostr_status_round_trip, NostrStatusOutcome};
+use super::topup::{nostr_topup_round_trip, NostrTopupOutcome};
 use paygress::discovery::DiscoveryClient;
 use paygress::nostr::ProviderFilter;
 
@@ -157,6 +159,37 @@ pub struct BatchParams {
 
 fn default_batch_template() -> String {
     "agent-sandbox".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StatusParams {
+    /// Provider npub that owns the workload.
+    pub provider: String,
+    /// Pod identifier from the spawn response (e.g.
+    /// "container-1042").
+    pub pod_id: String,
+    /// Per-call timeout in seconds.
+    #[serde(default = "default_status_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_status_timeout_secs() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TopupParams {
+    /// Provider npub that owns the workload.
+    pub provider: String,
+    /// Pod identifier from the spawn response.
+    pub pod_id: String,
+    /// Cashu token paying for the lease extension. The provider
+    /// applies `redeemed_amount / rate_msats_per_sec` seconds of
+    /// extension on success.
+    pub token: String,
+    /// Per-call timeout in seconds.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 #[tool_router]
@@ -412,6 +445,102 @@ impl PaygressMcpServer {
             serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string()),
         )]))
     }
+
+    #[tool(
+        description = "Get the current status of an existing Paygress workload by pod_id. Returns expiry, time-remaining, ssh host/port, and resource allocation. Use this to monitor a lease before it expires so you can call `topup_workload` proactively."
+    )]
+    async fn workload_status(
+        &self,
+        Parameters(params): Parameters<StatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let relays = self.resolve_relays();
+        let nostr_key = self.resolve_nostr_key()?;
+
+        let outcome = nostr_status_round_trip(
+            &params.pod_id,
+            &params.provider,
+            relays,
+            nostr_key,
+            params.timeout_secs,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("status: {}", e), None))?;
+
+        let body = match outcome {
+            NostrStatusOutcome::Success(s) => serde_json::json!({
+                "status": "ok",
+                "pod_id": s.pod_id,
+                "lease_status": s.status,
+                "expires_at": s.expires_at,
+                "time_remaining_seconds": s.time_remaining_seconds,
+                "cpu_millicores": s.cpu_millicores,
+                "memory_mb": s.memory_mb,
+                "ssh_host": s.ssh_host,
+                "ssh_port": s.ssh_port,
+                "ssh_username": s.ssh_username,
+            }),
+            NostrStatusOutcome::UnparseableResponse(content) => serde_json::json!({
+                "status": "unknown_response",
+                "content": content,
+            }),
+            NostrStatusOutcome::Timeout => serde_json::json!({
+                "status": "timeout",
+                "message": "provider did not respond within the timeout window",
+            }),
+        };
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
+        )]))
+    }
+
+    #[tool(
+        description = "Extend an existing Paygress workload's lease by paying the provider with another Cashu token. The provider redeems the token at the mint and adds `redeemed_amount / rate_msats_per_sec` seconds to the lease. Returns the new expiry on success or a structured provider error (lease_expired, not_owner, insufficient_payment, race_lost, etc.) on failure."
+    )]
+    async fn topup_workload(
+        &self,
+        Parameters(params): Parameters<TopupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let relays = self.resolve_relays();
+        let nostr_key = self.resolve_nostr_key()?;
+
+        let outcome = nostr_topup_round_trip(
+            &params.pod_id,
+            &params.token,
+            &params.provider,
+            relays,
+            nostr_key,
+            params.timeout_secs,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("topup: {}", e), None))?;
+
+        let body = match outcome {
+            NostrTopupOutcome::Success(r) => serde_json::json!({
+                "status": "ok",
+                "pod_id": r.pod_npub,
+                "extended_duration_seconds": r.extended_duration_seconds,
+                "new_expires_at": r.new_expires_at,
+                "message": r.message,
+            }),
+            NostrTopupOutcome::ProviderError(err) => serde_json::json!({
+                "status": "provider_error",
+                "error_type": err.error_type,
+                "message": err.message,
+                "details": err.details,
+            }),
+            NostrTopupOutcome::UnknownResponse(content) => serde_json::json!({
+                "status": "unknown_response",
+                "content": content,
+            }),
+            NostrTopupOutcome::Timeout => serde_json::json!({
+                "status": "timeout",
+                "message": "provider did not respond within the timeout window — token MAY have been spent; call workload_status to verify before retrying"
+            }),
+        };
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -420,10 +549,11 @@ impl ServerHandler for PaygressMcpServer {
         ServerInfo {
             instructions: Some(
                 "Paygress: pay-per-use compute marketplace using Cashu ecash and Nostr. \
-                 Use `list_providers` to discover providers, `spawn_workload` to pay for a \
-                 single ephemeral container, and `batch_spawn` for parallel N-shard fan-out. \
-                 The agent connects to the returned host:ssh_port itself for the actual \
-                 exec — Paygress is the spawn/billing fabric, not the exec channel."
+                 Lifecycle: `list_providers` (discover) → `spawn_workload` (single) or \
+                 `batch_spawn` (N-shard fan-out) → `workload_status` (monitor) → \
+                 `topup_workload` (extend before expiry). The agent connects to the \
+                 returned host:ssh_port itself to actually run code — Paygress is the \
+                 spawn/billing/lifecycle fabric, not the exec channel."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -452,11 +582,13 @@ mod tests {
         let server = PaygressMcpServer::new(McpArgs::default());
         let info = server.get_info();
         assert!(info.capabilities.tools.is_some());
-        assert!(info
-            .instructions
-            .as_deref()
-            .unwrap_or("")
-            .contains("Paygress"));
+        let inst = info.instructions.as_deref().unwrap_or("");
+        assert!(inst.contains("Paygress"));
+        // Pin the lifecycle hint so future edits don't drop the
+        // workload_status / topup_workload mentions — agents rely on
+        // these to know when to call them.
+        assert!(inst.contains("workload_status"));
+        assert!(inst.contains("topup_workload"));
     }
 
     #[test]
@@ -485,6 +617,29 @@ mod tests {
         assert_eq!(v.template, "agent-sandbox");
         assert_eq!(v.tier, "basic");
         assert_eq!(v.tokens.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn status_params_defaults_round_trip() {
+        let v = serde_json::from_value::<StatusParams>(serde_json::json!({
+            "provider": "npub1abc",
+            "pod_id": "container-7",
+        }))
+        .unwrap();
+        assert_eq!(v.timeout_secs, 30);
+        assert_eq!(v.pod_id, "container-7");
+    }
+
+    #[test]
+    fn topup_params_defaults_round_trip() {
+        let v = serde_json::from_value::<TopupParams>(serde_json::json!({
+            "provider": "npub1abc",
+            "pod_id": "container-7",
+            "token": "tok",
+        }))
+        .unwrap();
+        assert_eq!(v.timeout_secs, 120);
+        assert_eq!(v.token, "tok");
     }
 
     #[test]
