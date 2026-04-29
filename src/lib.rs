@@ -20,6 +20,7 @@ pub mod cashu;
 pub mod durable_workload;
 pub mod nostr;
 pub mod reputation;
+pub mod stake;
 
 // Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;
