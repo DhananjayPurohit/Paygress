@@ -29,6 +29,11 @@ required-features = ["kubernetes"]
 name = "paygress-cli"
 path = "src/cli/main.rs"
 
+# Observatory snapshot crawler (powers the dashboard).
+[[bin]]
+name = "paygress-snapshot"
+path = "src/bin/paygress_snapshot.rs"
+
 [features]
 # `kubernetes` gates the legacy K8s + ngx_l402 + HTTP control plane
 # (src/sidecar_service.rs, src/pod_provisioning.rs,
