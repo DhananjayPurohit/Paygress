@@ -15,7 +15,8 @@ use tracing::{debug, error, info, warn};
 use crate::cashu::{
     derive_seed_from_nostr_key, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
 };
-use crate::compute::{ComputeBackend, ContainerConfig};
+use crate::compute::{ComputeBackend, ContainerConfig, PortMapping};
+use crate::docker::DockerBackend;
 use crate::lxd::LxdBackend;
 use crate::nostr::{
     parse_private_message_content, AccessDetailsContent, CapacityInfo, EncryptedSpawnPodRequest,
@@ -24,11 +25,17 @@ use crate::nostr::{
     StatusResponseContent, TopUpResponseContent,
 };
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
+use crate::templates::{TemplateDefinition, TemplateName};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BackendType {
     Proxmox,
     LXD,
+    /// Docker backend. Required for the killer-templates path
+    /// (#31): templates use real public Docker images that LXD
+    /// can't run natively. Provider must have the `docker` CLI
+    /// installed and accessible to the running user.
+    Docker,
 }
 
 impl Default for BackendType {
@@ -186,6 +193,7 @@ impl ProviderService {
                 &config.proxmox_storage, // Reuse storage field for pool name
                 &config.proxmox_bridge,  // Reuse bridge for network
             )),
+            BackendType::Docker => Arc::new(DockerBackend::new()),
         };
 
         // Initialize Nostr client
@@ -608,23 +616,90 @@ async fn handle_spawn_request(
     // 5. Generate credentials
     let password = generate_password();
 
-    // Calculate host port for forwarding
+    // Calculate host port for SSH forwarding (LXD/Proxmox path).
     let host_port = match config.ssh_port_start {
         Some(start) => start + (id - config.vmid_range_start) as u16,
         None => 30000 + (id % 10000) as u16,
     };
 
-    // 6. Create Container
+    // 6. Resolve template (if requested) — image + ports + env come
+    //    from the provider's OWN local registry, not consumer bytes.
+    //    Unknown slugs are rejected so a consumer can't probe for
+    //    accepted templates by sending arbitrary strings.
+    let template = if let Some(slug) = request.template_slug.as_deref() {
+        match TemplateName::from_slug(slug) {
+            Some(name) => Some(TemplateDefinition::lookup(name)),
+            None => {
+                let err_msg = format!(
+                    "Unknown template `{}` — provider does not advertise it",
+                    slug
+                );
+                warn!("{}", err_msg);
+                nostr
+                    .send_error_response(
+                        requester_pubkey,
+                        "unknown_template",
+                        &err_msg,
+                        None,
+                        message_type,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Image: template wins over consumer-supplied (sandbox).
+    let image = template
+        .as_ref()
+        .map(|t| t.image.to_string())
+        .unwrap_or_else(|| request.pod_image.clone());
+
+    // Port mappings: each template port published on a host port
+    // derived from `host_port` so multiple workloads on the same
+    // provider don't collide. We allocate `host_port + i + 1` for
+    // template port i (host_port itself stays for SSH where backends
+    // care about it).
+    let template_ports: Vec<PortMapping> = template
+        .as_ref()
+        .map(|t| {
+            t.ports
+                .iter()
+                .enumerate()
+                .map(|(i, p)| PortMapping {
+                    host_port: host_port.saturating_add(1 + i as u16),
+                    container_port: p.container_port,
+                    protocol: "tcp",
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let template_env: HashMap<String, String> = template
+        .as_ref()
+        .map(|t| {
+            t.env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 7. Create Container
     let container_config = ContainerConfig {
         id,
         name: format!("paygress-{}", id),
-        image: request.pod_image.clone(),
+        image,
         cpu_cores: (spec.cpu_millicores / 1000).max(1) as u32,
         memory_mb: spec.memory_mb as u32,
         storage_gb: 10, // Default 10GB
         password: password.clone(),
         ssh_key: None,
         host_port: Some(host_port),
+        template_ports,
+        template_env,
     };
 
     debug!("Calling backend.create_container for workload {}", id);

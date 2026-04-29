@@ -63,6 +63,13 @@ pub struct SpawnArgs {
     /// Custom Nostr relays (comma-separated)
     #[arg(long)]
     pub relays: Option<String>,
+
+    /// Template slug (e.g. `nostr-relay`). When set, the provider
+    /// materializes image/ports/env from its OWN template registry
+    /// and ignores `--image`. Normally set by `paygress deploy`,
+    /// not by users directly.
+    #[arg(long, hide = true)]
+    pub template_slug: Option<String>,
 }
 
 pub async fn execute(mut args: SpawnArgs, verbose: bool) -> Result<()> {
@@ -238,6 +245,7 @@ async fn execute_nostr_spawn(
         pod_image: args.image,
         ssh_username: ssh_user,
         ssh_password: ssh_pass,
+        template_slug: args.template_slug.clone(),
     };
 
     println!();
