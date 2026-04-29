@@ -44,6 +44,13 @@ pub enum TemplateName {
     InferenceEndpoint,
     HeadlessBrowser,
     BitcoinNode,
+    /// Generic compute sandbox for AI agents, CI/test runners, and
+    /// map-reduce / batch shards. Python + Node + git in a writable
+    /// `/workspace` volume; no browser (the `HeadlessBrowser`
+    /// template covers that case). Stateless by default — a crash
+    /// means "retry from scratch", which is what the upstream caller
+    /// already does.
+    AgentSandbox,
 }
 
 impl TemplateName {
@@ -55,6 +62,7 @@ impl TemplateName {
             Self::InferenceEndpoint => "inference-endpoint",
             Self::HeadlessBrowser => "headless-browser",
             Self::BitcoinNode => "bitcoin-node",
+            Self::AgentSandbox => "agent-sandbox",
         }
     }
 
@@ -64,16 +72,18 @@ impl TemplateName {
             "inference-endpoint" => Some(Self::InferenceEndpoint),
             "headless-browser" => Some(Self::HeadlessBrowser),
             "bitcoin-node" => Some(Self::BitcoinNode),
+            "agent-sandbox" => Some(Self::AgentSandbox),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 4] {
+    pub fn all() -> [Self; 5] {
         [
             Self::NostrRelay,
             Self::InferenceEndpoint,
             Self::HeadlessBrowser,
             Self::BitcoinNode,
+            Self::AgentSandbox,
         ]
     }
 }
@@ -143,6 +153,7 @@ impl TemplateDefinition {
             TemplateName::InferenceEndpoint => inference_endpoint(),
             TemplateName::HeadlessBrowser => headless_browser(),
             TemplateName::BitcoinNode => bitcoin_node(),
+            TemplateName::AgentSandbox => agent_sandbox(),
         }
     }
 
@@ -271,6 +282,46 @@ fn bitcoin_node() -> TemplateDefinition {
     }
 }
 
+fn agent_sandbox() -> TemplateDefinition {
+    let mut env = HashMap::new();
+    env.insert("WORKSPACE", "/workspace");
+    env.insert("PYTHONUNBUFFERED", "1");
+    env.insert("NODE_ENV", "production");
+    TemplateDefinition {
+        name: TemplateName::AgentSandbox,
+        summary: "Generic compute sandbox: Python 3.12 + Node 20 + git in a writable /workspace volume. Built for AI agents writing code, CI/test runners, and map-reduce / batch shards. Stateless by default — retry-on-fresh-provider is the recovery model. Browser-using agents should compose with the `headless-browser` template.",
+        // Community-maintained image with Python + Node + git/curl
+        // preinstalled. Battle-tested in the data-engineering /
+        // CI ecosystem; pinned by major version so a registry-side
+        // rebuild doesn't silently change behavior.
+        image: "nikolaik/python-nodejs:python3.12-nodejs20",
+        ports: vec![Port {
+            // One generic HTTP port for agents/jobs that want to
+            // serve results or expose a status endpoint. The host
+            // mapping is published in AccessDetailsContent so the
+            // caller can reach it without scraping the SSH instruction.
+            container_port: 8080,
+            protocol: "http",
+            label: "sandbox-http",
+        }],
+        env,
+        compose_path: "templates/agent-sandbox/docker-compose.yml",
+        extra_docker_args: &[],
+        // /workspace is the agent's writable scratch. Persistent
+        // across restarts on the same provider so a long-running
+        // agent task that gets restarted (e.g. backend restart)
+        // doesn't lose its checkout.
+        data_path: Some("/workspace"),
+        tier: "basic",
+        replication: ReplicationMode::None,
+        // Sized for a typical CI step / agent run, not a heavyweight
+        // ML job. Operators can offer larger tiers separately.
+        min_cpu_millicores: 500,
+        min_memory_mb: 1024,
+        min_storage_gb: 5,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +393,25 @@ mod tests {
             TemplateDefinition::lookup(TemplateName::BitcoinNode).replication,
             ReplicationMode::Checkpointed
         );
+        // Agent sandbox: same recovery model as headless-browser
+        // (retry-from-scratch on a fresh provider) — most CI / agent
+        // runs are short-lived and naturally idempotent at the harness
+        // level, so paying for warm-standby would be pure waste.
+        assert_eq!(
+            TemplateDefinition::lookup(TemplateName::AgentSandbox).replication,
+            ReplicationMode::None
+        );
+    }
+
+    #[test]
+    fn agent_sandbox_has_workspace_data_path() {
+        // The /workspace volume is the contract for callers that
+        // want to leave artifacts for retrieval over SSH (e.g.
+        // map-reduce shards writing partial results). If this
+        // changes, the docker-compose.yml and the user-facing docs
+        // need to follow.
+        let def = TemplateDefinition::lookup(TemplateName::AgentSandbox);
+        assert_eq!(def.data_path, Some("/workspace"));
+        assert_eq!(def.env.get("WORKSPACE"), Some(&"/workspace"));
     }
 }
