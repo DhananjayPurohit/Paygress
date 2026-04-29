@@ -14,6 +14,8 @@
 //   path so engineering capacity flows to the canonical plane.
 
 // Core modules — always compiled.
+pub mod blossom;
+pub mod blossom_crypto;
 pub mod cashu;
 pub mod durable_workload;
 pub mod nostr;
