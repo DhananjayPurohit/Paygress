@@ -32,6 +32,14 @@ use tracing::{debug, error, info, warn};
 pub const KIND_PROVIDER_OFFER: u16 = 38383;
 pub const KIND_PROVIDER_HEARTBEAT: u16 = 38384;
 pub const KIND_PROVIDER_HEARTBEAT_EPHEMERAL: u16 = 20384;
+/// Lease revocation event (Unit 5 wiring). Published by a primary
+/// provider when its workload state machine emits
+/// `PublishLeaseRevocation` — i.e. the local state has left `Live`
+/// for a `WarmStandby` workload. Addressable so a standby that came
+/// online after the publish can still find it on cold start. The
+/// `d` tag is `paygress:revocation:v1:<primary_npub>:<workload_id>`
+/// and each standby is added as a `#p` tag for filterable subscriptions.
+pub const KIND_LEASE_REVOCATION: u16 = 38385;
 
 /// Schema version for offer + heartbeat payloads. Old payloads
 /// without this field deserialize to `1` via `#[serde(default)]`.
@@ -756,6 +764,34 @@ pub struct HeartbeatContent {
     pub version: u8,
 }
 
+/// Lease revocation content (Unit 5 wiring).
+///
+/// Emitted by a primary provider whose workload state machine has
+/// transitioned the workload out of `Live` (typically because the
+/// primary observed its own heartbeats failing to reach quorum at
+/// relays — split-brain self-eviction). Standby providers listed in
+/// `standby_providers` can promote on observing this event without
+/// fear of two writers, because the primary has *already* left Live
+/// before publishing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseRevocationContent {
+    pub workload_id: u32,
+    pub primary_provider_npub: String,
+    pub standby_providers: Vec<String>,
+    pub reason: String,
+    pub revoked_at: u64,
+
+    /// Optional Blossom URI of the latest checkpoint (Unit 6). When
+    /// set, the standby restores from this state rather than spawning
+    /// a fresh container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_uri: Option<String>,
+
+    /// Schema version. v0 (no field on the wire) deserializes to 1.
+    #[serde(default = "default_schema_version")]
+    pub version: u8,
+}
+
 /// Provider info as seen by discovery clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfo {
@@ -815,15 +851,20 @@ impl NostrRelaySubscriber {
 
     /// Publish a heartbeat event on BOTH the addressable (stored,
     /// kind 38384) and ephemeral (kind 20384) kinds. Returns the
-    /// addressable event id (the one consumers care about for uptime
-    /// history).
+    /// addressable event id and the set of relay URLs that
+    /// successfully accepted the *stored* heartbeat — the orchestrator
+    /// loop (Unit 5 wiring) consumes these as `HeartbeatObservation`s
+    /// to drive the workload state machine.
     ///
     /// The addressable form uses a per-minute bucketed `d` tag
     /// (`paygress:heartbeat:v1:<npub>:<bucket>`) so each minute's
     /// heartbeat lands in its own `(pubkey, kind, d-tag)` slot.
     /// Without bucketing, every heartbeat replaces the previous one
     /// at the relay and `calculate_uptime` sees zero history.
-    pub async fn publish_heartbeat(&self, heartbeat: HeartbeatContent) -> Result<String> {
+    pub async fn publish_heartbeat(
+        &self,
+        heartbeat: HeartbeatContent,
+    ) -> Result<(String, Vec<String>)> {
         let content = serde_json::to_string(&heartbeat)?;
         let bucket = heartbeat.timestamp / HEARTBEAT_BUCKET_SECS;
         let d_tag = format!(
@@ -864,8 +905,12 @@ impl NostrRelaySubscriber {
         );
         let ephemeral_event = ephemeral.to_event(&self.keys)?;
 
+        let mut accepting_relays: Vec<String> = Vec::new();
         match self.client.send_event(stored_event).await {
-            Ok(_) => debug!("📦 Stored heartbeat published: {}", stored_id),
+            Ok(out) => {
+                debug!("📦 Stored heartbeat published: {}", stored_id);
+                accepting_relays = out.success.iter().map(|u| u.to_string()).collect();
+            }
             Err(e) => warn!("Failed to publish stored heartbeat: {}", e),
         }
         match self.client.send_event(ephemeral_event).await {
@@ -873,8 +918,71 @@ impl NostrRelaySubscriber {
             Err(e) => warn!("Failed to publish ephemeral heartbeat: {}", e),
         }
 
-        info!("💓 Heartbeat published (stored + ephemeral): {}", stored_id);
-        Ok(stored_id)
+        info!(
+            "💓 Heartbeat published (stored + ephemeral): {} accepted by {} relay(s)",
+            stored_id,
+            accepting_relays.len()
+        );
+        Ok((stored_id, accepting_relays))
+    }
+
+    /// Publish a `LeaseRevocationContent` event (Unit 5 wiring).
+    ///
+    /// Addressable kind 38385, keyed by
+    /// `(pubkey, kind, d="paygress:revocation:v1:<primary_npub>:<workload_id>")`
+    /// so a standby coming online after the publish still observes
+    /// the latest revocation for that workload. Each standby is
+    /// added as a `#p` tag so subscribers filtering by their own
+    /// pubkey see only revocations addressed to them.
+    pub async fn publish_lease_revocation(
+        &self,
+        revocation: LeaseRevocationContent,
+    ) -> Result<String> {
+        let content = serde_json::to_string(&revocation)?;
+        let d_tag = format!(
+            "paygress:revocation:v{}:{}:{}",
+            revocation.version, revocation.primary_provider_npub, revocation.workload_id
+        );
+        let v_tag = revocation.version.to_string();
+        let workload_id_str = revocation.workload_id.to_string();
+
+        let mut tags = vec![
+            Tag::hashtag("paygress"),
+            Tag::hashtag("paygress-revocation"),
+            Tag::parse(&["d", &d_tag])?,
+            Tag::parse(&["v", &v_tag])?,
+            Tag::parse(&["workload", &workload_id_str])?,
+        ];
+        for standby_npub in &revocation.standby_providers {
+            if let Ok(pk) = nostr_sdk::PublicKey::parse(standby_npub) {
+                tags.push(Tag::public_key(pk));
+            } else {
+                warn!(
+                    "Skipping unparseable standby npub in revocation: {}",
+                    standby_npub
+                );
+            }
+        }
+
+        let builder = EventBuilder::new(Kind::Custom(KIND_LEASE_REVOCATION), content, tags);
+        let event = builder.to_event(&self.keys)?;
+        let event_id = event.id.to_hex();
+
+        match self.client.send_event(event).await {
+            Ok(out) => {
+                info!(
+                    "📜 Lease revocation published for workload {}: {} accepted by {} relay(s)",
+                    revocation.workload_id,
+                    event_id,
+                    out.success.len()
+                );
+                Ok(event_id)
+            }
+            Err(e) => {
+                error!("Failed to publish lease revocation: {}", e);
+                Err(e.into())
+            }
+        }
     }
 
     /// Query all provider offers from relays
