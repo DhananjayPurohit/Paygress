@@ -224,6 +224,122 @@ pub fn derive_seed_from_nostr_key(nostr_private_key: &str) -> [u8; 32] {
     sha256::Hash::hash(preimage.as_bytes()).to_byte_array()
 }
 
+/// Split one Cashu token into N tokens of approximately equal face
+/// value. Used by `paygress batch --split-token ... --shards N` so
+/// users don't have to hand-mint N tokens before fanning out.
+///
+/// Flow: open an ephemeral wallet at `db_path`, swap the input token
+/// in (mint round-trip), then prepare+send N tokens whose face
+/// values sum to the received amount. The first `N-1` shards each
+/// get `received / N` (integer floor); the final shard absorbs any
+/// remainder so the totals reconcile exactly.
+///
+/// Caveats:
+///   - This is `cdk::wallet` 0.9. Modern mints with v2 (66-char)
+///     keyset IDs (e.g. mint.minibits.cash) may fail at receive due
+///     to the same parsing issue we hit on the redeemer side. Tested
+///     today against `testnut.cashu.space`. cdk 0.14 upgrade is
+///     tracked separately.
+///   - The wallet's localstore at `db_path` is left in place after
+///     the split; callers wanting truly ephemeral semantics should
+///     remove it. The batch coordinator does.
+pub async fn split_token_into_n(
+    token_str: &str,
+    n: usize,
+    db_path: &Path,
+) -> Result<Vec<String>, anyhow::Error> {
+    use cdk::wallet::SendOptions;
+    use cdk::Amount;
+    use rand::RngCore;
+
+    if n == 0 {
+        anyhow::bail!("cannot split into 0 shards");
+    }
+
+    let token = Token::from_str(token_str)
+        .map_err(|e| anyhow::anyhow!("invalid input token: {}", e))?;
+    let mint_url = token
+        .mint_url()
+        .map_err(|e| anyhow::anyhow!("token has no mint URL: {}", e))?;
+    let unit = token.unit().unwrap_or(CurrencyUnit::Sat);
+
+    // Face-value pre-check: bail before touching the mint if N is
+    // mathematically infeasible. Keeps the error fast and the token
+    // unspent on bad input.
+    let face_value: u64 = token
+        .proofs()
+        .iter()
+        .map(|p| {
+            let v: u64 = p.amount.into();
+            v
+        })
+        .sum();
+    if face_value == 0 {
+        anyhow::bail!("input token has zero face value");
+    }
+    if (face_value as usize) < n {
+        anyhow::bail!(
+            "input token face value ({} {:?}) cannot be split into {} shards (minimum 1 per shard)",
+            face_value,
+            unit,
+            n
+        );
+    }
+
+    let db = cdk_redb::wallet::WalletRedbDatabase::new(db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open ephemeral wallet db at {}: {}",
+            db_path.display(),
+            e
+        )
+    })?;
+    let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
+
+    // Random seed — the wallet is ephemeral, so deterministic
+    // derivation buys us nothing.
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+
+    let wallet = Wallet::new(&mint_url.to_string(), unit, db, &seed, None)
+        .map_err(|e| anyhow::anyhow!("wallet construction failed: {}", e))?;
+
+    let received = wallet
+        .receive(token_str, ReceiveOptions::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to receive input token: {}", e))?;
+    let received_value: u64 = received.into();
+    if (received_value as usize) < n {
+        anyhow::bail!(
+            "received amount ({}) less than shard count ({}); mint may have charged fees",
+            received_value,
+            n
+        );
+    }
+
+    let per_shard_floor = received_value / n as u64;
+    let final_shard = received_value - per_shard_floor * (n as u64 - 1);
+
+    let mut tokens: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let amount = if i + 1 == n {
+            final_shard
+        } else {
+            per_shard_floor
+        };
+        let prepared = wallet
+            .prepare_send(Amount::from(amount), SendOptions::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("prepare_send shard {}/{}: {}", i + 1, n, e))?;
+        let token = wallet
+            .send(prepared, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("send shard {}/{}: {}", i + 1, n, e))?;
+        tokens.push(token.to_string());
+    }
+
+    Ok(tokens)
+}
+
 /// **Legacy face-value parser.** Returns the sum of `proof.amount` from
 /// a decoded token in msats, **without contacting the mint**. This is
 /// vulnerable to single- and cross-provider replay.
