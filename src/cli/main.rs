@@ -6,7 +6,7 @@ use colored::Colorize;
 mod api;
 mod commands;
 
-use commands::{batch, bootstrap, deploy, list, provider, spawn, status, system, topup};
+use commands::{batch, bootstrap, deploy, list, mcp, provider, spawn, status, system, topup};
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
 #[derive(Parser)]
@@ -44,6 +44,11 @@ enum Commands {
     /// Fan-out N workloads in parallel for map-reduce shards, CI
     /// matrices, and embarrassingly-parallel batch jobs.
     Batch(batch::BatchArgs),
+
+    /// Run a Model Context Protocol (MCP) server over stdio so AI
+    /// harnesses (Claude Desktop, Claude Code, Cline, Cursor, ...)
+    /// can spawn / batch / discover providers as native tools.
+    Mcp(mcp::McpArgs),
 
     // ============ Provider Commands ============
     /// Provider management - setup, start, stop, status
@@ -86,6 +91,7 @@ async fn main() {
         Commands::Topup(args) => topup::execute(args, cli.verbose).await,
         Commands::Status(args) => status::execute(args, cli.verbose).await,
         Commands::Batch(args) => batch::execute(args, cli.verbose).await,
+        Commands::Mcp(args) => mcp::execute(args, cli.verbose).await,
 
         // Provider
         Commands::Provider(args) => provider::execute(args, cli.verbose).await,
