@@ -85,16 +85,62 @@ async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> R
     Ok(())
 }
 
+/// Typed outcome of a Nostr status round-trip. Same dual-shape
+/// pattern as `NostrSpawnOutcome`: lets the pretty-print path and
+/// the MCP server share one transport.
+#[derive(Debug, Clone)]
+pub enum NostrStatusOutcome {
+    Success(paygress::nostr::StatusResponseContent),
+    /// Provider responded but the body wasn't a valid status response
+    /// (could be a future-shape forward-compat surprise).
+    UnparseableResponse(String),
+    /// Provider didn't respond within the timeout window.
+    Timeout,
+}
+
+/// Dispatch a single Nostr status request and wait for the provider's
+/// reply. No I/O on stdout — pure round-trip + structured outcome.
+pub async fn nostr_status_round_trip(
+    pod_id: &str,
+    provider_npub: &str,
+    relays: Vec<String>,
+    nostr_key: String,
+    timeout_secs: u64,
+) -> Result<NostrStatusOutcome> {
+    use paygress::discovery::DiscoveryClient;
+    use paygress::nostr::{StatusRequestContent, StatusResponseContent};
+
+    let client = DiscoveryClient::new_with_key(relays, nostr_key).await?;
+
+    let request = StatusRequestContent {
+        pod_id: pod_id.to_string(),
+    };
+    let request_json = serde_json::to_string(&request)?;
+
+    client
+        .nostr()
+        .send_encrypted_private_message(provider_npub, request_json, "nip04")
+        .await?;
+
+    match client
+        .nostr()
+        .wait_for_decrypted_message(provider_npub, timeout_secs)
+        .await
+    {
+        Ok(response) => match serde_json::from_str::<StatusResponseContent>(&response.content) {
+            Ok(s) => Ok(NostrStatusOutcome::Success(s)),
+            Err(_) => Ok(NostrStatusOutcome::UnparseableResponse(response.content)),
+        },
+        Err(_) => Ok(NostrStatusOutcome::Timeout),
+    }
+}
+
 async fn execute_nostr_status(
     pod_id: String,
     provider_npub: String,
     relays_opt: Option<String>,
     verbose: bool,
 ) -> Result<()> {
-    use paygress::nostr::{
-        NostrRelaySubscriber, RelayConfig, StatusRequestContent, StatusResponseContent,
-    };
-
     if verbose {
         println!("{} Checking workload status via Nostr...", "->".blue());
         println!("  Provider: {}", provider_npub);
@@ -112,34 +158,12 @@ async fn execute_nostr_status(
 
     let nostr_key = get_or_create_identity(None)?;
     let relays = parse_relays(relays_opt);
-    let relay_config = RelayConfig {
-        relays,
-        private_key: Some(nostr_key),
-    };
 
-    let client = NostrRelaySubscriber::new(relay_config).await?;
+    let outcome = nostr_status_round_trip(&pod_id, &provider_npub, relays, nostr_key, 30).await?;
+    spinner.finish_and_clear();
 
-    client
-        .subscribe_to_pod_events(|_| Box::pin(async { Ok(()) }))
-        .await?;
-
-    let request = StatusRequestContent {
-        pod_id: pod_id.clone(),
-    };
-    let content = serde_json::to_string(&request)?;
-
-    client
-        .send_encrypted_private_message(&provider_npub, content, "nip17")
-        .await?;
-
-    spinner.set_message("Waiting for provider response...");
-
-    match client.wait_for_decrypted_message(&provider_npub, 30).await {
-        Ok(response_event) => {
-            spinner.finish_and_clear();
-
-            let status_resp: StatusResponseContent = serde_json::from_str(&response_event.content)?;
-
+    match outcome {
+        NostrStatusOutcome::Success(status_resp) => {
             display_status(
                 &status_resp.pod_id,
                 &status_resp.status,
@@ -150,11 +174,15 @@ async fn execute_nostr_status(
                 Some(status_resp.time_remaining_seconds),
             );
         }
-        Err(e) => {
-            spinner.finish_and_clear();
+        NostrStatusOutcome::UnparseableResponse(body) => {
             return Err(anyhow::anyhow!(
-                "Timed out waiting for status from provider: {}",
-                e
+                "Provider returned an unrecognized status response (forward-compat schema?): {}",
+                body
+            ));
+        }
+        NostrStatusOutcome::Timeout => {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for status from provider"
             ));
         }
     }

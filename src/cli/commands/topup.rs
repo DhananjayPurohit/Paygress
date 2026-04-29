@@ -149,6 +149,71 @@ async fn execute_http_topup(
     Ok(())
 }
 
+/// Typed outcome of a Nostr topup round-trip. Same dual-shape pattern
+/// as `NostrSpawnOutcome` — lets the pretty-print path and the MCP
+/// server share one transport.
+#[derive(Debug, Clone)]
+pub enum NostrTopupOutcome {
+    Success(paygress::nostr::TopUpResponseContent),
+    /// Provider rejected the topup (insufficient payment, lease
+    /// expired, not the owner, race-lost, etc.). Error type strings
+    /// are stable — callers can match.
+    ProviderError(paygress::nostr::ErrorResponseContent),
+    /// Provider responded but the body wasn't either schema.
+    UnknownResponse(String),
+    /// Provider didn't respond within the timeout window. The token
+    /// MAY have been spent — caller should `status` to check.
+    Timeout,
+}
+
+/// Dispatch a single Nostr topup request and wait for the provider's
+/// reply. No I/O on stdout — pure round-trip + structured outcome.
+pub async fn nostr_topup_round_trip(
+    pod_id: &str,
+    token: &str,
+    provider_npub: &str,
+    relays: Vec<String>,
+    nostr_key: String,
+    timeout_secs: u64,
+) -> Result<NostrTopupOutcome> {
+    use paygress::nostr::{EncryptedTopUpPodRequest, ErrorResponseContent, TopUpResponseContent};
+
+    let client = DiscoveryClient::new_with_key(relays, nostr_key).await?;
+
+    let request = EncryptedTopUpPodRequest {
+        pod_npub: pod_id.to_string(),
+        cashu_token: token.to_string(),
+    };
+    let request_json = serde_json::to_string(&request)?;
+
+    client
+        .nostr()
+        .send_encrypted_private_message(provider_npub, request_json, "nip04")
+        .await?;
+
+    match client
+        .nostr()
+        .wait_for_decrypted_message(provider_npub, timeout_secs)
+        .await
+    {
+        Ok(response) => {
+            // Provider reply order: try TopUpResponseContent first
+            // (the success path) then ErrorResponseContent. Both have
+            // distinct shapes so the wrong-type parse fails cleanly.
+            if let Ok(s) = serde_json::from_str::<TopUpResponseContent>(&response.content) {
+                Ok(NostrTopupOutcome::Success(s))
+            } else if let Ok(err) =
+                serde_json::from_str::<ErrorResponseContent>(&response.content)
+            {
+                Ok(NostrTopupOutcome::ProviderError(err))
+            } else {
+                Ok(NostrTopupOutcome::UnknownResponse(response.content))
+            }
+        }
+        Err(_) => Ok(NostrTopupOutcome::Timeout),
+    }
+}
+
 async fn execute_nostr_topup(
     provider_npub: String,
     args: TopupArgs,
@@ -162,56 +227,49 @@ async fn execute_nostr_topup(
     let relays = parse_relays(args.relays);
     let nostr_key = get_or_create_identity(args.nostr_key)?;
 
-    let client = DiscoveryClient::new_with_key(relays, nostr_key).await?;
-
     println!("  Pod ID:   {}", args.pod_id.cyan());
     println!("  Provider: {}", provider_npub);
     println!();
-
-    let request = paygress::nostr::EncryptedTopUpPodRequest {
-        pod_npub: args.pod_id.clone(),
-        cashu_token: token,
-    };
-
     print!("  Sending topup request... ");
-
-    let request_json = serde_json::to_string(&request)?;
-    client
-        .nostr()
-        .send_encrypted_private_message(&provider_npub, request_json, "nip04")
-        .await?;
-
     println!("{}", "SENT".green());
     println!();
     println!("  Waiting for provider response (timeout: 60s)...");
 
-    match client
-        .nostr()
-        .wait_for_decrypted_message(&provider_npub, 60)
-        .await
-    {
-        Ok(response) => {
-            println!();
-            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&response.content) {
-                if resp.get("error").is_some() {
-                    println!("{}", "Topup failed".red().bold());
-                    println!("  {}", resp["error"].as_str().unwrap_or("Unknown error"));
-                } else {
-                    println!("{}", "Topup successful!".green().bold());
-                    if let Some(expires) = resp.get("expires_at") {
-                        println!("  {} {}", "New Expiry:".bold(), expires);
-                    }
-                    if let Some(added) = resp.get("added_seconds") {
-                        println!("  {} +{}s", "Added:".bold(), added);
-                    }
-                }
-            } else {
-                println!("Provider response: {}", response.content);
+    let outcome =
+        nostr_topup_round_trip(&args.pod_id, &token, &provider_npub, relays, nostr_key, 60).await?;
+    println!();
+
+    match outcome {
+        NostrTopupOutcome::Success(resp) => {
+            println!("{}", "Topup successful!".green().bold());
+            println!("  {} {}", "New Expiry:".bold(), resp.new_expires_at);
+            println!(
+                "  {} +{}s",
+                "Added:".bold(),
+                resp.extended_duration_seconds
+            );
+            if !resp.message.is_empty() {
+                println!("  {} {}", "Message:".bold(), resp.message);
             }
         }
-        Err(e) => {
-            println!();
-            println!("  {} {}", "Warning:".yellow(), e.to_string().yellow());
+        NostrTopupOutcome::ProviderError(err) => {
+            println!("{}", "Topup failed".red().bold());
+            println!("  Type:    {}", err.error_type);
+            println!("  Message: {}", err.message);
+            if let Some(d) = err.details {
+                println!("  Details: {}", d);
+            }
+        }
+        NostrTopupOutcome::UnknownResponse(body) => {
+            println!("{}", "Unknown topup response".yellow().bold());
+            println!("Body: {}", body);
+        }
+        NostrTopupOutcome::Timeout => {
+            println!(
+                "  {} {}",
+                "Warning:".yellow(),
+                "Provider didn't respond in time.".yellow()
+            );
             println!("The topup request was sent but the provider didn't respond in time.");
             println!(
                 "Check status with: paygress-cli status --pod-id {} --provider {}",
