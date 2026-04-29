@@ -6,7 +6,7 @@ use colored::Colorize;
 mod api;
 mod commands;
 
-use commands::{bootstrap, list, provider, spawn, status, system, topup};
+use commands::{bootstrap, deploy, list, provider, spawn, status, system, topup};
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
 #[derive(Parser)]
@@ -31,6 +31,9 @@ enum Commands {
 
     /// Spawn a new workload with Cashu payment
     Spawn(spawn::SpawnArgs),
+
+    /// Deploy an opinionated template (Unit 9)
+    Deploy(deploy::DeployArgs),
 
     /// Top up an existing workload with additional payment
     Topup(topup::TopupArgs),
@@ -75,6 +78,7 @@ async fn main() {
         // Consumer
         Commands::List(args) => list::execute(args, cli.verbose).await,
         Commands::Spawn(args) => spawn::execute(args, cli.verbose).await,
+        Commands::Deploy(args) => deploy::execute(args, cli.verbose).await,
         Commands::Topup(args) => topup::execute(args, cli.verbose).await,
         Commands::Status(args) => status::execute(args, cli.verbose).await,
 
