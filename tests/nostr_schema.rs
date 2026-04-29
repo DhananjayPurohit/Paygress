@@ -38,6 +38,7 @@ fn sample_offer() -> ProviderOfferContent {
         api_endpoint: None,
         version: SCHEMA_VERSION,
         isolation_level: IsolationLevel::SharedKernel,
+        stake_proof: None,
     }
 }
 

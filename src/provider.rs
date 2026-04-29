@@ -277,6 +277,7 @@ impl ProviderService {
             api_endpoint: None, // TODO: Add if supporting direct API
             version: crate::nostr::SCHEMA_VERSION,
             isolation_level: crate::nostr::IsolationLevel::SharedKernel,
+            stake_proof: None,
         };
 
         self.nostr.publish_provider_offer(offer).await?;
