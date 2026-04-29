@@ -1,0 +1,45 @@
+# Agent sandbox — generic Python + Node + git compute box.
+#
+# Used by AI agents writing code, CI/test runners, and map-reduce
+# / batch shards. Stateless by default — a crash means the upstream
+# caller retries on a fresh provider.
+#
+# Smoke test (local):
+#   docker compose -f templates/agent-sandbox/docker-compose.yml up -d
+#   docker exec -it paygress-agent-sandbox bash -lc \
+#     'python3 -c "import sys; print(sys.version)"; node --version; git --version'
+#
+# Map-reduce shard pattern: a coordinator spawns N pods, sets
+# `--env CHUNK=<i>/<N>` on each, drops a script into /workspace,
+# and collects results from /workspace via SSH/scp.
+services:
+  agent-sandbox:
+    image: nikolaik/python-nodejs:python3.12-nodejs20
+    container_name: paygress-agent-sandbox
+    restart: unless-stopped
+    # Host port is configurable via AGENT_SANDBOX_HOST_PORT; defaults
+    # to 8080. The sandbox can serve results / status from any HTTP
+    # server the workload chooses to bind to 0.0.0.0:8080.
+    ports:
+      - "${AGENT_SANDBOX_HOST_PORT:-8080}:8080"
+    environment:
+      WORKSPACE: /workspace
+      PYTHONUNBUFFERED: "1"
+      NODE_ENV: production
+    working_dir: /workspace
+    volumes:
+      - agent-sandbox-workspace:/workspace
+    # Sleep keeps the container alive so an interactive caller can
+    # `docker exec` in. Production spawns via Paygress run their own
+    # entrypoint scripts dropped into /workspace.
+    command: ["bash", "-lc", "sleep infinity"]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python3 --version >/dev/null 2>&1 && node --version >/dev/null 2>&1"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  agent-sandbox-workspace:
