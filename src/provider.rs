@@ -442,6 +442,22 @@ impl ProviderService {
                         event.kind, event.pubkey, event.message_type
                     );
 
+                    // Lease revocation events take a separate path
+                    // (Unit 5 standby-side promotion). Public events,
+                    // no decryption, no response. v1 logs only —
+                    // promotion action lands in a follow-up.
+                    if let Some(revocation) = crate::nostr::parse_revocation_event(&event) {
+                        info!(
+                            "Lease revocation observed: workload_id={}, primary={}, reason={}, state_uri={:?}, standbys={:?}",
+                            revocation.workload_id,
+                            revocation.primary_provider_npub,
+                            revocation.reason,
+                            revocation.state_uri,
+                            revocation.standby_providers,
+                        );
+                        return Ok(());
+                    }
+
                     // Parse the request
                     let request_type = match parse_private_message_content(&event.content) {
                         Ok(req) => req,

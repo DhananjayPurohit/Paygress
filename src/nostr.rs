@@ -148,9 +148,20 @@ impl NostrRelaySubscriber {
             .pubkeys(vec![self.keys.public_key()]) // Sets #p tag
             .limit(0);
 
+        // Lease revocation events (Unit 5 — standby-side promotion).
+        // Public events (no encryption); a primary publishes them
+        // addressed to the standby_providers via #p tags. The standby's
+        // listener filters by its own pubkey to receive only events
+        // addressed to it.
+        let revocation_filter = Filter::new()
+            .kind(Kind::Custom(KIND_LEASE_REVOCATION))
+            .pubkeys(vec![self.keys.public_key()])
+            .limit(0);
+
         let _ = self.client.subscribe(nip04_filter, None).await;
         let _ = self.client.subscribe(nip17_filter, None).await;
-        info!("Subscribed to NIP-04 (Encrypted Direct Messages) and NIP-17 (Gift Wrap) messages for pod provisioning and top-up requests");
+        let _ = self.client.subscribe(revocation_filter, None).await;
+        info!("Subscribed to NIP-04 / NIP-17 messages and KIND_LEASE_REVOCATION events addressed to this provider");
 
         // Handle incoming events
         self.client.handle_notifications(|notification| async {
@@ -247,6 +258,32 @@ impl NostrRelaySubscriber {
                                     event.id, e
                                 );
                             }
+                        }
+                    }
+                    Kind::Custom(k) if k == KIND_LEASE_REVOCATION => {
+                        // Lease revocation events are public — no
+                        // decryption. Build a NostrEvent with the
+                        // raw content; the handler dispatches by
+                        // kind and parses with parse_revocation_event.
+                        info!("Received lease revocation event: {}", event.id);
+                        let nostr_event = NostrEvent {
+                            id: event.id.to_hex(),
+                            pubkey: event.pubkey.to_hex(),
+                            created_at: event.created_at.as_u64(),
+                            kind: event.kind.as_u16() as u32,
+                            tags: event
+                                .tags
+                                .iter()
+                                .map(|tag| {
+                                    tag.as_slice().iter().map(|s| s.to_string()).collect()
+                                })
+                                .collect(),
+                            content: event.content.clone(),
+                            sig: event.sig.to_string(),
+                            message_type: "lease_revocation".to_string(),
+                        };
+                        if let Err(e) = handler(nostr_event).await {
+                            error!("Failed to process lease revocation {}: {}", event.id, e);
                         }
                     }
                     _ => {
@@ -697,6 +734,20 @@ pub fn parse_private_message_content(content: &str) -> Result<PrivateRequest> {
             ))
         }
     }
+}
+
+/// Parse a `NostrEvent` as a `LeaseRevocationContent` if its `kind`
+/// matches `KIND_LEASE_REVOCATION` and the body deserializes
+/// cleanly. Returns `None` for any non-revocation event so the
+/// caller can fall through to other dispatch arms without re-parsing.
+///
+/// Pure function — exposed so the standby-side dispatcher can be
+/// unit-tested without spinning up the relay pool.
+pub fn parse_revocation_event(event: &NostrEvent) -> Option<LeaseRevocationContent> {
+    if event.kind != KIND_LEASE_REVOCATION as u32 {
+        return None;
+    }
+    serde_json::from_str::<LeaseRevocationContent>(&event.content).ok()
 }
 
 // ==================== Provider Discovery Structures ====================

@@ -76,3 +76,50 @@ fn empty_standby_list_round_trips() {
     let back: LeaseRevocationContent = serde_json::from_str(&json).unwrap();
     assert!(back.standby_providers.is_empty());
 }
+
+// ==================== parse_revocation_event tests ====================
+//
+// Pin the standby-side dispatcher's pure helper so the dispatcher
+// in src/provider.rs stays correct without needing a relay pool.
+
+use paygress::nostr::{parse_revocation_event, NostrEvent, KIND_LEASE_REVOCATION};
+
+fn make_event(kind: u32, content: String) -> NostrEvent {
+    NostrEvent {
+        id: "id".to_string(),
+        pubkey: "primary-pub".to_string(),
+        created_at: 1_780_000_000,
+        kind,
+        tags: vec![],
+        content,
+        sig: "sig".to_string(),
+        message_type: "lease_revocation".to_string(),
+    }
+}
+
+#[test]
+fn parse_revocation_event_returns_some_for_matching_kind_and_body() {
+    let body = serde_json::to_string(&sample()).unwrap();
+    let ev = make_event(KIND_LEASE_REVOCATION as u32, body);
+    let parsed = parse_revocation_event(&ev).expect("must parse");
+    assert_eq!(parsed.workload_id, 1042);
+    assert_eq!(parsed.standby_providers.len(), 2);
+}
+
+#[test]
+fn parse_revocation_event_returns_none_for_wrong_kind() {
+    // Even if the body would parse as LeaseRevocationContent, a
+    // wrong-kind event must not be misclassified — the dispatcher
+    // relies on this to fall through to the DM path.
+    let body = serde_json::to_string(&sample()).unwrap();
+    let ev = make_event(4, body); // Kind::EncryptedDirectMessage = 4
+    assert!(parse_revocation_event(&ev).is_none());
+}
+
+#[test]
+fn parse_revocation_event_returns_none_for_malformed_body() {
+    // A right-kind event with junk in the body returns None instead
+    // of panicking — the dispatcher logs and moves on.
+    let ev = make_event(KIND_LEASE_REVOCATION as u32, "{not json".to_string());
+    assert!(parse_revocation_event(&ev).is_none());
+}
