@@ -15,6 +15,7 @@
 
 // Core modules — always compiled.
 pub mod cashu;
+pub mod durable_workload;
 pub mod nostr;
 
 // Proxmox / LXD canonical control plane — always compiled.
