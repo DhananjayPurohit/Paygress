@@ -51,6 +51,16 @@ pub struct ContainerConfig {
     /// Workload environment variables (template defaults +
     /// consumer overrides). Docker backend passes via `-e KEY=VAL`.
     pub template_env: HashMap<String, String>,
+
+    /// Extra `docker run` flags from the template definition (e.g.
+    /// `--ulimit nofile=1048576:1048576` for strfry). LXD/Proxmox
+    /// backends ignore these.
+    pub extra_runtime_args: Vec<String>,
+
+    /// In-container path for the workload's persistent state.
+    /// Docker backend mounts a vmid-scoped volume there.
+    /// `None` = stateless (no volume created).
+    pub data_path: Option<String>,
 }
 
 #[async_trait]

@@ -125,6 +125,12 @@ fn container_config_carries_template_data() {
             })
             .collect(),
         template_env: env,
+        extra_runtime_args: def
+            .extra_docker_args
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        data_path: def.data_path.map(|p| p.to_string()),
     };
     assert_eq!(cfg.template_ports.len(), 1);
     assert_eq!(cfg.template_ports[0].container_port, 7777);
