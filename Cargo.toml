@@ -82,6 +82,8 @@ reqwest = { version = "0.11", features = ["json"] }
 
 # MCP server dependencies
 rmcp = { version = "0.2.1", features = ["server", "transport-io", "macros"] }
+# rmcp's #[tool] macro derives parameter schemas via schemars 0.8.
+schemars = "0.8"
 async-trait = "0.1"
 
 # Environment file loading
