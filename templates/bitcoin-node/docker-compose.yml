@@ -1,0 +1,40 @@
+# Bitcoin node (bitcoind, regtest) — Paygress killer template.
+#
+# Defaults to regtest so smoke tests don't wait for a multi-day
+# mainnet sync. Set BITCOIN_NETWORK=main and remove the regtest
+# flags below to run mainnet.
+#
+# Smoke test:
+#   docker compose -f templates/bitcoin-node/docker-compose.yml up -d
+#   docker exec paygress-bitcoind bitcoin-cli -regtest \
+#     -rpcuser=paygress -rpcpassword=paygress getblockchaininfo
+#   docker exec paygress-bitcoind bitcoin-cli -regtest \
+#     -rpcuser=paygress -rpcpassword=paygress -generate 101
+services:
+  bitcoind:
+    image: btcpayserver/bitcoin:28.1
+    container_name: paygress-bitcoind
+    restart: unless-stopped
+    ports:
+      - "18443:18443" # regtest RPC
+      - "18444:18444" # regtest P2P
+    environment:
+      BITCOIN_NETWORK: regtest
+      BITCOIN_EXTRA_ARGS: |-
+        regtest=1
+        rpcbind=0.0.0.0:18443
+        rpcallowip=0.0.0.0/0
+        rpcuser=paygress
+        rpcpassword=paygress
+        fallbackfee=0.0001
+    volumes:
+      - bitcoind-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=paygress -rpcpassword=paygress getblockchaininfo > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  bitcoind-data:
