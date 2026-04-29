@@ -1,5 +1,6 @@
 // CLI commands module
 
+pub mod batch;
 pub mod bootstrap;
 pub mod deploy;
 pub mod identity;

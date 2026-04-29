@@ -6,7 +6,7 @@ use colored::Colorize;
 mod api;
 mod commands;
 
-use commands::{bootstrap, deploy, list, provider, spawn, status, system, topup};
+use commands::{batch, bootstrap, deploy, list, provider, spawn, status, system, topup};
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
 #[derive(Parser)]
@@ -40,6 +40,10 @@ enum Commands {
 
     /// Get status of a workload
     Status(status::StatusArgs),
+
+    /// Fan-out N workloads in parallel for map-reduce shards, CI
+    /// matrices, and embarrassingly-parallel batch jobs.
+    Batch(batch::BatchArgs),
 
     // ============ Provider Commands ============
     /// Provider management - setup, start, stop, status
@@ -81,6 +85,7 @@ async fn main() {
         Commands::Deploy(args) => deploy::execute(args, cli.verbose).await,
         Commands::Topup(args) => topup::execute(args, cli.verbose).await,
         Commands::Status(args) => status::execute(args, cli.verbose).await,
+        Commands::Batch(args) => batch::execute(args, cli.verbose).await,
 
         // Provider
         Commands::Provider(args) => provider::execute(args, cli.verbose).await,
