@@ -16,15 +16,33 @@ categories = ["command-line-utilities", "network-programming"]
 name = "paygress"
 path = "src/lib.rs"
 
-# Unified Paygress service binary
+# Legacy K8s + ngx_l402 + HTTP service binary. Gated behind the
+# `kubernetes` feature (off by default since Unit 7); build with
+# `cargo build --features kubernetes` to produce this binary.
 [[bin]]
 name = "paygress"
 path = "src/main.rs"
+required-features = ["kubernetes"]
 
 # CLI tool binary
 [[bin]]
 name = "paygress-cli"
 path = "src/cli/main.rs"
+
+[features]
+# `kubernetes` gates the legacy K8s + ngx_l402 + HTTP control plane
+# (src/sidecar_service.rs, src/pod_provisioning.rs,
+# src/interfaces/http_l402.rs, src/interfaces/mcp.rs,
+# src/mcp/http_client.rs, plus the legacy `paygress` binary at
+# src/main.rs which now declares required-features).
+#
+# **Default build is now Nostr-DM-only** (Unit 7 of the 12-month plan,
+# docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md). The
+# canonical control plane is Proxmox-LXD + Nostr-DM (src/provider.rs)
+# and ships in the default build. Existing K8s users can opt in
+# explicitly with `--features kubernetes`.
+default = []
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
 # Core dependencies
@@ -32,6 +50,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.143"
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
+thiserror = "1"
 rand = "0.8"
 
 # Cashu dependencies
@@ -43,9 +62,9 @@ nostr-sdk = { version = "0.33", features = ["nip04", "nip44", "nip59"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Kubernetes dependencies
-kube = { version = "0.93", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.22", features = ["v1_28"] }
+# Kubernetes dependencies (optional, gated behind the `kubernetes` feature)
+kube = { version = "0.93", features = ["runtime", "derive"], optional = true }
+k8s-openapi = { version = "0.22", features = ["v1_28"], optional = true }
 uuid = { version = "1.0", features = ["v4"] }
 futures-util = "0.3"
 
@@ -73,8 +92,21 @@ serde_urlencoded = "0.7"
 futures = "0.3"
 num_cpus = "1.0"
 
+# Blossom client + content-addressed storage encryption (Unit 6).
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.5"
+proptest = "1"
+tempfile = "3"
+base64 = "0.22"
+
 [profile.release]
-# Optimize for small binary size  
+# Optimize for small binary size
 opt-level = "s"
 lto = true
 codegen-units = 1

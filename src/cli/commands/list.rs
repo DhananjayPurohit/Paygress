@@ -114,7 +114,10 @@ async fn execute_nostr_list(args: ListArgs, verbose: bool) -> Result<()> {
 
     println!();
     println!("To see details: {} list info <npub>", "paygress-cli".cyan());
-    println!("To spawn:       {} spawn --provider <npub> --token <cashu-token>", "paygress-cli".cyan());
+    println!(
+        "To spawn:       {} spawn --provider <npub> --token <cashu-token>",
+        "paygress-cli".cyan()
+    );
 
     Ok(())
 }
@@ -128,7 +131,7 @@ async fn execute_http_list(server: &str, verbose: bool) -> Result<()> {
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     spinner.set_message("Fetching available offers...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -138,7 +141,9 @@ async fn execute_http_list(server: &str, verbose: bool) -> Result<()> {
     spinner.finish_and_clear();
 
     if !response.success {
-        let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+        let error_msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
         return Err(anyhow::anyhow!("Failed to get offers: {}", error_msg));
     }
 
@@ -149,7 +154,8 @@ async fn execute_http_list(server: &str, verbose: bool) -> Result<()> {
         if offers.is_empty() {
             println!("{}", "  No offers available".dimmed());
         } else {
-            println!("  {:<12} {:<20} {:<10} {:<10} {:>15}",
+            println!(
+                "  {:<12} {:<20} {:<10} {:<10} {:>15}",
                 "ID".bold().underline(),
                 "Name".bold().underline(),
                 "CPU".bold().underline(),
@@ -167,7 +173,8 @@ async fn execute_http_list(server: &str, verbose: bool) -> Result<()> {
                     format!("{} MB", offer.memory_mb)
                 };
 
-                println!("  {:<12} {:<20} {:<10} {:<10} {:>15}",
+                println!(
+                    "  {:<12} {:<20} {:<10} {:<10} {:>15}",
                     offer.id.cyan(),
                     offer.name,
                     cpu_display,
@@ -192,7 +199,11 @@ async fn execute_http_list(server: &str, verbose: bool) -> Result<()> {
         println!();
     }
 
-    println!("{}", "Tip: Use 'paygress-cli spawn --server <URL> --tier <ID> --token <CASHU_TOKEN>' to spawn".dimmed());
+    println!(
+        "{}",
+        "Tip: Use 'paygress-cli spawn --server <URL> --tier <ID> --token <CASHU_TOKEN>' to spawn"
+            .dimmed()
+    );
 
     Ok(())
 }

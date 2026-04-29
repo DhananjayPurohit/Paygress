@@ -9,7 +9,7 @@ use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use super::identity::{parse_relays, get_or_create_identity};
+use super::identity::{get_or_create_identity, parse_relays};
 use crate::api::PaygressClient;
 
 #[derive(Args)]
@@ -34,11 +34,13 @@ pub struct StatusArgs {
 pub async fn execute(args: StatusArgs, verbose: bool) -> Result<()> {
     if args.provider.is_some() {
         let provider = args.provider.clone().unwrap();
-        return execute_nostr_status(args.pod_id.clone(), provider, args.relays.clone(), verbose).await;
+        return execute_nostr_status(args.pod_id.clone(), provider, args.relays.clone(), verbose)
+            .await;
     }
 
-    let server = args.server.clone()
-        .ok_or_else(|| anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required"))?;
+    let server = args.server.clone().ok_or_else(|| {
+        anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required")
+    })?;
 
     execute_http_status(&server, args, verbose).await
 }
@@ -54,7 +56,7 @@ async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> R
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     spinner.set_message("Fetching pod status...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -74,15 +76,24 @@ async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> R
             response.time_remaining_seconds.map(|t| t as u64),
         );
     } else {
-        let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+        let error_msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
         return Err(anyhow::anyhow!("Failed to get pod status: {}", error_msg));
     }
 
     Ok(())
 }
 
-async fn execute_nostr_status(pod_id: String, provider_npub: String, relays_opt: Option<String>, verbose: bool) -> Result<()> {
-    use paygress::nostr::{NostrRelaySubscriber, RelayConfig, StatusRequestContent, StatusResponseContent};
+async fn execute_nostr_status(
+    pod_id: String,
+    provider_npub: String,
+    relays_opt: Option<String>,
+    verbose: bool,
+) -> Result<()> {
+    use paygress::nostr::{
+        NostrRelaySubscriber, RelayConfig, StatusRequestContent, StatusResponseContent,
+    };
 
     if verbose {
         println!("{} Checking workload status via Nostr...", "->".blue());
@@ -94,7 +105,7 @@ async fn execute_nostr_status(pod_id: String, provider_npub: String, relays_opt:
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     spinner.set_message("Connecting to Nostr and querying provider...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -108,12 +119,18 @@ async fn execute_nostr_status(pod_id: String, provider_npub: String, relays_opt:
 
     let client = NostrRelaySubscriber::new(relay_config).await?;
 
-    client.subscribe_to_pod_events(|_| Box::pin(async { Ok(()) })).await?;
+    client
+        .subscribe_to_pod_events(|_| Box::pin(async { Ok(()) }))
+        .await?;
 
-    let request = StatusRequestContent { pod_id: pod_id.clone() };
+    let request = StatusRequestContent {
+        pod_id: pod_id.clone(),
+    };
     let content = serde_json::to_string(&request)?;
 
-    client.send_encrypted_private_message(&provider_npub, content, "nip17").await?;
+    client
+        .send_encrypted_private_message(&provider_npub, content, "nip17")
+        .await?;
 
     spinner.set_message("Waiting for provider response...");
 
@@ -135,7 +152,10 @@ async fn execute_nostr_status(pod_id: String, provider_npub: String, relays_opt:
         }
         Err(e) => {
             spinner.finish_and_clear();
-            return Err(anyhow::anyhow!("Timed out waiting for status from provider: {}", e));
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for status from provider: {}",
+                e
+            ));
         }
     }
 

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: cargo test --all-features
+        run: cargo test --all-features
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (advisory)
+    runs-on: ubuntu-latest
+    # Clippy runs in advisory mode for now: warnings are reported in the
+    # build log but do NOT fail the job. The 12-month plan
+    # (docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md) calls
+    # for `-D warnings` as the eventual state. Tightening is staged:
+    #   1. Unit 7 feature-gates the K8s pipeline behind `kubernetes`,
+    #      removing ~half the existing dead-code warnings from default
+    #      builds automatically.
+    #   2. A follow-up PR cleans the remaining warnings on the
+    #      Nostr-DM canonical control plane.
+    #   3. Once warnings are at zero, this job switches to
+    #      `cargo clippy ... -- -D warnings` and is renamed to "Clippy".
+    # See docs/solutions/patterns/critical-patterns.md for the rationale.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: cargo clippy (advisory)
+        run: cargo clippy --all-targets --all-features
