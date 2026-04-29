@@ -37,6 +37,12 @@ pub enum ReplicationMode {
     WarmStandby { standby_providers: Vec<String> },
 }
 
+impl Default for ReplicationMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// What to do when a workload exits unexpectedly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "kebab-case")]
