@@ -46,8 +46,8 @@ pub use nostr::{custom_relay_config, default_relay_config, NostrRelaySubscriber,
 pub use nostr::{
     AccessDetailsContent, CapacityInfo, EncryptedTopUpPodRequest, ErrorResponseContent,
     HeartbeatContent, IsolationLevel, PrivateRequest, ProviderFilter, ProviderInfo,
-    ProviderOfferContent, StatusRequestContent, StatusResponseContent, TopUpResponseContent,
-    SCHEMA_VERSION,
+    ProviderOfferContent, StatusRequestContent, StatusResponseContent, TemplateAccessPort,
+    TopUpResponseContent, SCHEMA_VERSION,
 };
 pub use provider::{ProviderConfig, ProviderService};
 pub use proxmox::ProxmoxClient;
