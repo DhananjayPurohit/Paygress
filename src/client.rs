@@ -258,6 +258,8 @@ mod tests {
             pod_spec_name: "Basic".to_string(),
             pod_spec_description: "1 vCPU, 1GB".to_string(),
             instructions: vec!["ssh -p 30042 root@host".to_string()],
+            host_address: "host".to_string(),
+            template_ports: Vec::new(),
         })
         .unwrap()
     }

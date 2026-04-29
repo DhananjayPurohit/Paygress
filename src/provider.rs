@@ -756,9 +756,57 @@ async fn handle_spawn_request(
     // Use configured public IP/host
     let host = &config.public_ip;
 
+    // Build per-template ports with their template labels so the
+    // consumer doesn't have to remember the host_port + 1 + i rule.
+    // We zip back to the source TemplateDefinition by matching on
+    // container_port (each template's ports are unique by
+    // container_port today).
+    let template_access_ports: Vec<crate::nostr::TemplateAccessPort> = container_config
+        .template_ports
+        .iter()
+        .map(|p| {
+            let label = template
+                .as_ref()
+                .and_then(|t| {
+                    t.ports
+                        .iter()
+                        .find(|tp| tp.container_port == p.container_port)
+                })
+                .map(|tp| tp.label.to_string())
+                .unwrap_or_else(|| format!("port-{}", p.container_port));
+            crate::nostr::TemplateAccessPort {
+                host_port: p.host_port,
+                container_port: p.container_port,
+                protocol: p.protocol.to_string(),
+                label,
+            }
+        })
+        .collect();
+
     // Send access details
     let expires_dt =
         chrono::DateTime::from_timestamp(workload.expires_at as i64, 0).unwrap_or_default();
+
+    // Instructions: keep the SSH lines for legacy/manual access,
+    // append per-template-port lines so humans see them too.
+    let mut instructions = vec![
+        format!("🚀 Workload provisioned successfully!"),
+        format!("👤 Username: root"),
+        format!("🔑 Password: {}", password),
+        format!("⌛ Expires: {}", expires_dt.format("%Y-%m-%d %H:%M:%S UTC")),
+        format!("Access: You can connect to the container using SSH."),
+        format!("  ssh -p {} root@{}", host_port, host),
+    ];
+    if !template_access_ports.is_empty() {
+        instructions.push(format!("Workload ports:"));
+        for p in &template_access_ports {
+            instructions.push(format!(
+                "  {} ({}): {}://{}:{}",
+                p.label, p.protocol, p.protocol, host, p.host_port
+            ));
+        }
+    }
+
     let details = AccessDetailsContent {
         pod_npub: format!("container-{}", id),
         node_port: host_port,
@@ -767,14 +815,9 @@ async fn handle_spawn_request(
         memory_mb: spec.memory_mb,
         pod_spec_name: spec.name.clone(),
         pod_spec_description: spec.description.clone(),
-        instructions: vec![
-            format!("🚀 Workload provisioned successfully!"),
-            format!("👤 Username: root"),
-            format!("🔑 Password: {}", password),
-            format!("⌛ Expires: {}", expires_dt.format("%Y-%m-%d %H:%M:%S UTC")),
-            format!("Access: You can connect to the container using SSH."),
-            format!("  ssh -p {} root@{}", host_port, host),
-        ],
+        instructions,
+        host_address: host.clone(),
+        template_ports: template_access_ports,
     };
 
     debug!("Sending access details to {}", requester_pubkey);
