@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Paygress · Marketplace Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="container">
+      <h1>Paygress</h1>
+      <p class="tagline">Pay-per-use compute marketplace · Cashu ecash · Nostr discovery</p>
+      <div class="freshness" id="freshness">loading…</div>
+    </div>
+  </header>
+
+  <nav class="container nav">
+    <a href="#providers">Providers</a>
+    <a href="#features">Features shipped</a>
+    <a href="#schema">Schema</a>
+    <a href="#about">About</a>
+  </nav>
+
+  <main class="container">
+    <section id="providers">
+      <header class="section-header">
+        <h2>Active Providers</h2>
+        <div class="counters" id="provider-counters">—</div>
+      </header>
+      <div class="filters">
+        <label><input type="checkbox" id="filter-online"> Online only</label>
+        <label><input type="checkbox" id="filter-staked"> Staked only</label>
+        <label><input type="checkbox" id="filter-jurisdiction"> Has jurisdiction</label>
+      </div>
+      <div class="table-wrap">
+        <table id="providers-table">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Status</th>
+              <th>Last seen</th>
+              <th>Score</th>
+              <th>Stake</th>
+              <th>Isolation</th>
+              <th>Tiers</th>
+              <th>Cheapest</th>
+              <th>Jurisdiction</th>
+            </tr>
+          </thead>
+          <tbody id="providers-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="features">
+      <header class="section-header">
+        <h2>Features shipped</h2>
+        <div class="counters" id="feature-counters">—</div>
+      </header>
+      <div class="feature-grid" id="feature-grid"></div>
+    </section>
+
+    <section id="schema">
+      <header class="section-header">
+        <h2>Schema status</h2>
+      </header>
+      <div class="cards" id="schema-cards"></div>
+    </section>
+
+    <section id="about">
+      <header class="section-header"><h2>About this dashboard</h2></header>
+      <p>
+        This page reads <code>snapshot.json</code>, a versioned and reproducible
+        view of the marketplace produced by <code>paygress-snapshot</code> from
+        live Nostr relays. The score column comes from the Sybil-resistant
+        receipt aggregator; today the public corpus is empty, so all rows show
+        <code>0.0</code> until receipts are posted.
+      </p>
+      <p>
+        Regenerate locally: <code>cargo run --release --bin paygress-snapshot</code>.
+        Operators can run the same binary themselves and reproduce the published
+        numbers with the same inputs (the aggregator core is pure — same offers
+        + heartbeats + receipts in, byte-identical JSON out).
+      </p>
+    </section>
+  </main>
+
+  <footer class="container footer">
+    <span>Snapshot version <code id="schema-version">—</code></span>
+    <span id="generated-at">—</span>
+  </footer>
+
+  <script src="features.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

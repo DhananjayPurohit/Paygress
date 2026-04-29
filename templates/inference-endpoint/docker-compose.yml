@@ -1,0 +1,37 @@
+# Inference endpoint (Ollama) — Paygress killer template.
+#
+# Smoke test:
+#   docker compose -f templates/inference-endpoint/docker-compose.yml up -d
+#   docker exec paygress-ollama ollama pull llama3.2:1b
+#   curl http://localhost:11434/api/generate \
+#     -d '{"model":"llama3.2:1b","prompt":"hello","stream":false}'
+#
+# OpenAI-compatible API at /v1/chat/completions.
+# GPU support: uncomment the deploy.resources block below.
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: paygress-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    # Uncomment for NVIDIA GPU access:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ollama-models:
