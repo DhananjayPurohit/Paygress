@@ -475,7 +475,6 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             let keys = nostr_sdk::Keys::generate();
             let nsec = keys
                 .secret_key()
-                .map_err(|e| anyhow::anyhow!("Failed to get secret key: {}", e))?
                 .to_bech32()
                 .map_err(|e| anyhow::anyhow!("Failed to encode key: {}", e))?;
             let npub = keys

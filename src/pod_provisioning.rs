@@ -434,7 +434,7 @@ impl PodProvisioningService {
         // Generate NPUB first and use it as pod name
         let pod_keys = Keys::generate();
         let pod_npub = pod_keys.public_key().to_bech32().unwrap();
-        let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
+        let pod_nsec = pod_keys.secret_key().to_secret_hex();
 
         // Create Kubernetes-safe pod name from NPUB (take first 8 chars after npub1 prefix)
         let pod_name = format!(

@@ -154,15 +154,17 @@ impl BlossomClient {
             .as_secs();
         let expiration = now + self.auth_ttl_secs;
 
+        let exp_str = expiration.to_string();
         let tags = vec![
-            Tag::parse(&["t", op.tag_value()])?,
-            Tag::parse(&["x", x_hash])?,
-            Tag::parse(&["expiration", &expiration.to_string()])?,
+            Tag::parse(["t", op.tag_value()])?,
+            Tag::parse(["x", x_hash])?,
+            Tag::parse(["expiration", exp_str.as_str()])?,
         ];
 
-        let event = EventBuilder::new(Kind::Custom(AUTH_KIND), "", tags)
+        let event = EventBuilder::new(Kind::Custom(AUTH_KIND), "")
+            .tags(tags)
             .custom_created_at(Timestamp::from(now))
-            .to_event(&self.keys)?;
+            .sign_with_keys(&self.keys)?;
 
         let json = serde_json::to_string(&event)?;
         Ok(format!("Nostr {}", BASE64.encode(json.as_bytes())))

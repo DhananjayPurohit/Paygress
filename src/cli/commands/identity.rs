@@ -51,7 +51,7 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
         "  No identity found. Generating new Nostr identity...".yellow()
     );
     let keys = Keys::generate();
-    let nsec = keys.secret_key()?.to_bech32()?;
+    let nsec = keys.secret_key().to_bech32()?;
 
     // Save to file
     let mut file = std::fs::File::create(&identity_file)?;

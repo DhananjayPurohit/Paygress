@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use nostr_sdk::nips::nip04;
 use nostr_sdk::nips::nip59::UnwrappedGift;
 use nostr_sdk::{
-    Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, Timestamp, ToBech32, Url,
+    Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, Timestamp, ToBech32,
 };
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -92,14 +92,15 @@ impl NostrRelaySubscriber {
             }
         };
 
-        let client = Client::new(&keys);
+        let client = Client::new(keys.clone());
 
         // Add relays
         for relay_url in &config.relays {
             info!("Adding relay: {}", relay_url);
-            let url = Url::parse(relay_url)
+            client
+                .add_relay(relay_url)
+                .await
                 .with_context(|| format!("Invalid relay URL: {}", relay_url))?;
-            client.add_relay(url).await?;
         }
 
         info!("Connecting to {} relays...", config.relays.len());
@@ -139,10 +140,8 @@ impl NostrRelaySubscriber {
             .pubkeys(vec![self.keys.public_key()]) // Sets #p tag
             .limit(0);
 
-        let _ = self
-            .client
-            .subscribe(vec![nip04_filter, nip17_filter], None)
-            .await;
+        let _ = self.client.subscribe(nip04_filter, None).await;
+        let _ = self.client.subscribe(nip17_filter, None).await;
         info!("Subscribed to NIP-04 (Encrypted Direct Messages) and NIP-17 (Gift Wrap) messages for pod provisioning and top-up requests");
 
         // Handle incoming events
@@ -166,9 +165,9 @@ impl NostrRelaySubscriber {
                                         id: rumor.id.map(|id| id.to_hex()).unwrap_or_else(|| "unknown".to_string()),
                                         pubkey: rumor.pubkey.to_hex(),
                                         created_at: rumor.created_at.as_u64(),
-                                        kind: rumor.kind.as_u32(),
+                                        kind: rumor.kind.as_u16() as u32,
                                         tags: rumor.tags.iter().map(|tag| {
-                                            tag.as_vec().iter().map(|s| s.to_string()).collect()
+                                            tag.as_slice().iter().map(|s| s.to_string()).collect()
                                         }).collect(),
                                         content: rumor.content,
                                         sig: "unsigned".to_string(), // UnsignedEvent doesn't have a signature
@@ -195,43 +194,50 @@ impl NostrRelaySubscriber {
                     Kind::EncryptedDirectMessage => {
                         info!("Received NIP-04 Encrypted Direct Message: {}", event.id);
 
-                        // Decrypt the NIP-04 message using NIP-04 module
-                        match self.keys.secret_key() {
-                            Ok(secret_key) => {
-                                match nip04::decrypt(&secret_key, &event.pubkey, &event.content) {
-                                    Ok(decrypted_content) => {
-                                        debug!("Decrypted NIP-04 message. Length: {}", decrypted_content.len());
+                        let secret_key = self.keys.secret_key();
+                        match nip04::decrypt(secret_key, &event.pubkey, &event.content) {
+                            Ok(decrypted_content) => {
+                                debug!(
+                                    "Decrypted NIP-04 message. Length: {}",
+                                    decrypted_content.len()
+                                );
 
-                                        // Create a NostrEvent from the decrypted message with NIP-04 flag
-                                        let nostr_event = NostrEvent {
-                                            id: event.id.to_hex(),
-                                            pubkey: event.pubkey.to_hex(),
-                                            created_at: event.created_at.as_u64(),
-                                            kind: event.kind.as_u32(),
-                                            tags: event.tags.iter().map(|tag| {
-                                                tag.as_vec().iter().map(|s| s.to_string()).collect()
-                                            }).collect(),
-                                            content: decrypted_content,
-                                            sig: event.sig.to_string(),
-                                            message_type: "nip04".to_string(), // Flag to indicate NIP-04
-                                        };
+                                let nostr_event = NostrEvent {
+                                    id: event.id.to_hex(),
+                                    pubkey: event.pubkey.to_hex(),
+                                    created_at: event.created_at.as_u64(),
+                                    kind: event.kind.as_u16() as u32,
+                                    tags: event
+                                        .tags
+                                        .iter()
+                                        .map(|tag| {
+                                            tag.as_slice()
+                                                .iter()
+                                                .map(|s| s.to_string())
+                                                .collect()
+                                        })
+                                        .collect(),
+                                    content: decrypted_content,
+                                    sig: event.sig.to_string(),
+                                    message_type: "nip04".to_string(),
+                                };
 
-                                        match handler(nostr_event).await {
-                                            Ok(()) => {
-                                                info!("Successfully processed NIP-04 private message: {}", event.id);
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to process NIP-04 private message {}: {}", event.id, e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to decrypt NIP-04 message {}: {}", event.id, e);
-                                    }
+                                match handler(nostr_event).await {
+                                    Ok(()) => info!(
+                                        "Successfully processed NIP-04 private message: {}",
+                                        event.id
+                                    ),
+                                    Err(e) => error!(
+                                        "Failed to process NIP-04 private message {}: {}",
+                                        event.id, e
+                                    ),
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to get secret key for NIP-04 decryption: {}", e);
+                                error!(
+                                    "Failed to decrypt NIP-04 message {}: {}",
+                                    event.id, e
+                                );
                             }
                         }
                     }
@@ -253,14 +259,15 @@ impl NostrRelaySubscriber {
         let tags = vec![Tag::hashtag("paygress"), Tag::hashtag("offer")];
 
         info!("Creating event with kind 999 and {} tags", tags.len());
-        let builder = EventBuilder::new(Kind::Custom(999), content, tags);
-        let event = builder.to_event(&self.keys)?;
+        let event = EventBuilder::new(Kind::Custom(999), content)
+            .tags(tags)
+            .sign_with_keys(&self.keys)?;
         let event_id = event.id.to_hex();
 
         info!("Event created with ID: {}", event_id);
         info!("Sending offer event to relays: {}", event_id);
 
-        match self.client.send_event(event).await {
+        match self.client.send_event(&event).await {
             Ok(res) => {
                 info!(
                     "✅ Successfully published offer event: {} and {:?}",
@@ -285,36 +292,28 @@ impl NostrRelaySubscriber {
         let receiver_pubkey_parsed = nostr_sdk::PublicKey::parse(receiver_pubkey)?;
 
         match message_type {
-            "nip04" => match self.keys.secret_key() {
-                Ok(secret_key) => {
-                    let encrypted_content =
-                        nip04::encrypt(&secret_key, &receiver_pubkey_parsed, &content)?;
-                    let receiver_tag = Tag::public_key(receiver_pubkey_parsed);
-                    let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+            "nip04" => {
+                let secret_key = self.keys.secret_key();
+                let encrypted_content =
+                    nip04::encrypt(secret_key, &receiver_pubkey_parsed, &content)?;
+                let receiver_tag = Tag::public_key(receiver_pubkey_parsed);
+                let alt_tag = Tag::parse(["alt", "Private Message"])?;
 
-                    let event_builder = EventBuilder::new(
-                        Kind::EncryptedDirectMessage,
-                        encrypted_content,
-                        [receiver_tag, alt_tag],
-                    );
-                    let event = event_builder.to_event(&self.keys)?;
-                    let event_id = self.client.send_event(event).await?;
-                    info!("Sent NIP-04 message to {}: {:?}", receiver_pubkey, event_id);
-                    Ok(event_id.to_hex())
-                }
-                Err(e) => {
-                    error!("Failed to get secret key for NIP-04 encryption: {}", e);
-                    Err(e.into())
-                }
-            },
+                let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content)
+                    .tags([receiver_tag, alt_tag])
+                    .sign_with_keys(&self.keys)?;
+                let event_id = self.client.send_event(&event).await?;
+                info!("Sent NIP-04 message to {}: {:?}", receiver_pubkey, event_id);
+                Ok(event_id.val.to_hex())
+            }
             "nip17" | _ => {
                 // Default to NIP-17 if not specified or nip17
                 let event_id = self
                     .client
-                    .send_private_msg(receiver_pubkey_parsed, content, None)
+                    .send_private_msg(receiver_pubkey_parsed, content, [])
                     .await?;
                 info!("Sent NIP-17 message to {}: {:?}", receiver_pubkey, event_id);
-                Ok(event_id.to_hex())
+                Ok(event_id.val.to_hex())
             }
         }
     }
@@ -395,20 +394,21 @@ impl NostrRelaySubscriber {
         self.keys.public_key().to_hex()
     }
 
+    #[allow(dead_code)]
     fn convert_event(&self, event: &nostr_sdk::Event) -> NostrEvent {
         NostrEvent {
             id: event.id.to_hex(),
             pubkey: event.pubkey.to_hex(),
             created_at: event.created_at.as_u64(),
-            kind: event.kind.as_u32(),
+            kind: event.kind.as_u16() as u32,
             tags: event
                 .tags
                 .iter()
-                .map(|tag| tag.as_vec().iter().map(|s| s.to_string()).collect())
+                .map(|tag| tag.as_slice().iter().map(|s| s.to_string()).collect())
                 .collect(),
             content: event.content.clone(),
             sig: event.sig.to_string(),
-            message_type: "unknown".to_string(), // Default value since this function doesn't know the context
+            message_type: "unknown".to_string(),
         }
     }
 
@@ -432,7 +432,7 @@ impl NostrRelaySubscriber {
             .pubkeys(vec![receiver_pk])
             .kinds(vec![Kind::EncryptedDirectMessage, Kind::GiftWrap]);
 
-        let _ = client.subscribe(vec![filter], None).await;
+        let _ = client.subscribe(filter, None).await;
 
         // Use tokio::select to handle timeout and notification processing
         let result = tokio::select! {
@@ -455,8 +455,8 @@ impl NostrRelaySubscriber {
                                             id: rumor.id.map(|id| id.to_hex()).unwrap_or_default(),
                                             pubkey: sender.to_hex(),
                                             created_at: rumor.created_at.as_u64(),
-                                            kind: rumor.kind.as_u32(),
-                                            tags: rumor.tags.iter().map(|tag| tag.as_vec().iter().map(|s| s.to_string()).collect()).collect(),
+                                            kind: rumor.kind.as_u16() as u32,
+                                            tags: rumor.tags.iter().map(|tag| tag.as_slice().iter().map(|s| s.to_string()).collect()).collect(),
                                             content: rumor.content,
                                             sig: String::new(),
                                             message_type: "nip17".to_string(),
@@ -466,19 +466,18 @@ impl NostrRelaySubscriber {
                             }
                             Kind::EncryptedDirectMessage => {
                                 if event.pubkey == sender_pk {
-                                    if let Ok(secret_key) = receiver_keys.secret_key() {
-                                        if let Ok(content) = nip04::decrypt(&secret_key, &event.pubkey, &event.content) {
-                                            event_to_send = Some(NostrEvent {
-                                                id: event.id.to_hex(),
-                                                pubkey: event.pubkey.to_hex(),
-                                                created_at: event.created_at.as_u64(),
-                                                kind: event.kind.as_u32(),
-                                                tags: event.tags.iter().map(|tag| tag.as_vec().iter().map(|s| s.to_string()).collect()).collect(),
-                                                content,
-                                                sig: event.sig.to_string(),
-                                                message_type: "nip04".to_string(),
-                                            });
-                                        }
+                                    let secret_key = receiver_keys.secret_key();
+                                    if let Ok(content) = nip04::decrypt(secret_key, &event.pubkey, &event.content) {
+                                        event_to_send = Some(NostrEvent {
+                                            id: event.id.to_hex(),
+                                            pubkey: event.pubkey.to_hex(),
+                                            created_at: event.created_at.as_u64(),
+                                            kind: event.kind.as_u16() as u32,
+                                            tags: event.tags.iter().map(|tag| tag.as_slice().iter().map(|s| s.to_string()).collect()).collect(),
+                                            content,
+                                            sig: event.sig.to_string(),
+                                            message_type: "nip04".to_string(),
+                                        });
                                     }
                                 }
                             }
@@ -601,10 +600,10 @@ pub async fn send_provisioning_request_private_message(
     // Send as private message
     let service_pubkey_parsed = nostr_sdk::PublicKey::parse(service_pubkey)?;
     let event_id = client
-        .send_private_msg(service_pubkey_parsed, request_json, None)
+        .send_private_msg(service_pubkey_parsed, request_json, [])
         .await?;
 
-    Ok(event_id.to_hex())
+    Ok(event_id.val.to_hex())
 }
 
 // NEW: Helper function to parse private message content
@@ -751,15 +750,16 @@ impl NostrRelaySubscriber {
         let tags = vec![
             Tag::hashtag("paygress"),
             Tag::hashtag("compute"),
-            Tag::parse(&["d", &d_tag])?,
-            Tag::parse(&["v", &offer.version.to_string()])?,
+            Tag::parse(["d", d_tag.as_str()])?,
+            Tag::parse(["v", offer.version.to_string().as_str()])?,
         ];
 
-        let builder = EventBuilder::new(Kind::Custom(KIND_PROVIDER_OFFER), content, tags);
-        let event = builder.to_event(&self.keys)?;
+        let event = EventBuilder::new(Kind::Custom(KIND_PROVIDER_OFFER), content)
+            .tags(tags)
+            .sign_with_keys(&self.keys)?;
         let event_id = event.id.to_hex();
 
-        match self.client.send_event(event).await {
+        match self.client.send_event(&event).await {
             Ok(res) => {
                 info!("✅ Published provider offer: {} ({:?})", event_id, res);
                 Ok(event_id)
@@ -797,15 +797,13 @@ impl NostrRelaySubscriber {
         let stored_tags = vec![
             Tag::hashtag("paygress-heartbeat"),
             Tag::public_key(provider_pk),
-            Tag::parse(&["d", &d_tag])?,
-            Tag::parse(&["v", &v_tag])?,
+            Tag::parse(["d", d_tag.as_str()])?,
+            Tag::parse(["v", v_tag.as_str()])?,
         ];
-        let stored = EventBuilder::new(
-            Kind::Custom(KIND_PROVIDER_HEARTBEAT),
-            content.clone(),
-            stored_tags,
-        );
-        let stored_event = stored.to_event(&self.keys)?;
+        let stored_event =
+            EventBuilder::new(Kind::Custom(KIND_PROVIDER_HEARTBEAT), content.clone())
+                .tags(stored_tags)
+                .sign_with_keys(&self.keys)?;
         let stored_id = stored_event.id.to_hex();
 
         // 2. Ephemeral: relays don't store, but live subscribers see
@@ -813,20 +811,18 @@ impl NostrRelaySubscriber {
         let ephemeral_tags = vec![
             Tag::hashtag("paygress-heartbeat"),
             Tag::public_key(provider_pk),
-            Tag::parse(&["v", &v_tag])?,
+            Tag::parse(["v", v_tag.as_str()])?,
         ];
-        let ephemeral = EventBuilder::new(
-            Kind::Custom(KIND_PROVIDER_HEARTBEAT_EPHEMERAL),
-            content,
-            ephemeral_tags,
-        );
-        let ephemeral_event = ephemeral.to_event(&self.keys)?;
+        let ephemeral_event =
+            EventBuilder::new(Kind::Custom(KIND_PROVIDER_HEARTBEAT_EPHEMERAL), content)
+                .tags(ephemeral_tags)
+                .sign_with_keys(&self.keys)?;
 
-        match self.client.send_event(stored_event).await {
+        match self.client.send_event(&stored_event).await {
             Ok(_) => debug!("📦 Stored heartbeat published: {}", stored_id),
             Err(e) => warn!("Failed to publish stored heartbeat: {}", e),
         }
-        match self.client.send_event(ephemeral_event).await {
+        match self.client.send_event(&ephemeral_event).await {
             Ok(_) => debug!("⚡ Ephemeral heartbeat published"),
             Err(e) => warn!("Failed to publish ephemeral heartbeat: {}", e),
         }
@@ -843,7 +839,7 @@ impl NostrRelaySubscriber {
 
         let events = self
             .client
-            .get_events_of(vec![filter], Some(std::time::Duration::from_secs(5)))
+            .fetch_events(filter, std::time::Duration::from_secs(5))
             .await?;
 
         let mut providers = Vec::new();
@@ -875,7 +871,7 @@ impl NostrRelaySubscriber {
 
         let events = self
             .client
-            .get_events_of(vec![filter], Some(std::time::Duration::from_secs(5)))
+            .fetch_events(filter, std::time::Duration::from_secs(5))
             .await?;
 
         let mut heartbeats = Vec::new();
@@ -916,7 +912,7 @@ impl NostrRelaySubscriber {
 
         let events = self
             .client
-            .get_events_of(vec![filter], Some(std::time::Duration::from_secs(3)))
+            .fetch_events(filter, std::time::Duration::from_secs(3))
             .await?;
 
         if let Some(event) = events.first() {
@@ -962,7 +958,7 @@ impl NostrRelaySubscriber {
         // Use a short timeout of 3 seconds for fast feedback
         let events = self
             .client
-            .get_events_of(vec![filter], Some(std::time::Duration::from_secs(3)))
+            .fetch_events(filter, std::time::Duration::from_secs(3))
             .await?;
 
         let mut heartbeats = std::collections::HashMap::new();
