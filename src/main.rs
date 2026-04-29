@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing_subscriber::{self, EnvFilter};
 
 mod cashu;
+mod durable_workload; // referenced by nostr::EncryptedSpawnPodRequest::replication
 mod interfaces;
 mod mcp;
 mod nostr; // Still used for PodSpec type

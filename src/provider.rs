@@ -945,7 +945,21 @@ async fn handle_spawn_request(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
 
-    // 7. Track Workload
+    // 7. Track Workload.
+    //
+    // Replication mode flows from the consumer's spawn request. Old
+    // clients (no `replication` field) default to None — identical
+    // behavior to before this PR. New clients can opt into
+    // `WarmStandby { standby_providers }` by sending the same spawn
+    // request to every provider in the set; the orchestrator's
+    // `PublishLeaseRevocation` event from #34 then has a real
+    // `standby_providers` list to address. Standby-side promotion
+    // (subscribing + acting on incoming revocations) lands in a
+    // follow-up.
+    let replication = request
+        .replication
+        .clone()
+        .unwrap_or_else(crate::durable_workload::ReplicationMode::default);
     let workload = WorkloadInfo {
         vmid: id,
         workload_type: "lxc".to_string(), // Default for Proxmox/LXD
@@ -953,12 +967,7 @@ async fn handle_spawn_request(
         created_at: now,
         expires_at: now + duration_secs,
         owner_npub: requester_pubkey.to_string(),
-        // Replication / restart-policy / state-uri default to the
-        // safe single-container values. The Nostr request schema
-        // doesn't yet carry replication preferences (would be a
-        // breaking change for consumers); a follow-up will add an
-        // optional field once Unit 5 wiring proves out end-to-end.
-        replication: crate::durable_workload::ReplicationMode::default(),
+        replication,
         restart_policy: crate::durable_workload::RestartPolicy::default(),
         state_uri: None,
     };

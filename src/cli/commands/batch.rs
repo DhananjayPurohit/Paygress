@@ -333,6 +333,7 @@ pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
                 ssh_user.clone(),
                 ssh_pass.clone(),
                 template,
+                None,
                 relays,
                 nostr_key,
                 timeout,

@@ -119,6 +119,7 @@ impl PodProvisioningService {
             ssh_username: request.ssh_username,
             ssh_password: request.ssh_password,
             template_slug: None,
+            replication: None,
         };
 
         // Use the existing logic from main.rs handle_spawn_pod_request
