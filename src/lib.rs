@@ -27,6 +27,7 @@ pub mod templates;
 // Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;
 pub mod discovery;
+pub mod docker;
 pub mod lxd;
 pub mod provider;
 pub mod proxmox;

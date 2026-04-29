@@ -581,6 +581,17 @@ pub struct EncryptedSpawnPodRequest {
     pub pod_image: String,           // Required: Container image to use for the pod
     pub ssh_username: String,
     pub ssh_password: String,
+
+    /// Optional template slug. When set, the provider materializes
+    /// the workload's image / ports / env from its OWN local
+    /// template registry (`paygress::templates`) rather than
+    /// trusting consumer-supplied bytes — so a consumer cannot
+    /// smuggle an arbitrary image past the provider's vetted
+    /// list. `pod_image` is ignored when `template_slug` resolves.
+    /// Old clients that don't set this field continue to work
+    /// (`#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_slug: Option<String>,
 }
 
 // NEW: Encrypted top-up request structure

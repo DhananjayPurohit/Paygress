@@ -207,6 +207,15 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
 
     // Delegate to the existing spawn flow. Deploy is a thin,
     // opinionated lens over spawn — not a parallel implementation.
+    // The `template_slug` we pass here is what makes the provider
+    // resolve image/ports/env from its OWN template registry
+    // rather than trusting `--image` bytes.
+    let template_slug = match args.template {
+        Template::NostrRelay => "nostr-relay",
+        Template::InferenceEndpoint => "inference-endpoint",
+        Template::HeadlessBrowser => "headless-browser",
+        Template::BitcoinNode => "bitcoin-node",
+    };
     let spawn_args = SpawnArgs {
         provider: args.provider,
         server: None,
@@ -217,6 +226,7 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         ssh_pass: None,
         nostr_key: args.nostr_key,
         relays: args.relays,
+        template_slug: Some(template_slug.to_string()),
     };
     spawn::execute(spawn_args, verbose).await
 }
