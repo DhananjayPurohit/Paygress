@@ -9,7 +9,8 @@ use paygress::nostr::LeaseRevocationContent;
 
 fn sample() -> LeaseRevocationContent {
     LeaseRevocationContent {
-        workload_id: 1042,
+        // Consumer-assigned UUID — matches the standby's slot key.
+        workload_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         primary_provider_npub: "npub1primary".to_string(),
         standby_providers: vec!["npub1standby1".to_string(), "npub1standby2".to_string()],
         reason: "heartbeat-quorum-lost-past-t2".to_string(),
@@ -24,7 +25,7 @@ fn round_trip() {
     let v1 = sample();
     let json = serde_json::to_string(&v1).unwrap();
     let back: LeaseRevocationContent = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.workload_id, 1042);
+    assert_eq!(back.workload_id, "550e8400-e29b-41d4-a716-446655440000");
     assert_eq!(back.primary_provider_npub, "npub1primary");
     assert_eq!(back.standby_providers.len(), 2);
     assert_eq!(back.reason, "heartbeat-quorum-lost-past-t2");
@@ -50,7 +51,7 @@ fn v0_without_version_field_parses() {
     // but for forward-compat (a future version dropping `version`)
     // we want #[serde(default)] to keep working.
     let v0 = serde_json::json!({
-        "workload_id": 7,
+        "workload_id": "wid-7",
         "primary_provider_npub": "npub1abc",
         "standby_providers": ["npub1xyz"],
         "reason": "self-eviction",
@@ -58,7 +59,7 @@ fn v0_without_version_field_parses() {
     });
     let parsed: LeaseRevocationContent =
         serde_json::from_value(v0).expect("v0 revocation must parse");
-    assert_eq!(parsed.workload_id, 7);
+    assert_eq!(parsed.workload_id, "wid-7");
     assert_eq!(parsed.standby_providers.len(), 1);
     assert!(parsed.state_uri.is_none());
     assert_eq!(parsed.version, 1, "missing version defaults to 1");
@@ -102,7 +103,7 @@ fn parse_revocation_event_returns_some_for_matching_kind_and_body() {
     let body = serde_json::to_string(&sample()).unwrap();
     let ev = make_event(KIND_LEASE_REVOCATION as u32, body);
     let parsed = parse_revocation_event(&ev).expect("must parse");
-    assert_eq!(parsed.workload_id, 1042);
+    assert_eq!(parsed.workload_id, "550e8400-e29b-41d4-a716-446655440000");
     assert_eq!(parsed.standby_providers.len(), 2);
 }
 

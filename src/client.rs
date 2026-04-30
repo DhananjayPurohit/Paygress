@@ -89,6 +89,8 @@ impl PaygressClient {
             ssh_password: request.ssh_password,
             template_slug: None,
             replication: None,
+            primary_npub: None,
+            workload_id: None,
         };
         let json = serde_json::to_string(&payload)?;
         self.send_and_parse(provider_npub, json, parse_spawn_response)

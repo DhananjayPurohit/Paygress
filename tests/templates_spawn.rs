@@ -19,6 +19,8 @@ fn spawn_request_omits_template_slug_when_none() {
         ssh_password: "p".to_string(),
         template_slug: None,
         replication: None,
+        primary_npub: None,
+        workload_id: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(
@@ -37,6 +39,8 @@ fn spawn_request_includes_template_slug_when_set() {
         ssh_password: "p".to_string(),
         template_slug: Some("nostr-relay".to_string()),
         replication: None,
+        primary_npub: None,
+        workload_id: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains(r#""template_slug":"nostr-relay""#));
