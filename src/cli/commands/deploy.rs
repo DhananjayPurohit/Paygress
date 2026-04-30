@@ -232,6 +232,19 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         Template::BitcoinNode => "bitcoin-node",
         Template::AgentSandbox => "agent-sandbox",
     };
+    // Translate the deploy CLI's replication enum to the spawn CLI's
+    // string form. Deploy doesn't yet collect --standby (each
+    // template's standby topology is not first-class for now); when
+    // the user picks `--replication warm-standby` via deploy, fall
+    // back to `none` on the wire — the deploy command surfaces the
+    // "not yet enforced" warning above. Once the consumer-side
+    // standby coordination flow lands, this maps will route the list.
+    let replication_str = match replication {
+        ReplicationMode::None => "none",
+        ReplicationMode::Checkpointed => "checkpointed",
+        ReplicationMode::WarmStandby => "none", // see comment above
+    }
+    .to_string();
     let spawn_args = SpawnArgs {
         provider: args.provider,
         server: None,
@@ -243,6 +256,8 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         nostr_key: args.nostr_key,
         relays: args.relays,
         template_slug: Some(template_slug.to_string()),
+        replication: replication_str,
+        standby: None,
     };
     spawn::execute(spawn_args, verbose).await
 }

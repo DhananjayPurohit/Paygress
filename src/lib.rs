@@ -45,9 +45,9 @@ pub use lxd::LxdBackend;
 pub use nostr::{custom_relay_config, default_relay_config, NostrRelaySubscriber, RelayConfig};
 pub use nostr::{
     AccessDetailsContent, CapacityInfo, EncryptedTopUpPodRequest, ErrorResponseContent,
-    HeartbeatContent, IsolationLevel, PrivateRequest, ProviderFilter, ProviderInfo,
-    ProviderOfferContent, StatusRequestContent, StatusResponseContent, TemplateAccessPort,
-    TopUpResponseContent, SCHEMA_VERSION,
+    HeartbeatContent, IsolationLevel, LeaseRevocationContent, PrivateRequest, ProviderFilter,
+    ProviderInfo, ProviderOfferContent, StatusRequestContent, StatusResponseContent,
+    TemplateAccessPort, TopUpResponseContent, KIND_LEASE_REVOCATION, SCHEMA_VERSION,
 };
 pub use provider::{ProviderConfig, ProviderService};
 pub use proxmox::ProxmoxClient;

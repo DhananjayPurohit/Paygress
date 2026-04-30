@@ -325,6 +325,8 @@ pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
                 ssh_user.clone(),
                 ssh_pass.clone(),
                 template,
+                None, // batch shards are short-lived; warm-standby
+                // doesn't apply here. Could expose later.
                 relays,
                 nostr_key,
                 timeout,

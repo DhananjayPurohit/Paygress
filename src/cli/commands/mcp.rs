@@ -270,6 +270,7 @@ impl PaygressMcpServer {
             params.ssh_user.clone(),
             ssh_pass.clone(),
             params.template.clone(),
+            None, // MCP-side replication exposure is a follow-up
             relays,
             nostr_key,
             params.timeout_secs,
@@ -363,6 +364,7 @@ impl PaygressMcpServer {
                     ssh_user.clone(),
                     ssh_pass.clone(),
                     template,
+                    None, // batch shards: no warm-standby
                     relays,
                     nostr_key,
                     timeout,
