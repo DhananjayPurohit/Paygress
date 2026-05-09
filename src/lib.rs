@@ -19,6 +19,7 @@ pub mod blossom_crypto;
 pub mod cashu;
 pub mod durable_workload;
 pub mod nostr;
+pub mod reputation;
 
 // Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;
