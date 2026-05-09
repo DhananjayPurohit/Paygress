@@ -23,6 +23,7 @@ pub mod nostr;
 pub mod observatory;
 pub mod reputation;
 pub mod stake;
+pub mod templates;
 
 // Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;

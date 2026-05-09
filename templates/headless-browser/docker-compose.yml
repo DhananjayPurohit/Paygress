@@ -1,0 +1,29 @@
+# Headless browser (browserless/chromium) — Paygress killer template.
+#
+# Smoke test:
+#   docker compose -f templates/headless-browser/docker-compose.yml up -d
+#   curl -X POST 'http://localhost:3000/screenshot?token=paygress-local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"url":"https://example.com"}' --output /tmp/example.png
+#
+# Or use Playwright/Puppeteer to connect over CDP at
+# ws://localhost:3000?token=paygress-local
+services:
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: paygress-browserless
+    restart: unless-stopped
+    # Host port is configurable via the BROWSERLESS_HOST_PORT env
+    # var; defaults to 3000. Override if your host already has
+    # something on 3000.
+    ports:
+      - "${BROWSERLESS_HOST_PORT:-3000}:3000"
+    environment:
+      CONNECTION_TIMEOUT: "300000"
+      MAX_CONCURRENT_SESSIONS: "10"
+      TOKEN: paygress-local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
