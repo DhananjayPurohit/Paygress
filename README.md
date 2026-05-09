@@ -6,6 +6,18 @@ https://github.com/user-attachments/assets/627d2bb1-1a9b-4e66-bc42-7c91a1804fe1
 
 Paygress is a marketplace where anyone can buy or sell compute resources using Cashu ecash tokens. Providers advertise on Nostr, consumers discover and pay - all anonymous, all instant.
 
+## What you can do
+
+In plain English, what Paygress lets a user do today:
+
+- **Rent a Linux container by the second.** Hand it a prepaid voucher, get a container running on someone else's machine. No signup, no credit card, no email. The container shuts down when the voucher runs out; extend the lease anytime by handing over another voucher.
+- **Pick from five ready-made boxes.** Generic Python + Node sandbox (with a built-in HTTP exec endpoint — run code without SSH); AI inference endpoint (Ollama, OpenAI-compatible API); Nostr relay; disposable headless Chrome; Bitcoin node.
+- **Run code inside the sandbox without SSH.** The agent-sandbox template ships with a bundled HTTP exec server. POST a command, get back stdout/stderr/exit code. Same credentials as SSH, no extra setup.
+- **Run many containers in parallel.** One command spawns N containers, splits a single voucher N ways automatically, hands you a JSON manifest with each one's address. Built for batch jobs (render farms, ML batch inference), CI matrices (one runner per OS/version), and map-reduce workloads.
+- **Long-running services with automatic failover.** Pay 3 hosts at once (one primary, two standbys). The primary runs the actual container and pings the network every minute. If it stops pinging — machine crashed, network died — the first standby takes over within ~30 seconds, becomes the new primary. (V1 caveat: best-effort single-writer for ~30s during failover; ideal for relays / stateless services, see PR #43 for the full story.)
+- **Let AI assistants do all this for you.** A built-in MCP server plugs into Claude Desktop, Cursor, Cline, Claude Code with one config block. The assistant gets six tools: discover providers, spawn a sandbox, fan out N spawns, monitor a lease, extend a lease, and run code inside the sandbox. So Claude can say *"let me run that for you"* and within seconds has actually executed your code in a sandbox it paid for itself.
+- **Become a host yourself.** Run the provider command on a Linux box you own and start renting compute to anyone with vouchers. Heartbeats publish your availability; consumers find you through discovery. You earn vouchers per second of compute served.
+
 ## Prerequisites
 
 Install Rust via [rustup](https://rustup.rs/):
