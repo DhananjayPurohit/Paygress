@@ -37,6 +37,7 @@ use super::identity::{get_or_create_identity, parse_relays};
 use super::spawn::{nostr_spawn_round_trip, NostrSpawnOutcome};
 use super::status::{nostr_status_round_trip, NostrStatusOutcome};
 use super::topup::{nostr_topup_round_trip, NostrTopupOutcome};
+use crate::exec_client;
 use paygress::discovery::DiscoveryClient;
 use paygress::nostr::ProviderFilter;
 
@@ -190,6 +191,41 @@ pub struct TopupParams {
     /// Per-call timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RunCommandParams {
+    /// Host the agent-sandbox is published on. Comes from the
+    /// `host` field of a `spawn_workload` / `batch_spawn` response.
+    pub host: String,
+    /// Port the exec server is reachable on. For the `agent-sandbox`
+    /// template this is the host port mapped to container 8080
+    /// (label `sandbox-exec` in the template ports list).
+    pub port: u16,
+    /// HTTP Basic auth username. The provider sets this to "root"
+    /// inside the container; rarely overridden.
+    #[serde(default = "default_exec_user")]
+    pub user: String,
+    /// HTTP Basic auth password. Must match the password the spawn
+    /// response printed (the provider injects it as EXEC_PASS in the
+    /// container's env).
+    pub pass: String,
+    /// Shell command to run. Interpreted by `bash -lc` inside the
+    /// container, so pipes / redirects work naturally.
+    pub command: String,
+    /// Server-side command timeout (seconds). Capped at 1800.
+    #[serde(default = "default_exec_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Override the working directory. Defaults to /workspace.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+}
+
+fn default_exec_user() -> String {
+    "root".to_string()
+}
+fn default_exec_timeout_secs() -> u64 {
+    60
 }
 
 #[tool_router]
@@ -543,6 +579,45 @@ impl PaygressMcpServer {
             serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
         )]))
     }
+
+    #[tool(
+        description = "Run a shell command inside an agent-sandbox workload via its baked-in HTTP exec server. Pass the host and port from the spawn response (port label `sandbox-exec`), plus the SSH password (the provider reuses it as EXEC_PASS). Returns stdout, stderr, exit_code, duration_ms, timed_out. Use this immediately after `spawn_workload` to actually run code inside the paid sandbox — Paygress is the spawn fabric, this is the exec channel."
+    )]
+    async fn run_command(
+        &self,
+        Parameters(params): Parameters<RunCommandParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let total_timeout = std::time::Duration::from_secs(params.timeout_secs.saturating_add(5));
+        let outcome = exec_client::call_exec(
+            &params.host,
+            params.port,
+            &params.user,
+            &params.pass,
+            &params.command,
+            Some(params.timeout_secs),
+            params.working_dir.as_deref(),
+            total_timeout,
+        )
+        .await;
+
+        let body = match outcome {
+            Ok(resp) => serde_json::json!({
+                "status": "ok",
+                "stdout": resp.stdout,
+                "stderr": resp.stderr,
+                "exit_code": resp.exit_code,
+                "duration_ms": resp.duration_ms,
+                "timed_out": resp.timed_out,
+            }),
+            Err(e) => serde_json::json!({
+                "status": "transport_error",
+                "message": e.to_string(),
+            }),
+        };
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -551,11 +626,13 @@ impl ServerHandler for PaygressMcpServer {
         ServerInfo {
             instructions: Some(
                 "Paygress: pay-per-use compute marketplace using Cashu ecash and Nostr. \
-                 Lifecycle: `list_providers` (discover) → `spawn_workload` (single) or \
-                 `batch_spawn` (N-shard fan-out) → `workload_status` (monitor) → \
-                 `topup_workload` (extend before expiry). The agent connects to the \
-                 returned host:ssh_port itself to actually run code — Paygress is the \
-                 spawn/billing/lifecycle fabric, not the exec channel."
+                 Full lifecycle: `list_providers` (discover) → `spawn_workload` / \
+                 `batch_spawn` (pay + provision) → `run_command` (exec inside the \
+                 sandbox via its baked-in HTTP server) → `workload_status` (monitor) \
+                 → `topup_workload` (extend before expiry). For the canonical agent \
+                 flow: spawn an `agent-sandbox` template, then call `run_command` \
+                 with the returned host + sandbox-exec port + ssh_pass — that's the \
+                 paid box's stdout in your hand."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -587,10 +664,26 @@ mod tests {
         let inst = info.instructions.as_deref().unwrap_or("");
         assert!(inst.contains("Paygress"));
         // Pin the lifecycle hint so future edits don't drop the
-        // workload_status / topup_workload mentions — agents rely on
-        // these to know when to call them.
+        // workload_status / topup_workload / run_command mentions —
+        // agents rely on these to know when to call them.
         assert!(inst.contains("workload_status"));
         assert!(inst.contains("topup_workload"));
+        assert!(inst.contains("run_command"));
+    }
+
+    #[test]
+    fn run_command_params_defaults_round_trip() {
+        let v = serde_json::from_value::<RunCommandParams>(serde_json::json!({
+            "host": "1.2.3.4",
+            "port": 30043,
+            "pass": "hunter2",
+            "command": "ls /workspace",
+        }))
+        .unwrap();
+        assert_eq!(v.user, "root");
+        assert_eq!(v.timeout_secs, 60);
+        assert!(v.working_dir.is_none());
+        assert_eq!(v.command, "ls /workspace");
     }
 
     #[test]

@@ -5,8 +5,9 @@ use colored::Colorize;
 
 mod api;
 mod commands;
+mod exec_client;
 
-use commands::{batch, bootstrap, deploy, list, mcp, provider, spawn, status, system, topup};
+use commands::{batch, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system, topup};
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
 #[derive(Parser)]
@@ -50,6 +51,10 @@ enum Commands {
     /// can spawn / batch / discover providers as native tools.
     Mcp(mcp::McpArgs),
 
+    /// Run a shell command inside a spawned agent-sandbox workload
+    /// via its baked-in HTTP exec server. Returns stdout/stderr/exit.
+    Exec(exec::ExecArgs),
+
     // ============ Provider Commands ============
     /// Provider management - setup, start, stop, status
     Provider(provider::ProviderArgs),
@@ -92,6 +97,7 @@ async fn main() {
         Commands::Status(args) => status::execute(args, cli.verbose).await,
         Commands::Batch(args) => batch::execute(args, cli.verbose).await,
         Commands::Mcp(args) => mcp::execute(args, cli.verbose).await,
+        Commands::Exec(args) => exec::execute(args, cli.verbose).await,
 
         // Provider
         Commands::Provider(args) => provider::execute(args, cli.verbose).await,

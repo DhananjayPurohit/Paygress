@@ -904,7 +904,7 @@ async fn handle_spawn_request(
         })
         .unwrap_or_default();
 
-    let template_env: HashMap<String, String> = template
+    let mut template_env: HashMap<String, String> = template
         .as_ref()
         .map(|t| {
             t.env
@@ -913,6 +913,26 @@ async fn handle_spawn_request(
                 .collect()
         })
         .unwrap_or_default();
+
+    // For templates that bake in the paygress-exec HTTP server
+    // (currently `agent-sandbox`), inject the same credentials the
+    // consumer will see in AccessDetails — `root` + the
+    // provider-generated `password`. The instructions block already
+    // tells the consumer to use "root + this password", so the exec
+    // server reusing those creds means there's exactly one secret
+    // to manage per spawn.
+    //
+    // The template defaults EXEC_USER/EXEC_PASS to empty strings;
+    // the server returns 503 until they're non-empty, so this
+    // overlay is what unlocks /exec.
+    if let Some(t) = template.as_ref() {
+        if t.env.contains_key("EXEC_USER") {
+            template_env.insert("EXEC_USER".to_string(), "root".to_string());
+        }
+        if t.env.contains_key("EXEC_PASS") {
+            template_env.insert("EXEC_PASS".to_string(), password.clone());
+        }
+    }
 
     let extra_runtime_args: Vec<String> = template
         .as_ref()

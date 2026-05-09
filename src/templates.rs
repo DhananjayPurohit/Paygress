@@ -287,22 +287,32 @@ fn agent_sandbox() -> TemplateDefinition {
     env.insert("WORKSPACE", "/workspace");
     env.insert("PYTHONUNBUFFERED", "1");
     env.insert("NODE_ENV", "production");
+    // EXEC_USER and EXEC_PASS are the auth credentials for the
+    // baked-in HTTP exec server (images/agent-sandbox/server.py).
+    // Provider's spawn handler overrides these with the consumer's
+    // ssh_username / ssh_password at container-start time so the
+    // caller can use ONE set of creds for both SSH (legacy) and the
+    // exec endpoint. Default values here are placeholders — the
+    // server returns 503 until they're set to non-empty values.
+    env.insert("EXEC_USER", "");
+    env.insert("EXEC_PASS", "");
     TemplateDefinition {
         name: TemplateName::AgentSandbox,
-        summary: "Generic compute sandbox: Python 3.12 + Node 20 + git in a writable /workspace volume. Built for AI agents writing code, CI/test runners, and map-reduce / batch shards. Stateless by default — retry-on-fresh-provider is the recovery model. Browser-using agents should compose with the `headless-browser` template.",
-        // Community-maintained image with Python + Node + git/curl
-        // preinstalled. Battle-tested in the data-engineering /
-        // CI ecosystem; pinned by major version so a registry-side
-        // rebuild doesn't silently change behavior.
-        image: "nikolaik/python-nodejs:python3.12-nodejs20",
+        summary: "Generic compute sandbox: Python 3.12 + Node 20 + git in a writable /workspace volume. Bundled HTTP exec server on port 8080 lets agents run shell commands directly via the `paygress-cli exec` / MCP `run_command` path — no SSH needed. Stateless by default — retry-on-fresh-provider is the recovery model. Browser-using agents should compose with the `headless-browser` template.",
+        // Custom paygress image: nikolaik/python-nodejs +
+        // /usr/local/bin/paygress-exec (the baked-in HTTP server).
+        // Built and published by .github/workflows/agent-sandbox-image.yml
+        // on tags `agent-sandbox-v*`. Pinned to 0.1.0 so a registry-
+        // side rebuild can't silently change spawn behavior.
+        image: "ghcr.io/dhananjaypurohit/paygress-agent-sandbox:0.1.0",
         ports: vec![Port {
-            // One generic HTTP port for agents/jobs that want to
-            // serve results or expose a status endpoint. The host
-            // mapping is published in AccessDetailsContent so the
-            // caller can reach it without scraping the SSH instruction.
+            // The exec server listens here. AccessDetails surfaces
+            // the host_port mapping so the caller can hit
+            // http://<host>:<host_port>/exec with HTTP Basic auth
+            // using the spawn-time ssh_user / ssh_pass.
             container_port: 8080,
             protocol: "http",
-            label: "sandbox-http",
+            label: "sandbox-exec",
         }],
         env,
         compose_path: "templates/agent-sandbox/docker-compose.yml",

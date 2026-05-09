@@ -3,6 +3,7 @@
 pub mod batch;
 pub mod bootstrap;
 pub mod deploy;
+pub mod exec;
 pub mod identity;
 pub mod list;
 pub mod mcp;
