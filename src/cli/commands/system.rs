@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use colored::*;
-use std::process::Command;
 use std::io::{self, Write};
+use std::process::Command;
 
 #[derive(Args)]
 pub struct SystemArgs {
@@ -47,13 +47,30 @@ pub async fn execute(args: SystemArgs, verbose: bool) -> Result<()> {
 
 async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
     if let Some(ref host) = args.host {
-        return execute_remote_reset(host, &args.user, args.port, args.uninstall_backend, args.yes, verbose).await;
+        return execute_remote_reset(
+            host,
+            &args.user,
+            args.port,
+            args.uninstall_backend,
+            args.yes,
+            verbose,
+        )
+        .await;
     }
 
     println!("{}", "⚠️  SYSTEM RESET (LOCAL) ⚠️".red().bold());
-    println!("{}", "This will permanently remove Paygress services and configurations from THIS machine.".red());
+    println!(
+        "{}",
+        "This will permanently remove Paygress services and configurations from THIS machine."
+            .red()
+    );
     if args.uninstall_backend {
-        println!("{}", "WARNING: This will also attempt to UNINSTALL your compute backend (LXD/Proxmox).".red().bold());
+        println!(
+            "{}",
+            "WARNING: This will also attempt to UNINSTALL your compute backend (LXD/Proxmox)."
+                .red()
+                .bold()
+        );
     }
     println!();
 
@@ -71,14 +88,20 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
     // 1. Stop and disable service
     print!("  Stopping paygress-provider service... ");
     io::stdout().flush()?;
-    let _ = Command::new("systemctl").args(["stop", "paygress-provider"]).output();
-    let _ = Command::new("systemctl").args(["disable", "paygress-provider"]).output();
+    let _ = Command::new("systemctl")
+        .args(["stop", "paygress-provider"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["disable", "paygress-provider"])
+        .output();
     println!("{}", "DONE".green());
 
     // 2. Remove systemd unit
     print!("  Removing systemd unit... ");
     io::stdout().flush()?;
-    let _ = Command::new("rm").args(["-f", "/etc/systemd/system/paygress-provider.service"]).output();
+    let _ = Command::new("rm")
+        .args(["-f", "/etc/systemd/system/paygress-provider.service"])
+        .output();
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
     println!("{}", "DONE".green());
 
@@ -94,7 +117,9 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
 
         print!("    Removing LXD (snap)... ");
         io::stdout().flush()?;
-        let output = Command::new("snap").args(["remove", "lxd", "--purge"]).output();
+        let output = Command::new("snap")
+            .args(["remove", "lxd", "--purge"])
+            .output();
         if output.is_ok() {
             println!("{}", "DONE".green());
         } else {
@@ -103,11 +128,16 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
 
         print!("    Removing LXC (apt)... ");
         io::stdout().flush()?;
-        let _ = Command::new("apt-get").args(["remove", "--purge", "-y", "lxc", "lxcfs"]).output();
+        let _ = Command::new("apt-get")
+            .args(["remove", "--purge", "-y", "lxc", "lxcfs"])
+            .output();
         let _ = Command::new("apt-get").args(["autoremove", "-y"]).output();
         println!("{}", "DONE".green());
 
-        println!("    {} Manual Proxmox cleanup may be required if using Proxmox VE.", "Note:".yellow());
+        println!(
+            "    {} Manual Proxmox cleanup may be required if using Proxmox VE.",
+            "Note:".yellow()
+        );
     }
 
     println!();
@@ -119,7 +149,14 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-async fn execute_remote_reset(host: &str, user: &str, port: u16, uninstall_backend: bool, yes: bool, _verbose: bool) -> Result<()> {
+async fn execute_remote_reset(
+    host: &str,
+    user: &str,
+    port: u16,
+    uninstall_backend: bool,
+    yes: bool,
+    _verbose: bool,
+) -> Result<()> {
     println!("{}", "Remote System Reset".bold());
     println!("  Host: {}@{}:{}", user, host, port);
     println!();
@@ -144,7 +181,7 @@ async fn execute_remote_reset(host: &str, user: &str, port: u16, uninstall_backe
          rm -f /etc/systemd/system/paygress-provider.service; \
          systemctl daemon-reload; \
          rm -rf /etc/paygress; \
-         echo 'Paygress service and config removed.'"
+         echo 'Paygress service and config removed.'",
     );
 
     if uninstall_backend {
@@ -152,12 +189,19 @@ async fn execute_remote_reset(host: &str, user: &str, port: u16, uninstall_backe
             "; snap remove lxd --purge 2>/dev/null; \
              apt-get remove --purge -y lxc lxcfs 2>/dev/null; \
              apt-get autoremove -y 2>/dev/null; \
-             echo 'Backend cleanup attempted.'"
+             echo 'Backend cleanup attempted.'",
         );
     }
 
     let output = Command::new("ssh")
-        .args(["-p", &port_str, "-o", "StrictHostKeyChecking=no", &ssh_target, &reset_script])
+        .args([
+            "-p",
+            &port_str,
+            "-o",
+            "StrictHostKeyChecking=no",
+            &ssh_target,
+            &reset_script,
+        ])
         .output()?;
 
     if output.status.success() {

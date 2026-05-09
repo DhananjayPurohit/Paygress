@@ -2,8 +2,8 @@
 //
 // Abstracts the underlying container/VM platform (Proxmox vs LXD)
 
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,22 +32,22 @@ pub struct ContainerConfig {
 pub trait ComputeBackend: Send + Sync {
     /// Find an available ID in the given range
     async fn find_available_id(&self, range_start: u32, range_end: u32) -> Result<u32>;
-    
+
     /// Create a new container
     async fn create_container(&self, config: &ContainerConfig) -> Result<String>; // Returns container ID/Name
-    
+
     /// Start a container
     async fn start_container(&self, id: u32) -> Result<()>;
-    
+
     /// Stop a container
     async fn stop_container(&self, id: u32) -> Result<()>;
-    
+
     /// Delete a container
     async fn delete_container(&self, id: u32) -> Result<()>;
-    
+
     /// Get node resource usage
     async fn get_node_status(&self) -> Result<NodeStatus>;
-    
+
     /// Get public IP of the container/VM
     async fn get_container_ip(&self, id: u32) -> Result<Option<String>>;
 }

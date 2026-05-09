@@ -8,11 +8,10 @@ use colored::Colorize;
 use nostr_sdk::ToBech32;
 use std::process::Command;
 
-use paygress::provider::{ProviderConfig, ProviderService, load_config, save_config};
 use paygress::nostr::PodSpec;
+use paygress::provider::{load_config, save_config, ProviderConfig, ProviderService};
 
 const CONFIG_PATH: &str = "/etc/paygress/provider-config.json";
-
 
 #[derive(Args)]
 pub struct ProviderArgs {
@@ -46,43 +45,43 @@ pub struct SetupArgs {
     /// Proxmox API URL (e.g., https://192.168.1.100:8006/api2/json)
     #[arg(long)]
     pub proxmox_url: String,
-    
+
     /// Proxmox API token ID (e.g., root@pam!paygress)
     #[arg(long)]
     pub token_id: String,
-    
+
     /// Proxmox API token secret
     #[arg(long)]
     pub token_secret: String,
-    
+
     /// Proxmox node name
     #[arg(long, default_value = "pve")]
     pub node: String,
-    
+
     /// Storage pool name
     #[arg(long, default_value = "local-lvm")]
     pub storage: String,
-    
+
     /// LXC template path
     #[arg(long, default_value = "local:vztmpl/ubuntu-22.04-standard.tar.zst")]
     pub template: String,
-    
+
     /// Network bridge
     #[arg(long, default_value = "vmbr0")]
     pub bridge: String,
-    
+
     /// Nostr private key (nsec format, auto-generated if not provided)
     #[arg(long)]
     pub nostr_key: Option<String>,
-    
+
     /// Provider display name
     #[arg(long)]
     pub name: String,
-    
+
     /// Location description (e.g., "US-East", "Germany")
     #[arg(long)]
     pub location: Option<String>,
-    
+
     /// Public IP address (auto-detected if not provided)
     #[arg(long)]
     pub public_ip: Option<String>,
@@ -97,7 +96,7 @@ pub struct StartArgs {
     /// Path to configuration file
     #[arg(long, default_value = "/etc/paygress/provider-config.json")]
     pub config: String,
-    
+
     /// Run in foreground (don't daemonize)
     #[arg(long, default_value = "true")]
     pub foreground: bool,
@@ -158,7 +157,8 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         None => {
             println!("  {} Generating new Nostr keypair...", "⚙".yellow());
             let keys = nostr_sdk::Keys::generate();
-            let nsec = keys.secret_key()
+            let nsec = keys
+                .secret_key()
                 .map_err(|e| anyhow::anyhow!("Failed to get secret key: {}", e))?
                 .to_bech32()
                 .map_err(|e| anyhow::anyhow!("Failed to encode key: {}", e))?;
@@ -195,7 +195,9 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         },
     ];
 
-    let mints: Vec<String> = args.mints.split(',')
+    let mints: Vec<String> = args
+        .mints
+        .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -212,12 +214,18 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
                         ip.trim().to_string()
                     }
                     Err(_) => {
-                        println!("  {} Could not auto-detect IP, using 127.0.0.1", "⚠".yellow());
+                        println!(
+                            "  {} Could not auto-detect IP, using 127.0.0.1",
+                            "⚠".yellow()
+                        );
                         "127.0.0.1".to_string()
                     }
                 },
                 Err(_) => {
-                    println!("  {} Could not auto-detect IP, using 127.0.0.1", "⚠".yellow());
+                    println!(
+                        "  {} Could not auto-detect IP, using 127.0.0.1",
+                        "⚠".yellow()
+                    );
                     "127.0.0.1".to_string()
                 }
             }
@@ -254,6 +262,7 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         tunnel_interface: None,
         ssh_port_start: None,
         ssh_port_end: None,
+        cashu_wallet_db_path: "./paygress-cashu-wallet.redb".to_string(),
     };
 
     // Save configuration
@@ -263,26 +272,27 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
     // Test Proxmox connection
     println!();
     println!("  {} Testing Proxmox connection...", "⚙".yellow());
-    
+
     match paygress::proxmox::ProxmoxClient::new(
         &config.proxmox_url,
         &config.proxmox_token_id,
         &config.proxmox_token_secret,
         &config.proxmox_node,
     ) {
-        Ok(client) => {
-            match client.get_node_status().await {
-                Ok(status) => {
-                    println!("  {} Proxmox connected!", "✓".green());
-                    println!("      Node CPU: {:.1}%", status.cpu * 100.0);
-                    println!("      Memory: {} MB used", status.memory.used / (1024 * 1024));
-                }
-                Err(e) => {
-                    println!("  {} Proxmox connection failed: {}", "✗".red(), e);
-                    println!("      Check your API token and URL");
-                }
+        Ok(client) => match client.get_node_status().await {
+            Ok(status) => {
+                println!("  {} Proxmox connected!", "✓".green());
+                println!("      Node CPU: {:.1}%", status.cpu * 100.0);
+                println!(
+                    "      Memory: {} MB used",
+                    status.memory.used / (1024 * 1024)
+                );
             }
-        }
+            Err(e) => {
+                println!("  {} Proxmox connection failed: {}", "✗".red(), e);
+                println!("      Check your API token and URL");
+            }
+        },
         Err(e) => {
             println!("  {} Failed to create Proxmox client: {}", "✗".red(), e);
         }
@@ -296,7 +306,7 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
     println!("  {} provider start", "paygress-cli".cyan());
     println!();
     println!("Your provider name: {}", args.name.yellow());
-    
+
     Ok(())
 }
 
@@ -306,9 +316,9 @@ async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
 
     // Load configuration
     let config = load_config(&args.config)?;
-    
+
     println!("  Provider: {}", config.provider_name.yellow());
-    
+
     match config.backend_type {
         paygress::provider::BackendType::Proxmox => {
             println!("  Backend:  Proxmox");
@@ -324,7 +334,7 @@ async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
 
     // Create and run the provider service
     let service = ProviderService::new(config).await?;
-    
+
     println!("  NPUB: {}", service.get_npub().cyan());
     println!();
     println!("{}", "Provider is now live! Press Ctrl+C to stop.".green());
@@ -362,9 +372,7 @@ async fn execute_stop(_verbose: bool) -> Result<()> {
         if o.status.success() {
             let pids = String::from_utf8_lossy(&o.stdout);
             for pid in pids.trim().lines() {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.trim())
-                    .output();
+                let _ = std::process::Command::new("kill").arg(pid.trim()).output();
             }
             println!("{}", "Provider stopped.".green());
             return Ok(());
@@ -378,13 +386,16 @@ async fn execute_stop(_verbose: bool) -> Result<()> {
 async fn execute_status(_verbose: bool) -> Result<()> {
     println!("{}", "📊 Provider Status".blue().bold());
     println!("{}", "━".repeat(50).blue());
-    
+
     // Try to load config
     match load_config(CONFIG_PATH) {
         Ok(config) => {
             println!();
             println!("  Provider Name:  {}", config.provider_name.yellow());
-            println!("  Location:       {}", config.provider_location.as_deref().unwrap_or("Not set"));
+            println!(
+                "  Location:       {}",
+                config.provider_location.as_deref().unwrap_or("Not set")
+            );
             println!("  Proxmox URL:    {}", config.proxmox_url);
             println!("  Node:           {}", config.proxmox_node);
             println!();
@@ -400,16 +411,17 @@ async fn execute_status(_verbose: bool) -> Result<()> {
             if config.tunnel_enabled {
                 println!();
                 println!("  {} Tunnel:", "🔒".to_string());
-                println!("    Interface: {}", config.tunnel_interface.as_deref().unwrap_or("wg0"));
+                println!(
+                    "    Interface: {}",
+                    config.tunnel_interface.as_deref().unwrap_or("wg0")
+                );
                 println!("    Public IP: {}", config.public_ip);
                 if let (Some(ps), Some(pe)) = (config.ssh_port_start, config.ssh_port_end) {
                     println!("    Port range: {}-{}", ps, pe);
                 }
                 // Check if WireGuard interface is up
                 let iface = config.tunnel_interface.as_deref().unwrap_or("wg0");
-                let wg_status = Command::new("wg")
-                    .args(["show", iface])
-                    .output();
+                let wg_status = Command::new("wg").args(["show", iface]).output();
                 match wg_status {
                     Ok(o) if o.status.success() => println!("    Status: {}", "UP".green()),
                     _ => println!("    Status: {}", "DOWN".red()),
@@ -422,7 +434,7 @@ async fn execute_status(_verbose: bool) -> Result<()> {
             println!("  Run 'paygress-cli provider setup' first.");
         }
     }
-    
+
     println!();
     Ok(())
 }
@@ -446,7 +458,9 @@ async fn execute_config(args: ConfigArgs, _verbose: bool) -> Result<()> {
 
 /// Check if the current process is running as root (uid 0).
 fn nix_is_root() -> bool {
-    Command::new("id").arg("-u").output()
+    Command::new("id")
+        .arg("-u")
+        .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
         .unwrap_or(false)
 }
@@ -464,13 +478,21 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
 
     // Check if config already exists (use sudo to read since /etc/wireguard may be 700)
     let exists = if need_sudo {
-        Command::new("sudo").args(["test", "-f", &wg_conf_path]).status().map(|s| s.success()).unwrap_or(false)
+        Command::new("sudo")
+            .args(["test", "-f", &wg_conf_path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     } else {
         std::path::Path::new(&wg_conf_path).exists()
     };
 
     if exists {
-        println!("  {} WireGuard config already exists at {}", "!".yellow(), wg_conf_path);
+        println!(
+            "  {} WireGuard config already exists at {}",
+            "!".yellow(),
+            wg_conf_path
+        );
         println!("  Delete it first if you want to re-provision.");
         println!();
 
@@ -497,7 +519,13 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         _ => {
             println!("{}", "not found, installing...".yellow());
             let mut cmd_args: Vec<&str> = sudo.to_vec();
-            cmd_args.extend_from_slice(&["apt-get", "install", "-y", "wireguard", "wireguard-tools"]);
+            cmd_args.extend_from_slice(&[
+                "apt-get",
+                "install",
+                "-y",
+                "wireguard",
+                "wireguard-tools",
+            ]);
             let prog = cmd_args.remove(0);
             let install = Command::new(prog)
                 .args(&cmd_args)
@@ -520,7 +548,8 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     print!("  Requesting VPN config from {}... ", args.vpn_url);
     let client = reqwest::Client::new();
     let version = env!("CARGO_PKG_VERSION");
-    let response = client.get(&args.vpn_url)
+    let response = client
+        .get(&args.vpn_url)
         .header("Authorization", format!("Cashu {}", args.token))
         .header("User-Agent", format!("Paygress-CLI/{}", version))
         .send()
@@ -540,8 +569,13 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
 
     // 3. Validate config
     if !wg_config.contains("[Interface]") {
-        println!("  {} Received invalid config (no [Interface] section)", "X".red());
-        return Err(anyhow::anyhow!("Invalid WireGuard config received from VPN service"));
+        println!(
+            "  {} Received invalid config (no [Interface] section)",
+            "X".red()
+        );
+        return Err(anyhow::anyhow!(
+            "Invalid WireGuard config received from VPN service"
+        ));
     }
     println!("  {} Config validated", "V".green());
 
@@ -564,11 +598,15 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         }
         tee.wait()?;
 
-        Command::new("sudo").args(["chmod", "600", &wg_conf_path]).output()?;
+        Command::new("sudo")
+            .args(["chmod", "600", &wg_conf_path])
+            .output()?;
     } else {
         std::fs::create_dir_all("/etc/wireguard")?;
         std::fs::write(&wg_conf_path, &wg_config)?;
-        Command::new("chmod").args(["600", &wg_conf_path]).output()?;
+        Command::new("chmod")
+            .args(["600", &wg_conf_path])
+            .output()?;
     }
     println!("  {} Saved to {}", "V".green(), wg_conf_path);
 
@@ -586,9 +624,7 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     let mut wg_args: Vec<&str> = sudo.to_vec();
     wg_args.extend_from_slice(&["wg-quick", "up", &args.interface]);
     let prog = wg_args.remove(0);
-    let output = Command::new(prog)
-        .args(&wg_args)
-        .output()?;
+    let output = Command::new(prog).args(&wg_args).output()?;
 
     if output.status.success() {
         println!("{}", "UP".green());
@@ -606,7 +642,11 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     // 7. Enable on boot
     if need_sudo {
         let _ = Command::new("sudo")
-            .args(["systemctl", "enable", &format!("wg-quick@{}", args.interface)])
+            .args([
+                "systemctl",
+                "enable",
+                &format!("wg-quick@{}", args.interface),
+            ])
             .output();
     } else {
         let _ = Command::new("systemctl")
@@ -629,7 +669,10 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     }
     println!();
     println!("  Your provider will now be reachable through the VPN tunnel.");
-    println!("  Restart the provider service to apply: {} provider start", "paygress-cli".cyan());
+    println!(
+        "  Restart the provider service to apply: {} provider start",
+        "paygress-cli".cyan()
+    );
 
     Ok(())
 }
@@ -638,14 +681,16 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
 /// Returns (public_ip, optional_port_start, optional_port_end)
 fn parse_wg_config(config: &str) -> Option<(String, Option<u16>, Option<u16>)> {
     // Extract public IP from Endpoint field (e.g., "Endpoint = 1.2.3.4:51820")
-    let public_ip = config.lines()
+    let public_ip = config
+        .lines()
         .find(|l| l.trim().starts_with("Endpoint"))
         .and_then(|l| l.split('=').nth(1))
         .map(|v| v.trim().split(':').next().unwrap_or("").to_string())
         .filter(|s| !s.is_empty())?;
 
     // Try to extract port range from comments (e.g., "# Public Ports: 1.2.3.4:11000-11999")
-    let (port_start, port_end) = config.lines()
+    let (port_start, port_end) = config
+        .lines()
         .find(|l| l.contains("Public Ports:") || l.contains("Port Range:"))
         .and_then(|l| {
             // Extract "11000-11999" from the line
@@ -676,10 +721,18 @@ fn update_provider_tunnel_config(
             config.ssh_port_start = port_start;
             config.ssh_port_end = port_end;
             save_config(CONFIG_PATH, &config)?;
-            println!("  {} Provider config updated (public_ip={}, tunnel=enabled)", "✓".green(), public_ip);
+            println!(
+                "  {} Provider config updated (public_ip={}, tunnel=enabled)",
+                "✓".green(),
+                public_ip
+            );
         }
         Err(_) => {
-            println!("  {} No provider config found at {}. Run 'provider setup' first.", "⚠".yellow(), CONFIG_PATH);
+            println!(
+                "  {} No provider config found at {}. Run 'provider setup' first.",
+                "⚠".yellow(),
+                CONFIG_PATH
+            );
             println!("  Tunnel is active but provider config not updated.");
         }
     }

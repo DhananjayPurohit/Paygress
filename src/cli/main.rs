@@ -6,7 +6,7 @@ use colored::Colorize;
 mod api;
 mod commands;
 
-use commands::{list, spawn, topup, status, provider, bootstrap, system};
+use commands::{bootstrap, deploy, list, provider, spawn, status, system, topup};
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
 #[derive(Parser)]
@@ -26,12 +26,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     // ============ Consumer Commands ============
-
     /// Discover providers and their offers
     List(list::ListArgs),
 
     /// Spawn a new workload with Cashu payment
     Spawn(spawn::SpawnArgs),
+
+    /// Deploy an opinionated template (Unit 9)
+    Deploy(deploy::DeployArgs),
 
     /// Top up an existing workload with additional payment
     Topup(topup::TopupArgs),
@@ -40,7 +42,6 @@ enum Commands {
     Status(status::StatusArgs),
 
     // ============ Provider Commands ============
-
     /// Provider management - setup, start, stop, status
     Provider(provider::ProviderArgs),
 
@@ -60,7 +61,10 @@ fn print_banner() {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_writer(std::io::stderr)
         .init();
 
@@ -74,6 +78,7 @@ async fn main() {
         // Consumer
         Commands::List(args) => list::execute(args, cli.verbose).await,
         Commands::Spawn(args) => spawn::execute(args, cli.verbose).await,
+        Commands::Deploy(args) => deploy::execute(args, cli.verbose).await,
         Commands::Topup(args) => topup::execute(args, cli.verbose).await,
         Commands::Status(args) => status::execute(args, cli.verbose).await,
 

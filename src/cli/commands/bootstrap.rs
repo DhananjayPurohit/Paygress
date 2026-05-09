@@ -10,49 +10,48 @@ use nostr_sdk::ToBech32;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-
 #[derive(Args)]
 pub struct BootstrapArgs {
     /// Target server IP or hostname
     #[arg(long)]
     pub host: String,
-    
+
     /// SSH user (must have sudo privileges)
     #[arg(long, default_value = "root")]
     pub user: String,
-    
+
     /// SSH password (use --key for key-based auth)
     #[arg(long)]
     pub password: Option<String>,
-    
+
     /// SSH private key path
     #[arg(long)]
     pub key: Option<String>,
-    
+
     /// SSH port
     #[arg(long, default_value = "22")]
     pub port: u16,
-    
+
     /// Provider display name
     #[arg(long)]
     pub name: String,
-    
+
     /// Location description (e.g., "US-East", "Germany")
     #[arg(long)]
     pub location: Option<String>,
-    
+
     /// Nostr private key (nsec format, auto-generated if not provided)
     #[arg(long)]
     pub nostr_key: Option<String>,
-    
+
     /// Whitelisted Cashu mints (comma-separated)
     #[arg(long, default_value = "https://mint.minibits.cash")]
     pub mints: String,
-    
+
     /// Skip Proxmox installation (assumes already installed)
     #[arg(long)]
     pub skip_proxmox: bool,
-    
+
     /// Dry run - show commands without executing
     #[arg(long)]
     pub dry_run: bool,
@@ -69,21 +68,36 @@ pub struct BootstrapArgs {
 }
 
 pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
-    println!("{}", "╔════════════════════════════════════════════════════════════╗".blue());
-    println!("{}", "║              🚀 PAYGRESS BOOTSTRAP                         ║".blue());
-    println!("{}", "║     One-Click Proxmox + Provider Setup                     ║".blue());
-    println!("{}", "╚════════════════════════════════════════════════════════════╝".blue());
+    println!(
+        "{}",
+        "╔════════════════════════════════════════════════════════════╗".blue()
+    );
+    println!(
+        "{}",
+        "║              🚀 PAYGRESS BOOTSTRAP                         ║".blue()
+    );
+    println!(
+        "{}",
+        "║     One-Click Proxmox + Provider Setup                     ║".blue()
+    );
+    println!(
+        "{}",
+        "╚════════════════════════════════════════════════════════════╝".blue()
+    );
     println!();
 
     if args.dry_run {
-        println!("{}", "🔍 DRY RUN MODE - Commands will be shown but not executed".yellow());
+        println!(
+            "{}",
+            "🔍 DRY RUN MODE - Commands will be shown but not executed".yellow()
+        );
         println!();
     }
 
     let target = format!("{}@{}", args.user, args.host);
     let is_root = args.user == "root";
     let sudo = if is_root { "" } else { "sudo " };
-    
+
     println!("Target: {}", target.cyan());
     println!("Name:   {}", args.name.yellow());
     if let Some(ref loc) = args.location {
@@ -94,8 +108,6 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     // Step 1: Test SSH connection
     println!("{}", "Step 1: Testing SSH Connection".blue().bold());
     println!("{}", "─".repeat(50));
-    
-
 
     if args.dry_run {
         println!("  Would connect to {}", args.host.cyan());
@@ -118,42 +130,62 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     // Step 1.5: Grant passwordless sudo for the rest of this bootstrap session
     // (prompts once here so every subsequent SSH call is non-interactive)
     if !is_root && !args.dry_run {
-        println!("{}", "Configuring passwordless sudo for bootstrap session...".yellow());
+        println!(
+            "{}",
+            "Configuring passwordless sudo for bootstrap session...".yellow()
+        );
         let grant_cmd = format!(
             "echo '{} ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/paygress-bootstrap > /dev/null && echo 'GRANTED'",
             args.user
         );
         if !run_ssh_command(&args, &grant_cmd)? {
-            return Err(anyhow::anyhow!("Failed to configure passwordless sudo. Check that your user has sudo privileges."));
+            return Err(anyhow::anyhow!(
+                "Failed to configure passwordless sudo. Check that your user has sudo privileges."
+            ));
         }
-        println!("  {} sudo escalation configured (will be removed at end)", "✓".green());
+        println!(
+            "  {} sudo escalation configured (will be removed at end)",
+            "✓".green()
+        );
         println!();
     }
 
     // Step 2: Check OS & Install Backend
-    println!("{}", "Step 2: Checking OS & Installing Backend".blue().bold());
+    println!(
+        "{}",
+        "Step 2: Checking OS & Installing Backend".blue().bold()
+    );
     println!("{}", "─".repeat(50));
-    
+
     let os_id = if args.dry_run {
         println!("  Would detect OS (assuming debian for dry-run)");
         "debian".to_string()
     } else {
-        let output = run_ssh_command_output(&args, "cat /etc/os-release | grep ^ID= | cut -d= -f2 | tr -d '\"'")?;
+        let output = run_ssh_command_output(
+            &args,
+            "cat /etc/os-release | grep ^ID= | cut -d= -f2 | tr -d '\"'",
+        )?;
         output.trim().to_string()
     };
-    
+
     println!("  Detected OS: {}", os_id.cyan());
-    
+
     let use_lxd = os_id == "ubuntu";
-    
+
     if use_lxd {
-        println!("{}", "  -> Installing LXD backend (Ubuntu detected)".green());
-        
+        println!(
+            "{}",
+            "  -> Installing LXD backend (Ubuntu detected)".green()
+        );
+
         if args.dry_run {
             println!("  Would run: snap install lxd && lxd init --auto");
         } else {
             // Check if LXD is installed
-            let check = run_ssh_command_output(&args, "which lxd >/dev/null 2>&1 && echo 'installed' || echo 'not_installed'")?;
+            let check = run_ssh_command_output(
+                &args,
+                "which lxd >/dev/null 2>&1 && echo 'installed' || echo 'not_installed'",
+            )?;
             if check.trim() == "installed" {
                 println!("  LXD is already installed.");
             } else {
@@ -165,7 +197,10 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
 
             // Ensure default storage pool exists (lxd init --auto may not create one,
             // or LXD may have been pre-installed without a pool)
-            let pool_check = run_ssh_command_output(&args, &format!("{}lxc storage list --format csv 2>/dev/null | wc -l", sudo))?;
+            let pool_check = run_ssh_command_output(
+                &args,
+                &format!("{}lxc storage list --format csv 2>/dev/null | wc -l", sudo),
+            )?;
             if pool_check.trim() == "0" {
                 println!("  Creating default storage pool...");
                 let create_pool = format!("{}lxc storage create default dir", sudo);
@@ -176,7 +211,13 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             }
 
             // Ensure default network bridge exists
-            let net_check = run_ssh_command_output(&args, &format!("{}lxc network list --format csv 2>/dev/null | grep -c lxdbr0 || true", sudo))?;
+            let net_check = run_ssh_command_output(
+                &args,
+                &format!(
+                    "{}lxc network list --format csv 2>/dev/null | grep -c lxdbr0 || true",
+                    sudo
+                ),
+            )?;
             if net_check.trim() == "0" {
                 println!("  Creating default network bridge (lxdbr0)...");
                 let create_net = format!("{}lxc network create lxdbr0", sudo);
@@ -188,12 +229,19 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
 
             // Ensure default profile has root disk and network devices
             // (pool/bridge may exist but profile may have empty devices: {})
-            let profile_devices = run_ssh_command_output(&args, &format!(
-                "{}lxc profile show default 2>/dev/null | grep -c 'root:' || true", sudo
-            ))?;
+            let profile_devices = run_ssh_command_output(
+                &args,
+                &format!(
+                    "{}lxc profile show default 2>/dev/null | grep -c 'root:' || true",
+                    sudo
+                ),
+            )?;
             if profile_devices.trim() == "0" {
                 println!("  Configuring default profile with storage and network...");
-                let add_root = format!("{}lxc profile device add default root disk path=/ pool=default", sudo);
+                let add_root = format!(
+                    "{}lxc profile device add default root disk path=/ pool=default",
+                    sudo
+                );
                 run_ssh_command(&args, &add_root)?;
                 let add_net = format!("{}lxc network attach-profile lxdbr0 default eth0", sudo);
                 run_ssh_command(&args, &add_net)?;
@@ -204,22 +252,33 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         }
     } else if !args.skip_proxmox {
         // Proxmox (Debian) path
-        println!("{}", "  -> Installing Proxmox backend (Debian assumed)".green());
-        
+        println!(
+            "{}",
+            "  -> Installing Proxmox backend (Debian assumed)".green()
+        );
+
         if os_id != "debian" && !args.dry_run {
-             println!("{}", format!("⚠️  Warning: OS is not Debian (detected: {}). Proxmox install may fail.", os_id).yellow());
+            println!(
+                "{}",
+                format!(
+                    "⚠️  Warning: OS is not Debian (detected: {}). Proxmox install may fail.",
+                    os_id
+                )
+                .yellow()
+            );
         }
 
-        let proxmox_check = "which pvesh >/dev/null 2>&1 && echo 'installed' || echo 'not_installed'";
-        
+        let proxmox_check =
+            "which pvesh >/dev/null 2>&1 && echo 'installed' || echo 'not_installed'";
+
         if args.dry_run {
             println!("  Would check: {}", proxmox_check.cyan());
         } else {
             print!("  Checking for existing Proxmox... ");
             std::io::stdout().flush()?;
-            
+
             let output = run_ssh_command_output(&args, proxmox_check)?;
-            
+
             if output.trim() == "installed" {
                 println!("{}", "Already installed".green());
             } else {
@@ -228,7 +287,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 println!("  {} Installing Proxmox VE...", "⚙".yellow());
                 println!("  {} This may take 10-15 minutes", "⏳".to_string());
                 println!();
-                
+
                 // Run Proxmox installation script
                 let install_script = get_proxmox_install_script();
                 // If not root, run with sudo bash
@@ -237,9 +296,9 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 } else {
                     format!("sudo bash -c '{}'", install_script.replace("'", "'\\''"))
                 };
-                
+
                 run_ssh_command(&args, &cmd)?;
-                
+
                 println!("  {} Proxmox VE installed!", "✓".green());
             }
         }
@@ -251,15 +310,13 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     // Step 3: Create API Token
     println!("{}", "Step 3: Creating Proxmox API Token".blue().bold());
     println!("{}", "─".repeat(50));
-    
+
     let token_name = "paygress";
     let create_token_cmd = format!(
         "pveum user token add root@pam {} --privsep=0 2>/dev/null || pveum user token list root@pam 2>/dev/null | grep {}",
         token_name, token_name
     );
-    
 
-    
     // Only check for token if we are using Proxmox (skipping for LXD)
     if !use_lxd {
         if args.dry_run {
@@ -267,12 +324,15 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         } else {
             print!("  Creating API token... ");
             std::io::stdout().flush()?;
-            
-            let token_output = run_ssh_command_output(&args, &format!(
-                "{}pveum user token add root@pam {} --privsep=0 2>&1 || echo 'exists'",
-                sudo, token_name
-            ))?;
-            
+
+            let token_output = run_ssh_command_output(
+                &args,
+                &format!(
+                    "{}pveum user token add root@pam {} --privsep=0 2>&1 || echo 'exists'",
+                    sudo, token_name
+                ),
+            )?;
+
             if token_output.contains("exists") || token_output.contains("already exists") {
                 println!("{}", "Already exists".green());
             } else {
@@ -283,7 +343,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             }
         }
     } else {
-         println!("  Skipping Proxmox API token creation (LXD mode)");
+        println!("  Skipping Proxmox API token creation (LXD mode)");
     }
     println!();
 
@@ -311,9 +371,12 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         // scp via the ControlMaster socket so no re-authentication
         let cp = control_path(&args.host, args.port);
         let mut scp_args = vec![
-            "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
-            "-o".to_string(), format!("ControlPath={}", cp),
-            "-P".to_string(), args.port.to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=no".to_string(),
+            "-o".to_string(),
+            format!("ControlPath={}", cp),
+            "-P".to_string(),
+            args.port.to_string(),
         ];
         if let Some(ref key) = args.key {
             scp_args.push("-i".to_string());
@@ -327,21 +390,33 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             .status()
             .context("Failed to run scp")?;
         if !scp_status.success() {
-            return Err(anyhow::anyhow!("scp failed — check SSH credentials and path"));
+            return Err(anyhow::anyhow!(
+                "scp failed — check SSH credentials and path"
+            ));
         }
 
         // Stop the service first — can't overwrite a running binary ("Text file busy")
-        let _ = run_ssh_command(&args, &format!("{}systemctl stop paygress-provider 2>/dev/null || true", sudo));
+        let _ = run_ssh_command(
+            &args,
+            &format!(
+                "{}systemctl stop paygress-provider 2>/dev/null || true",
+                sudo
+            ),
+        );
 
         // Move into place
-        let install_remote = format!("{}install -m 755 /tmp/paygress-cli /usr/local/bin/paygress-cli", sudo);
+        let install_remote = format!(
+            "{}install -m 755 /tmp/paygress-cli /usr/local/bin/paygress-cli",
+            sudo
+        );
         if !run_ssh_command(&args, &install_remote)? {
             return Err(anyhow::anyhow!("Failed to install binary on remote"));
         }
         println!("{}", "OK".green());
     } else {
         // --- crates.io mode: cargo install on the remote ---
-        let install_cmd = format!(r#"
+        let install_cmd = format!(
+            r#"
             set -e
             if ! command -v cargo &> /dev/null; then
                 if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
@@ -360,7 +435,9 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             # Stop the running service before overwriting the binary
             {0}systemctl stop paygress-provider 2>/dev/null || true
             {0}cp "$HOME/.cargo/bin/paygress-cli" /usr/local/bin/paygress-cli
-        "#, sudo);
+        "#,
+            sudo
+        );
 
         print!("  Installing paygress-cli from crates.io (this may take a few minutes)... ");
         std::io::stdout().flush()?;
@@ -385,7 +462,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     // Step 5: Generate Nostr Key
     println!("{}", "Step 5: Configuring Nostr".blue().bold());
     println!("{}", "─".repeat(50));
-    
+
     let nostr_key = match args.nostr_key {
         Some(ref key) => {
             println!("  Using provided Nostr key");
@@ -394,15 +471,18 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         None => {
             print!("  Generating Nostr keypair... ");
             std::io::stdout().flush()?;
-            
+
             let keys = nostr_sdk::Keys::generate();
-            let nsec = keys.secret_key()
+            let nsec = keys
+                .secret_key()
                 .map_err(|e| anyhow::anyhow!("Failed to get secret key: {}", e))?
                 .to_bech32()
                 .map_err(|e| anyhow::anyhow!("Failed to encode key: {}", e))?;
-            let npub = keys.public_key().to_bech32()
+            let npub = keys
+                .public_key()
+                .to_bech32()
                 .map_err(|e| anyhow::anyhow!("Failed to encode public key: {}", e))?;
-            
+
             println!("{}", "Done".green());
             println!("  NPUB: {}", npub.cyan());
             nsec
@@ -411,16 +491,24 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     println!();
 
     // Step 6: Create Configuration
-    println!("{}", "Step 6: Creating Provider Configuration".blue().bold());
+    println!(
+        "{}",
+        "Step 6: Creating Provider Configuration".blue().bold()
+    );
     println!("{}", "─".repeat(50));
-    
+
     // Explicitly set backend type based on OS detection, otherwise it defaults to Proxmox
     let backend_type = if use_lxd { "LXD" } else { "Proxmox" };
-    let proxmox_template = if use_lxd { "images:ubuntu/22.04" } else { "local:vztmpl/ubuntu-22.04-standard.tar.zst" };
+    let proxmox_template = if use_lxd {
+        "images:ubuntu/22.04"
+    } else {
+        "local:vztmpl/ubuntu-22.04-standard.tar.zst"
+    };
     let storage = if use_lxd { "default" } else { "local-lvm" }; // LXD default pool is usually 'default'
     let bridge = if use_lxd { "lxdbr0" } else { "vmbr0" }; // LXD default bridge is lxdbr0
-    
-    let config = format!(r#"{{
+
+    let config = format!(
+        r#"{{
   "backend_type": "{}",
   "proxmox_url": "https://127.0.0.1:8006/api2/json",
   "proxmox_token_id": "root@pam!paygress",
@@ -451,7 +539,10 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         bridge,
         nostr_key,
         args.name,
-        args.location.as_ref().map(|l| format!("\"{}\"", l)).unwrap_or("null".to_string()),
+        args.location
+            .as_ref()
+            .map(|l| format!("\"{}\"", l))
+            .unwrap_or("null".to_string()),
         args.host, // <--- Added arg
         args.mints
     );
@@ -465,20 +556,23 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 config
             )
         } else {
-             format!(
+            format!(
                 "{}mkdir -p /etc/paygress && echo '{}' | {}tee /etc/paygress/provider-config.json > /dev/null",
                 sudo, config.replace("'", "'\\''"), sudo
             )
         };
         run_ssh_command(&args, &create_config)?;
-        println!("  {} Created /etc/paygress/provider-config.json", "✓".green());
+        println!(
+            "  {} Created /etc/paygress/provider-config.json",
+            "✓".green()
+        );
     }
     println!();
 
     // Step 7: Create Systemd Service
     println!("{}", "Step 7: Setting Up Systemd Service".blue().bold());
     println!("{}", "─".repeat(50));
-    
+
     let systemd_service = r#"[Unit]
 Description=Paygress Provider Service
 After=network.target pve-cluster.service
@@ -502,7 +596,7 @@ WantedBy=multi-user.target
                 systemd_service
             )
         } else {
-             format!(
+            format!(
                 "echo '{}' | {}tee /etc/systemd/system/paygress-provider.service > /dev/null && {}systemctl daemon-reload",
                 systemd_service.replace("'", "'\\''"), sudo, sudo
             )
@@ -515,17 +609,23 @@ WantedBy=multi-user.target
     // Step 8: Start Service
     println!("{}", "Step 8: Starting Provider Service".blue().bold());
     println!("{}", "─".repeat(50));
-    
+
     if args.dry_run {
         println!("  Would run: systemctl enable --now paygress-provider");
     } else {
         if use_lxd {
-             let start_cmd = format!("{}systemctl enable paygress-provider && {}systemctl restart paygress-provider", sudo, sudo);
-             run_ssh_command(&args, &start_cmd)?;
-             println!("  {} Service started successfully!", "✓".green());
+            let start_cmd = format!(
+                "{}systemctl enable paygress-provider && {}systemctl restart paygress-provider",
+                sudo, sudo
+            );
+            run_ssh_command(&args, &start_cmd)?;
+            println!("  {} Service started successfully!", "✓".green());
         } else {
             // Don't actually start yet since config needs token
-            println!("  {} Service configured (not started - needs API token)", "✓".green());
+            println!(
+                "  {} Service configured (not started - needs API token)",
+                "✓".green()
+            );
             println!();
             println!("  To complete setup, SSH into the server and:");
             println!("    1. Get your API token: pveum user token list root@pam");
@@ -542,7 +642,7 @@ WantedBy=multi-user.target
     println!();
     println!("  Provider Name: {}", args.name.yellow());
     println!("  Server:        {}", args.host.cyan());
-    
+
     if !use_lxd {
         println!("  Proxmox UI:    https://{}:8006", args.host);
         println!();
@@ -554,7 +654,7 @@ WantedBy=multi-user.target
         println!("  Backend:       LXD (Native)");
         println!("  Status:        Running 🟢");
     }
-    
+
     println!();
     println!("  Users can discover you with:");
     println!("    {} market list", "paygress-cli".cyan());
@@ -581,11 +681,16 @@ fn control_path(host: &str, port: u16) -> String {
 fn base_ssh_args(args: &BootstrapArgs) -> Vec<String> {
     let cp = control_path(&args.host, args.port);
     let mut v = vec![
-        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
-        "-o".to_string(), "ControlMaster=auto".to_string(),
-        "-o".to_string(), format!("ControlPath={}", cp),
-        "-o".to_string(), "ControlPersist=10m".to_string(),
-        "-p".to_string(), args.port.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={}", cp),
+        "-o".to_string(),
+        "ControlPersist=10m".to_string(),
+        "-p".to_string(),
+        args.port.to_string(),
     ];
     if let Some(ref key) = args.key {
         v.push("-i".to_string());
@@ -603,7 +708,8 @@ fn open_ssh_master(args: &BootstrapArgs) -> Result<()> {
     }
     let mut ssh_args = base_ssh_args(args);
     ssh_args.extend([
-        "-o".to_string(), "ControlMaster=yes".to_string(),
+        "-o".to_string(),
+        "ControlMaster=yes".to_string(),
         "-N".to_string(), // no command — just keep the connection open
         "-f".to_string(), // background immediately after auth
         format!("{}@{}", args.user, args.host),
@@ -620,8 +726,13 @@ fn open_ssh_master(args: &BootstrapArgs) -> Result<()> {
     let status = Command::new(&program)
         .args(&final_args)
         .status()
-        .context(format!("Failed to open SSH master connection. {}", 
-            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        .context(format!(
+            "Failed to open SSH master connection. {}",
+            if program == "sshpass" {
+                "Is sshpass installed? (apt-get install sshpass / brew install sshpass)"
+            } else {
+                ""
+            }
         ))?;
     if !status.success() {
         return Err(anyhow::anyhow!("SSH master connection failed"));
@@ -634,8 +745,10 @@ fn close_ssh_master(args: &BootstrapArgs) {
     let cp = control_path(&args.host, args.port);
     let _ = Command::new("ssh")
         .args([
-            "-o", &format!("ControlPath={}", cp),
-            "-O", "exit",
+            "-o",
+            &format!("ControlPath={}", cp),
+            "-O",
+            "exit",
             &format!("{}@{}", args.user, args.host),
         ])
         .output();
@@ -661,8 +774,14 @@ fn run_ssh_command(args: &BootstrapArgs, cmd: &str) -> Result<bool> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context(format!("Failed to execute {} command. {}", program,
-            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        .context(format!(
+            "Failed to execute {} command. {}",
+            program,
+            if program == "sshpass" {
+                "Is sshpass installed? (apt-get install sshpass / brew install sshpass)"
+            } else {
+                ""
+            }
         ))?;
 
     Ok(status.success())
@@ -685,8 +804,14 @@ fn run_ssh_command_output(args: &BootstrapArgs, cmd: &str) -> Result<String> {
     let output = Command::new(&program)
         .args(&final_args)
         .output()
-        .context(format!("Failed to execute {} command. {}", program,
-            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        .context(format!(
+            "Failed to execute {} command. {}",
+            program,
+            if program == "sshpass" {
+                "Is sshpass installed? (apt-get install sshpass / brew install sshpass)"
+            } else {
+                ""
+            }
         ))?;
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

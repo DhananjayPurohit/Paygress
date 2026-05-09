@@ -9,7 +9,7 @@ use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use super::identity::{parse_relays, get_or_create_identity};
+use super::identity::{get_or_create_identity, parse_relays};
 use crate::api::{PaygressClient, TopupRequest};
 use paygress::discovery::DiscoveryClient;
 
@@ -46,8 +46,9 @@ pub async fn execute(args: TopupArgs, verbose: bool) -> Result<()> {
         return execute_nostr_topup(provider, args, verbose).await;
     }
 
-    let server = args.server.clone()
-        .ok_or_else(|| anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required"))?;
+    let server = args.server.clone().ok_or_else(|| {
+        anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required")
+    })?;
 
     execute_http_topup(&server, args, verbose).await
 }
@@ -63,7 +64,7 @@ async fn execute_http_topup(server: &str, args: TopupArgs, verbose: bool) -> Res
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     spinner.set_message("Processing top-up payment...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -97,7 +98,9 @@ async fn execute_http_topup(server: &str, args: TopupArgs, verbose: bool) -> Res
             println!("  {} {}", "Message:".bold(), msg);
         }
     } else {
-        let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+        let error_msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
         return Err(anyhow::anyhow!("Failed to top up pod: {}", error_msg));
     }
 
@@ -118,27 +121,33 @@ async fn execute_nostr_topup(provider_npub: String, args: TopupArgs, _verbose: b
     println!("  Provider: {}", provider_npub);
     println!();
 
-    // Build topup request (same structure as spawn but with just token + pod_id)
-    let request = serde_json::json!({
-        "type": "topup",
-        "pod_id": args.pod_id,
-        "cashu_token": args.token,
-    });
+    // Build topup request as the structured EncryptedTopUpPodRequest
+    // payload — provider.rs uses #[serde(untagged)] PrivateRequest, so
+    // the field set must match the TopUp variant exactly. Sending a
+    // free-form JSON would silently misroute (the provider would
+    // either fail to parse or match the wrong variant).
+    let request = paygress::nostr::EncryptedTopUpPodRequest {
+        pod_npub: args.pod_id.clone(),
+        cashu_token: args.token,
+    };
 
     print!("  Sending topup request... ");
 
     let request_json = serde_json::to_string(&request)?;
-    client.nostr().send_encrypted_private_message(
-        &provider_npub,
-        request_json,
-        "nip04",
-    ).await?;
+    client
+        .nostr()
+        .send_encrypted_private_message(&provider_npub, request_json, "nip04")
+        .await?;
 
     println!("{}", "SENT".green());
     println!();
     println!("  Waiting for provider response (timeout: 60s)...");
 
-    match client.nostr().wait_for_decrypted_message(&provider_npub, 60).await {
+    match client
+        .nostr()
+        .wait_for_decrypted_message(&provider_npub, 60)
+        .await
+    {
         Ok(response) => {
             println!();
 
@@ -164,7 +173,10 @@ async fn execute_nostr_topup(provider_npub: String, args: TopupArgs, _verbose: b
             println!();
             println!("  {} {}", "Warning:".yellow(), e.to_string().yellow());
             println!("The topup request was sent but the provider didn't respond in time.");
-            println!("Check status with: paygress-cli status --pod-id {} --provider {}", args.pod_id, provider_npub);
+            println!(
+                "Check status with: paygress-cli status --pod-id {} --provider {}",
+                args.pod_id, provider_npub
+            );
         }
     }
 

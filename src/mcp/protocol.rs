@@ -1,15 +1,15 @@
 // MCP Protocol Implementation
-// 
+//
 // This module contains the data structures and protocol handlers
 // for the Model Context Protocol (MCP) server implementation.
 
-use serde_json::Value;
 use crate::mcp::http_client::{PaywalledHttpClient, SpawnPodRequest};
+use serde_json::Value;
 
 /// Handle MCP initialization request
 pub fn handle_initialize(request: &Value) -> Value {
     use serde_json::json;
-    
+
     json!({
         "jsonrpc": "2.0",
         "id": request["id"],
@@ -34,7 +34,7 @@ pub fn handle_initialize(request: &Value) -> Value {
 /// Handle MCP tools/list request
 pub fn handle_tools_list(request: &Value) -> Value {
     use serde_json::json;
-    
+
     json!({
         "jsonrpc": "2.0",
         "id": request["id"],
@@ -92,8 +92,8 @@ pub fn handle_tools_list(request: &Value) -> Value {
 /// Handle MCP tools/call request using HTTP client (with L402 paywall support)
 pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: &Value) -> Value {
     use serde_json::json;
-    use tracing::{info, error};
-    
+    use tracing::{error, info};
+
     let params = &request["params"];
     let tool_name = params["name"].as_str().unwrap_or("");
     let arguments = &params["arguments"];
@@ -189,9 +189,10 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
             match http_client.topup_pod(pod_npub, cashu_token).await {
                 Ok(response) => {
                     if response["success"].as_bool().unwrap_or(false) {
-                        let extended_duration = response["extended_duration_seconds"].as_u64().unwrap_or(0);
+                        let extended_duration =
+                            response["extended_duration_seconds"].as_u64().unwrap_or(0);
                         let new_expires_at = response["new_expires_at"].as_str().unwrap_or("N/A");
-                        
+
                         // Format duration
                         let hours = extended_duration / 3600;
                         let minutes = (extended_duration % 3600) / 60;
@@ -253,14 +254,15 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
             match http_client.get_offers().await {
                 Ok(response) => {
                     let min_duration = response["minimum_duration_seconds"].as_u64().unwrap_or(0);
-                    let whitelisted_mints = response["whitelisted_mints"].as_array()
+                    let whitelisted_mints = response["whitelisted_mints"]
+                        .as_array()
                         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                         .unwrap_or_else(|| vec![]);
-                    
+
                     let empty_vec = vec![];
                     let pod_specs = response["pod_specs"].as_array().unwrap_or(&empty_vec);
                     let mut specs_text = String::new();
-                    
+
                     for (i, spec) in pod_specs.iter().enumerate() {
                         let id = spec["id"].as_str().unwrap_or("unknown");
                         let name = spec["name"].as_str().unwrap_or("Unknown");
@@ -268,17 +270,17 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         let memory = spec["memory_mb"].as_u64().unwrap_or(0);
                         let rate = spec["rate_msats_per_sec"].as_u64().unwrap_or(0);
                         let description = spec["description"].as_str().unwrap_or("");
-                        
+
                         // Calculate example pricing
                         let cost_1_min = rate * 60;
                         let cost_1_hour = rate * 3600;
-                        
+
                         specs_text.push_str(&format!(
                             "\n{}. **{}** (`{}`)\n   {}\n   • {} CPU • {} MB RAM\n   • {} msats/sec ({}k msats/min, {}k msats/hour)\n",
                             i + 1, name, id, description, cpu, memory, rate, cost_1_min/1000, cost_1_hour/1000
                         ));
                     }
-                    
+
                     let mut mints_text = String::new();
                     for mint in whitelisted_mints {
                         mints_text.push_str(&format!("   • {}\n", mint));
@@ -298,7 +300,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                                     ───────────────────────────────────────────\n\n\
                                     🏦 **Accepted Mints:**\n\
                                     {}\n\
-                                    💡 Use these VM specs when spawning a pod for optimal performance!", 
+                                    💡 Use these VM specs when spawning a pod for optimal performance!",
                                     specs_text, min_duration, mints_text
                                 )
                             }
@@ -328,12 +330,13 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                     if response["found"].as_bool().unwrap_or(false) {
                         let pod_npub = response["pod_npub"].as_str().unwrap_or("N/A");
                         let status = response["status"].as_str().unwrap_or("unknown");
-                        let time_remaining = response["time_remaining_seconds"].as_i64().unwrap_or(0);
+                        let time_remaining =
+                            response["time_remaining_seconds"].as_i64().unwrap_or(0);
                         let expires_at = response["expires_at"].as_str().unwrap_or("N/A");
                         let pod_spec_name = response["pod_spec_name"].as_str().unwrap_or("N/A");
                         let cpu = response["cpu_millicores"].as_u64().unwrap_or(0);
                         let memory = response["memory_mb"].as_u64().unwrap_or(0);
-                        
+
                         // Format time remaining
                         let time_str = if time_remaining > 0 {
                             let hours = time_remaining / 3600;
@@ -349,7 +352,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         } else {
                             "Expired ⏰".to_string()
                         };
-                        
+
                         let status_icon = if time_remaining > 0 { "✅" } else { "⏰" };
 
                         json!({
@@ -365,9 +368,9 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                                         • Remaining: {}\n\
                                         • Expires: {}\n\n\
                                         Use topup_pod to extend the VM lifetime before it expires.",
-                                        status_icon, 
+                                        status_icon,
                                         status.to_uppercase(),
-                                        pod_npub, 
+                                        pod_npub,
                                         pod_spec_name, cpu, memory,
                                         time_str,
                                         expires_at

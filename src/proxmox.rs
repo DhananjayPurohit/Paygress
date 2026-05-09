@@ -3,9 +3,9 @@
 // Provides interface to Proxmox REST API for managing LXC containers and VMs.
 
 use anyhow::{Context, Result};
-use reqwest::{Client, header};
+use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// Proxmox API client for container and VM management
 pub struct ProxmoxClient {
@@ -47,8 +47,8 @@ pub struct VmConfig {
     pub memory: u32,
     pub cores: u32,
     pub sockets: u32,
-    pub ide2: String,      // ISO image
-    pub scsi0: String,     // Disk
+    pub ide2: String,  // ISO image
+    pub scsi0: String, // Disk
     pub net0: String,
     pub ostype: String,
     #[serde(default = "default_true")]
@@ -99,7 +99,7 @@ struct ProxmoxResponse<T> {
 /// Task response from Proxmox (for async operations)
 #[derive(Debug, Deserialize)]
 struct TaskResponse {
-    data: String,  // UPID (task ID)
+    data: String, // UPID (task ID)
 }
 
 impl ProxmoxClient {
@@ -113,7 +113,7 @@ impl ProxmoxClient {
     pub fn new(api_url: &str, token_id: &str, token_secret: &str, node: &str) -> Result<Self> {
         // Build client with self-signed cert support
         let client = Client::builder()
-            .danger_accept_invalid_certs(true)  // Proxmox often uses self-signed certs
+            .danger_accept_invalid_certs(true) // Proxmox often uses self-signed certs
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -137,10 +137,14 @@ impl ProxmoxClient {
     /// Create an LXC container
     pub async fn create_lxc(&self, config: &LxcConfig) -> Result<String> {
         let url = format!("{}/lxc", self.node_url());
-        
-        info!("Creating LXC container {} on node {}", config.vmid, self.node);
 
-        let response = self.client
+        info!(
+            "Creating LXC container {} on node {}",
+            config.vmid, self.node
+        );
+
+        let response = self
+            .client
             .post(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .form(config)
@@ -155,7 +159,9 @@ impl ProxmoxClient {
             anyhow::bail!("Proxmox API error: {} - {}", status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse create LXC response")?;
 
         info!("LXC creation task started: {}", task.data);
@@ -165,10 +171,11 @@ impl ProxmoxClient {
     /// Start an LXC container
     pub async fn start_lxc(&self, vmid: u32) -> Result<String> {
         let url = format!("{}/lxc/{}/status/start", self.node_url(), vmid);
-        
+
         info!("Starting LXC container {}", vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -181,7 +188,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to start LXC {}: {} - {}", vmid, status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse start LXC response")?;
 
         Ok(task.data)
@@ -190,10 +199,11 @@ impl ProxmoxClient {
     /// Stop an LXC container
     pub async fn stop_lxc(&self, vmid: u32) -> Result<String> {
         let url = format!("{}/lxc/{}/status/stop", self.node_url(), vmid);
-        
+
         info!("Stopping LXC container {}", vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -206,7 +216,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to stop LXC {}: {} - {}", vmid, status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse stop LXC response")?;
 
         Ok(task.data)
@@ -215,10 +227,11 @@ impl ProxmoxClient {
     /// Delete an LXC container
     pub async fn delete_lxc(&self, vmid: u32) -> Result<String> {
         let url = format!("{}/lxc/{}", self.node_url(), vmid);
-        
+
         info!("Deleting LXC container {}", vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .delete(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -231,7 +244,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to delete LXC {}: {} - {}", vmid, status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse delete LXC response")?;
 
         Ok(task.data)
@@ -241,7 +256,8 @@ impl ProxmoxClient {
     pub async fn get_lxc_status(&self, vmid: u32) -> Result<WorkloadStatus> {
         let url = format!("{}/lxc/{}/status/current", self.node_url(), vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -254,7 +270,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to get LXC {} status: {} - {}", vmid, status, body);
         }
 
-        let resp: ProxmoxResponse<WorkloadStatus> = response.json().await
+        let resp: ProxmoxResponse<WorkloadStatus> = response
+            .json()
+            .await
             .context("Failed to parse LXC status response")?;
 
         resp.data.context("No status data returned")
@@ -264,7 +282,8 @@ impl ProxmoxClient {
     pub async fn list_lxc(&self) -> Result<Vec<WorkloadStatus>> {
         let url = format!("{}/lxc", self.node_url());
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -277,7 +296,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to list LXC containers: {} - {}", status, body);
         }
 
-        let resp: ProxmoxResponse<Vec<WorkloadStatus>> = response.json().await
+        let resp: ProxmoxResponse<Vec<WorkloadStatus>> = response
+            .json()
+            .await
             .context("Failed to parse LXC list response")?;
 
         Ok(resp.data.unwrap_or_default())
@@ -288,10 +309,11 @@ impl ProxmoxClient {
     /// Create a VM
     pub async fn create_vm(&self, config: &VmConfig) -> Result<String> {
         let url = format!("{}/qemu", self.node_url());
-        
+
         info!("Creating VM {} on node {}", config.vmid, self.node);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .form(config)
@@ -306,7 +328,9 @@ impl ProxmoxClient {
             anyhow::bail!("Proxmox API error: {} - {}", status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse create VM response")?;
 
         info!("VM creation task started: {}", task.data);
@@ -316,10 +340,11 @@ impl ProxmoxClient {
     /// Start a VM
     pub async fn start_vm(&self, vmid: u32) -> Result<String> {
         let url = format!("{}/qemu/{}/status/start", self.node_url(), vmid);
-        
+
         info!("Starting VM {}", vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -332,7 +357,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to start VM {}: {} - {}", vmid, status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse start VM response")?;
 
         Ok(task.data)
@@ -341,10 +368,11 @@ impl ProxmoxClient {
     /// Stop a VM
     pub async fn stop_vm(&self, vmid: u32) -> Result<String> {
         let url = format!("{}/qemu/{}/status/stop", self.node_url(), vmid);
-        
+
         info!("Stopping VM {}", vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -357,7 +385,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to stop VM {}: {} - {}", vmid, status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse stop VM response")?;
 
         Ok(task.data)
@@ -366,10 +396,11 @@ impl ProxmoxClient {
     /// Delete a VM
     pub async fn delete_vm(&self, vmid: u32) -> Result<String> {
         let url = format!("{}/qemu/{}", self.node_url(), vmid);
-        
+
         info!("Deleting VM {}", vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .delete(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -382,7 +413,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to delete VM {}: {} - {}", vmid, status, body);
         }
 
-        let task: TaskResponse = response.json().await
+        let task: TaskResponse = response
+            .json()
+            .await
             .context("Failed to parse delete VM response")?;
 
         Ok(task.data)
@@ -392,7 +425,8 @@ impl ProxmoxClient {
     pub async fn get_vm_status(&self, vmid: u32) -> Result<WorkloadStatus> {
         let url = format!("{}/qemu/{}/status/current", self.node_url(), vmid);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -405,7 +439,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to get VM {} status: {} - {}", vmid, status, body);
         }
 
-        let resp: ProxmoxResponse<WorkloadStatus> = response.json().await
+        let resp: ProxmoxResponse<WorkloadStatus> = response
+            .json()
+            .await
             .context("Failed to parse VM status response")?;
 
         resp.data.context("No status data returned")
@@ -415,7 +451,8 @@ impl ProxmoxClient {
     pub async fn list_vm(&self) -> Result<Vec<WorkloadStatus>> {
         let url = format!("{}/qemu", self.node_url());
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -428,7 +465,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to list VMs: {} - {}", status, body);
         }
 
-        let resp: ProxmoxResponse<Vec<WorkloadStatus>> = response.json().await
+        let resp: ProxmoxResponse<Vec<WorkloadStatus>> = response
+            .json()
+            .await
             .context("Failed to parse VM list response")?;
 
         Ok(resp.data.unwrap_or_default())
@@ -440,7 +479,8 @@ impl ProxmoxClient {
     pub async fn get_node_status(&self) -> Result<NodeStatus> {
         let url = format!("{}/status", self.node_url());
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header(header::AUTHORIZATION, &self.auth_header)
             .send()
@@ -453,7 +493,9 @@ impl ProxmoxClient {
             anyhow::bail!("Failed to get node status: {} - {}", status, body);
         }
 
-        let resp: ProxmoxResponse<NodeStatus> = response.json().await
+        let resp: ProxmoxResponse<NodeStatus> = response
+            .json()
+            .await
             .context("Failed to parse node status response")?;
 
         resp.data.context("No node status data returned")
@@ -464,7 +506,8 @@ impl ProxmoxClient {
         let lxc_list = self.list_lxc().await?;
         let vm_list = self.list_vm().await?;
 
-        let used_ids: std::collections::HashSet<u32> = lxc_list.iter()
+        let used_ids: std::collections::HashSet<u32> = lxc_list
+            .iter()
             .chain(vm_list.iter())
             .map(|w| w.vmid)
             .collect();
@@ -481,7 +524,7 @@ impl ProxmoxClient {
     /// Wait for a task to complete
     pub async fn wait_for_task(&self, upid: &str, timeout_secs: u64) -> Result<()> {
         use tokio::time::{sleep, Duration};
-        
+
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
@@ -491,8 +534,9 @@ impl ProxmoxClient {
             }
 
             let url = format!("{}/tasks/{}/status", self.node_url(), upid);
-            
-            let response = self.client
+
+            let response = self
+                .client
                 .get(&url)
                 .header(header::AUTHORIZATION, &self.auth_header)
                 .send()
@@ -507,7 +551,7 @@ impl ProxmoxClient {
                 }
 
                 let resp: ProxmoxResponse<TaskStatus> = response.json().await?;
-                
+
                 if let Some(task) = resp.data {
                     if task.status == "stopped" {
                         if let Some(exit) = task.exitstatus {
@@ -555,8 +599,8 @@ mod tests {
 
 // ==================== ComputeBackend Implementation ====================
 
-use async_trait::async_trait;
 use crate::compute::{ComputeBackend, ContainerConfig, NodeStatus as ComputeNodeStatus};
+use async_trait::async_trait;
 
 /// Wrapper around ProxmoxClient to implement ComputeBackend trait
 pub struct ProxmoxBackend {
@@ -580,14 +624,16 @@ impl ProxmoxBackend {
 #[async_trait]
 impl ComputeBackend for ProxmoxBackend {
     async fn find_available_id(&self, range_start: u32, range_end: u32) -> Result<u32> {
-        self.client.find_available_vmid(range_start, range_end).await
+        self.client
+            .find_available_vmid(range_start, range_end)
+            .await
     }
-    
+
     async fn create_container(&self, config: &ContainerConfig) -> Result<String> {
         // Use default template if config doesn't specify (config.image is usually "ubuntu:22.04" etc)
         // But Proxmox needs full template path "local:vztmpl/..."
         // For now, we ignore config.image and use self.template
-        
+
         let lxc = LxcConfig {
             vmid: config.id,
             hostname: config.name.clone(),
@@ -602,18 +648,18 @@ impl ComputeBackend for ProxmoxBackend {
             start: true,
             unprivileged: true,
         };
-        
+
         let task = self.client.create_lxc(&lxc).await?;
         self.client.wait_for_task(&task, 120).await?;
         Ok(config.id.to_string())
     }
-    
+
     async fn start_container(&self, id: u32) -> Result<()> {
         let task = self.client.start_lxc(id).await?;
         self.client.wait_for_task(&task, 60).await?;
         Ok(())
     }
-    
+
     async fn stop_container(&self, id: u32) -> Result<()> {
         let task = self.client.stop_lxc(id).await?;
         self.client.wait_for_task(&task, 60).await?;
@@ -632,13 +678,13 @@ impl ComputeBackend for ProxmoxBackend {
             cpu_usage: status.cpu,
             memory_used: status.memory.used,
             memory_total: status.memory.total,
-            disk_used: 0, 
+            disk_used: 0,
             disk_total: 0,
         })
     }
-    
+
     async fn get_container_ip(&self, _id: u32) -> Result<Option<String>> {
-         // Proxmox API connection logic to get IP is complex without guest agent
-         Ok(None)
+        // Proxmox API connection logic to get IP is complex without guest agent
+        Ok(None)
     }
 }

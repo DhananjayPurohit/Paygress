@@ -12,15 +12,18 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::nostr::{
-    NostrRelaySubscriber, RelayConfig, ProviderOfferContent, HeartbeatContent, 
-    CapacityInfo, PodSpec, EncryptedSpawnPodRequest, AccessDetailsContent, 
-    ErrorResponseContent, parse_private_message_content, PrivateRequest,
-    StatusRequestContent, StatusResponseContent,
+use crate::cashu::{
+    derive_seed_from_nostr_key, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
 };
-use crate::proxmox::{ProxmoxClient, ProxmoxBackend};
 use crate::compute::{ComputeBackend, ContainerConfig};
 use crate::lxd::LxdBackend;
+use crate::nostr::{
+    parse_private_message_content, AccessDetailsContent, CapacityInfo, EncryptedSpawnPodRequest,
+    EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent, NostrRelaySubscriber,
+    PodSpec, PrivateRequest, ProviderOfferContent, RelayConfig, StatusRequestContent,
+    StatusResponseContent, TopUpResponseContent,
+};
+use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BackendType {
@@ -34,15 +37,13 @@ impl Default for BackendType {
     }
 }
 
-
 /// Provider configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub backend_type: BackendType,
-    
-    // Proxmox / Backend settings
 
+    // Proxmox / Backend settings
     pub proxmox_url: String,
     pub proxmox_token_id: String,
     pub proxmox_token_secret: String,
@@ -52,21 +53,21 @@ pub struct ProviderConfig {
     pub proxmox_bridge: String,
     pub vmid_range_start: u32,
     pub vmid_range_end: u32,
-    
+
     // Nostr settings
     pub nostr_private_key: String,
     pub nostr_relays: Vec<String>,
-    
+
     // Provider metadata
     pub provider_name: String,
     pub provider_location: Option<String>,
     pub public_ip: String,
     pub capabilities: Vec<String>,
-    
+
     // Pricing & specs
     pub specs: Vec<PodSpec>,
     pub whitelisted_mints: Vec<String>,
-    
+
     // Operational settings
     pub heartbeat_interval_secs: u64,
     pub minimum_duration_seconds: u64,
@@ -80,6 +81,18 @@ pub struct ProviderConfig {
     pub ssh_port_start: Option<u16>,
     #[serde(default)]
     pub ssh_port_end: Option<u16>,
+
+    // Cashu wallet settings (Unit 1: real mint redemption on the
+    // Nostr-DM path). The wallet stores swapped proofs, keysets, and
+    // quotes; one redb file holds state for every mint the provider
+    // accepts. Defaults to a path next to the binary so existing
+    // operators don't need to update their config.
+    #[serde(default = "default_cashu_wallet_db_path")]
+    pub cashu_wallet_db_path: String,
+}
+
+fn default_cashu_wallet_db_path() -> String {
+    "./paygress-cashu-wallet.redb".to_string()
 }
 
 impl Default for ProviderConfig {
@@ -104,16 +117,14 @@ impl Default for ProviderConfig {
             provider_location: None,
             public_ip: "127.0.0.1".to_string(),
             capabilities: vec!["lxc".to_string()],
-            specs: vec![
-                PodSpec {
-                    id: "basic".to_string(),
-                    name: "Basic".to_string(),
-                    description: "1 vCPU, 1GB RAM".to_string(),
-                    cpu_millicores: 1000,
-                    memory_mb: 1024,
-                    rate_msats_per_sec: 50,
-                },
-            ],
+            specs: vec![PodSpec {
+                id: "basic".to_string(),
+                name: "Basic".to_string(),
+                description: "1 vCPU, 1GB RAM".to_string(),
+                cpu_millicores: 1000,
+                memory_mb: 1024,
+                rate_msats_per_sec: 50,
+            }],
             whitelisted_mints: vec!["https://mint.minibits.cash".to_string()],
             heartbeat_interval_secs: 60,
             minimum_duration_seconds: 60,
@@ -121,6 +132,7 @@ impl Default for ProviderConfig {
             tunnel_interface: None,
             ssh_port_start: None,
             ssh_port_end: None,
+            cashu_wallet_db_path: default_cashu_wallet_db_path(),
         }
     }
 }
@@ -129,7 +141,7 @@ impl Default for ProviderConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkloadInfo {
     pub vmid: u32,
-    pub workload_type: String,  // "lxc" or "vm"
+    pub workload_type: String, // "lxc" or "vm"
     pub spec_id: String,
     pub created_at: u64,
     pub expires_at: u64,
@@ -141,6 +153,7 @@ pub struct ProviderService {
     config: ProviderConfig,
     backend: Arc<dyn ComputeBackend>,
     nostr: NostrRelaySubscriber,
+    redeemer: Arc<dyn MintRedeemer>,
     active_workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: Arc<Mutex<ProviderStats>>,
 }
@@ -169,12 +182,10 @@ impl ProviderService {
                     &config.proxmox_template,
                 ))
             }
-            BackendType::LXD => {
-                Arc::new(LxdBackend::new(
-                    &config.proxmox_storage, // Reuse storage field for pool name
-                    &config.proxmox_bridge,  // Reuse bridge for network
-                ))
-            }
+            BackendType::LXD => Arc::new(LxdBackend::new(
+                &config.proxmox_storage, // Reuse storage field for pool name
+                &config.proxmox_bridge,  // Reuse bridge for network
+            )),
         };
 
         // Initialize Nostr client
@@ -184,6 +195,24 @@ impl ProviderService {
         };
         let nostr = NostrRelaySubscriber::new(relay_config).await?;
 
+        // Initialize the Cashu redeemer. Wallet identity is derived
+        // deterministically from the provider's Nostr private key so
+        // the same provider sees a consistent proof history across
+        // restarts. The redb file holds proofs, keysets, and quotes
+        // for every mint this provider accepts.
+        let wallet_db = cdk_redb::wallet::WalletRedbDatabase::new(std::path::Path::new(
+            &config.cashu_wallet_db_path,
+        ))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open cashu wallet database at {}: {}",
+                config.cashu_wallet_db_path,
+                e
+            )
+        })?;
+        let seed = derive_seed_from_nostr_key(&config.nostr_private_key);
+        let redeemer: Arc<dyn MintRedeemer> = Arc::new(CdkRedeemer::new(Arc::new(wallet_db), seed));
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -192,6 +221,7 @@ impl ProviderService {
             config,
             backend,
             nostr,
+            redeemer,
             active_workloads: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(ProviderStats {
                 total_jobs_completed: 0,
@@ -234,7 +264,7 @@ impl ProviderService {
     /// Publish provider offer to Nostr
     async fn publish_offer(&self) -> Result<()> {
         let stats = self.stats.lock().await;
-        
+
         let offer = ProviderOfferContent {
             provider_npub: self.get_npub(),
             hostname: self.config.provider_name.clone(),
@@ -245,6 +275,8 @@ impl ProviderService {
             uptime_percent: 100.0, // Will be calculated from heartbeat history
             total_jobs_completed: stats.total_jobs_completed,
             api_endpoint: None, // TODO: Add if supporting direct API
+            version: crate::nostr::SCHEMA_VERSION,
+            isolation_level: crate::nostr::IsolationLevel::SharedKernel,
         };
 
         self.nostr.publish_provider_offer(offer).await?;
@@ -254,7 +286,7 @@ impl ProviderService {
     /// Send heartbeat every N seconds
     async fn heartbeat_loop(&self) -> Result<()> {
         let interval = tokio::time::Duration::from_secs(self.config.heartbeat_interval_secs);
-        
+
         loop {
             if let Err(e) = self.send_heartbeat().await {
                 warn!("Failed to send heartbeat: {}", e);
@@ -266,13 +298,15 @@ impl ProviderService {
     /// Send a single heartbeat
     async fn send_heartbeat(&self) -> Result<()> {
         let workloads = self.active_workloads.lock().await;
-        
+
         // Get node status for capacity info
         let capacity = match self.backend.get_node_status().await {
             Ok(status) => CapacityInfo {
                 cpu_available: ((1.0 - status.cpu_usage) * 100000.0) as u64, // Convert to millicores
-                memory_mb_available: status.memory_total.saturating_sub(status.memory_used) / (1024 * 1024),
-                storage_gb_available: status.disk_total.saturating_sub(status.disk_used) / (1024 * 1024 * 1024), 
+                memory_mb_available: status.memory_total.saturating_sub(status.memory_used)
+                    / (1024 * 1024),
+                storage_gb_available: status.disk_total.saturating_sub(status.disk_used)
+                    / (1024 * 1024 * 1024),
             },
             Err(e) => {
                 warn!("Failed to get node status: {}", e);
@@ -293,6 +327,7 @@ impl ProviderService {
             timestamp: now,
             active_workloads: workloads.len() as u32,
             available_capacity: capacity,
+            version: crate::nostr::SCHEMA_VERSION,
         };
 
         self.nostr.publish_heartbeat(heartbeat).await?;
@@ -302,94 +337,113 @@ impl ProviderService {
     /// Listen for spawn requests via NIP-17
     async fn listen_for_requests(&self) -> Result<()> {
         info!("Listening for Paygress requests...");
-        
+
         // Clone what we need for the handler
         let backend = self.backend.clone();
         let config = self.config.clone();
         let nostr = self.nostr.clone();
+        let redeemer = self.redeemer.clone();
         let workloads = self.active_workloads.clone();
         let stats = self.stats.clone();
 
-        self.nostr.subscribe_to_pod_events(move |event| {
-            let backend = backend.clone();
-            let config = config.clone();
-            let nostr = nostr.clone();
-            let workloads = workloads.clone();
-            let stats = stats.clone();
-            
-            Box::pin(async move {
-                let my_pubkey = nostr.public_key().to_hex();
-                if event.pubkey == my_pubkey {
-                    return Ok(());
-                }
+        self.nostr
+            .subscribe_to_pod_events(move |event| {
+                let backend = backend.clone();
+                let config = config.clone();
+                let nostr = nostr.clone();
+                let redeemer = redeemer.clone();
+                let workloads = workloads.clone();
+                let stats = stats.clone();
 
-                debug!("Handler received event kind: {}, from: {}, message_type: {}", event.kind, event.pubkey, event.message_type);
-                
-                // Parse the request
-                let request_type = match parse_private_message_content(&event.content) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!("Failed to parse request from {}: {}", event.pubkey, e);
-                        let error = ErrorResponseContent {
-                            error_type: "invalid_request".to_string(),
-                            message: "Failed to parse request".to_string(),
-                            details: Some(e.to_string()),
-                        };
-                        let _ = nostr.send_error_response_private_message(
-                            &event.pubkey,
-                            error,
-                            &event.message_type,
-                        ).await;
+                Box::pin(async move {
+                    let my_pubkey = nostr.public_key().to_hex();
+                    if event.pubkey == my_pubkey {
                         return Ok(());
                     }
-                };
 
-                debug!("Successfully parsed request metadata");
+                    debug!(
+                        "Handler received event kind: {}, from: {}, message_type: {}",
+                        event.kind, event.pubkey, event.message_type
+                    );
 
-                // Dispatch to specific handler
-                match request_type {
-                    PrivateRequest::Spawn(spawn_req) => {
-                        if let Err(e) = handle_spawn_request(
-                            backend.as_ref(),
-                            &config,
-                            &nostr,
-                            &workloads,
-                            &stats,
-                            &event.pubkey,
-                            &event.message_type,
-                            spawn_req,
-                        ).await {
-                            error!("Failed to handle spawn request: {}", e);
+                    // Parse the request
+                    let request_type = match parse_private_message_content(&event.content) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            warn!("Failed to parse request from {}: {}", event.pubkey, e);
+                            let error = ErrorResponseContent {
+                                error_type: "invalid_request".to_string(),
+                                message: "Failed to parse request".to_string(),
+                                details: Some(e.to_string()),
+                            };
+                            let _ = nostr
+                                .send_error_response_private_message(
+                                    &event.pubkey,
+                                    error,
+                                    &event.message_type,
+                                )
+                                .await;
+                            return Ok(());
+                        }
+                    };
+
+                    debug!("Successfully parsed request metadata");
+
+                    // Dispatch to specific handler
+                    match request_type {
+                        PrivateRequest::Spawn(spawn_req) => {
+                            if let Err(e) = handle_spawn_request(
+                                backend.as_ref(),
+                                &config,
+                                &nostr,
+                                redeemer.as_ref(),
+                                &workloads,
+                                &stats,
+                                &event.pubkey,
+                                &event.message_type,
+                                spawn_req,
+                            )
+                            .await
+                            {
+                                error!("Failed to handle spawn request: {}", e);
+                            }
+                        }
+                        PrivateRequest::Status(status_req) => {
+                            if let Err(e) = handle_status_request(
+                                backend.as_ref(),
+                                &config,
+                                &nostr,
+                                &workloads,
+                                &event.pubkey,
+                                &event.message_type,
+                                status_req,
+                            )
+                            .await
+                            {
+                                error!("Failed to handle status request: {}", e);
+                            }
+                        }
+                        PrivateRequest::TopUp(topup_req) => {
+                            if let Err(e) = handle_topup_request(
+                                &config,
+                                &nostr,
+                                redeemer.as_ref(),
+                                &workloads,
+                                &event.pubkey,
+                                &event.message_type,
+                                topup_req,
+                            )
+                            .await
+                            {
+                                error!("Failed to handle topup request: {}", e);
+                            }
                         }
                     }
-                    PrivateRequest::Status(status_req) => {
-                        if let Err(e) = handle_status_request(
-                            backend.as_ref(),
-                            &config,
-                            &nostr,
-                            &workloads,
-                            &event.pubkey,
-                            &event.message_type,
-                            status_req,
-                        ).await {
-                            error!("Failed to handle status request: {}", e);
-                        }
-                    }
-                    PrivateRequest::TopUp(_) => {
-                        warn!("TopUp request received but not yet fully implemented");
-                        let _ = nostr.send_error_response(
-                            &event.pubkey,
-                            "not_implemented",
-                            "TopUp is not yet implemented on this provider",
-                            None,
-                            &event.message_type,
-                        ).await;
-                    }
-                }
 
-                Ok(())
+                    Ok(())
+                })
             })
-        }).await?;
+            .await?;
 
         Ok(())
     }
@@ -397,10 +451,10 @@ impl ProviderService {
     /// Cleanup expired workloads
     async fn cleanup_loop(&self) -> Result<()> {
         let interval = tokio::time::Duration::from_secs(30);
-        
+
         loop {
             tokio::time::sleep(interval).await;
-            
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
@@ -414,7 +468,7 @@ impl ProviderService {
 
             for vmid in expired {
                 info!("Cleaning up expired workload: {}", vmid);
-                
+
                 if let Some(_workload) = workloads.remove(&vmid) {
                     let stop_result = self.backend.stop_container(vmid).await;
                     let result = match stop_result {
@@ -438,38 +492,54 @@ impl ProviderService {
 
 // Clone impl removed as ComputeBackend is Arc'd
 
-/// Handle a spawn request
+/// Handle a spawn request.
+///
+/// Redeems the provided Cashu token at the mint via the supplied
+/// `MintRedeemer` (Unit 1 — see docs/plans/...). On any redemption
+/// failure (invalid token, non-whitelisted mint, already-spent,
+/// pending, network) we reply with a structured error and DO NOT call
+/// the backend — no container is created without a successful swap.
 async fn handle_spawn_request(
     backend: &dyn ComputeBackend,
     config: &ProviderConfig,
     nostr: &NostrRelaySubscriber,
+    redeemer: &dyn MintRedeemer,
     workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: &Arc<Mutex<ProviderStats>>,
     requester_pubkey: &str,
     message_type: &str,
     request: EncryptedSpawnPodRequest,
 ) -> Result<()> {
-    info!("Processing spawn request from {} (tier: {:?})", requester_pubkey, request.pod_spec_id);
+    info!(
+        "Processing spawn request from {} (tier: {:?})",
+        requester_pubkey, request.pod_spec_id
+    );
 
-    // 1. Extract Cashu token value
-    let payment_msats = match crate::cashu::extract_token_value(&request.cashu_token).await {
+    // 1. Redeem Cashu token at the mint (Unit 1).
+    let payment_msats = match validate_and_redeem(
+        redeemer,
+        &config.whitelisted_mints,
+        &request.cashu_token,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
-            let err_msg = format!("Invalid Cashu token: {}", e);
-            error!("{}", err_msg);
-            nostr.send_error_response(
-                requester_pubkey,
-                "invalid_token",
-                &err_msg,
-                None,
-                message_type,
-            ).await?;
+            let (error_type, err_msg) = redeem_error_to_response(&e);
+            error!("Cashu redemption failed: {}", err_msg);
+            nostr
+                .send_error_response(requester_pubkey, error_type, &err_msg, None, message_type)
+                .await?;
             return Ok(());
         }
     };
 
     // 2. Find matching spec/tier
-    let spec = match config.specs.iter().find(|s| Some(s.id.clone()) == request.pod_spec_id) {
+    let spec = match config
+        .specs
+        .iter()
+        .find(|s| Some(s.id.clone()) == request.pod_spec_id)
+    {
         Some(s) => s,
         None => {
             // Default to first spec if none specified or not found
@@ -478,13 +548,9 @@ async fn handle_spawn_request(
             } else {
                 let err_msg = "No pod specifications available on this provider";
                 error!("{}", err_msg);
-                nostr.send_error_response(
-                    requester_pubkey,
-                    "no_specs",
-                    err_msg,
-                    None,
-                    message_type,
-                ).await?;
+                nostr
+                    .send_error_response(requester_pubkey, "no_specs", err_msg, None, message_type)
+                    .await?;
                 return Ok(());
             }
         }
@@ -499,41 +565,48 @@ async fn handle_spawn_request(
             config.minimum_duration_seconds
         );
         warn!("{}", err_msg);
-        nostr.send_error_response(
-            requester_pubkey,
-            "insufficient_payment",
-            &err_msg,
-            None,
-            message_type,
-        ).await?;
+        nostr
+            .send_error_response(
+                requester_pubkey,
+                "insufficient_payment",
+                &err_msg,
+                None,
+                message_type,
+            )
+            .await?;
         return Ok(());
     }
 
-    info!("Validated payment: {} msats for {}s on tier {}", payment_msats, duration_secs, spec.name);
+    info!(
+        "Validated payment: {} msats for {}s on tier {}",
+        payment_msats, duration_secs, spec.name
+    );
 
     // 4. Find available ID
-    let id = match backend.find_available_id(
-        config.vmid_range_start,
-        config.vmid_range_end,
-    ).await {
+    let id = match backend
+        .find_available_id(config.vmid_range_start, config.vmid_range_end)
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             let err_msg = format!("Failed to find available ID: {}", e);
             error!("{}", err_msg);
-            nostr.send_error_response(
-                requester_pubkey,
-                "provisioning_error",
-                &err_msg,
-                None,
-                message_type,
-            ).await?;
+            nostr
+                .send_error_response(
+                    requester_pubkey,
+                    "provisioning_error",
+                    &err_msg,
+                    None,
+                    message_type,
+                )
+                .await?;
             return Ok(());
         }
     };
 
     // 5. Generate credentials
-    let password = crate::sidecar_service::SidecarState::generate_password();
-    
+    let password = generate_password();
+
     // Calculate host port for forwarding
     let host_port = match config.ssh_port_start {
         Some(start) => start + (id - config.vmid_range_start) as u16,
@@ -557,13 +630,15 @@ async fn handle_spawn_request(
     if let Err(e) = backend.create_container(&container_config).await {
         let err_msg = format!("Backend failed to create workload: {}", e);
         error!("{}", err_msg);
-        nostr.send_error_response(
-            requester_pubkey,
-            "backend_error",
-            &err_msg,
-            None,
-            message_type,
-        ).await?;
+        nostr
+            .send_error_response(
+                requester_pubkey,
+                "backend_error",
+                &err_msg,
+                None,
+                message_type,
+            )
+            .await?;
         return Ok(());
     }
     debug!("Successfully created container {}", id);
@@ -583,7 +658,7 @@ async fn handle_spawn_request(
     };
 
     workloads.lock().await.insert(id, workload.clone());
-    
+
     // Update stats
     {
         let mut s = stats.lock().await;
@@ -593,9 +668,10 @@ async fn handle_spawn_request(
     // 8. Get Access Details
     // Use configured public IP/host
     let host = &config.public_ip;
-    
+
     // Send access details
-    let expires_dt = chrono::DateTime::from_timestamp(workload.expires_at as i64, 0).unwrap_or_default();
+    let expires_dt =
+        chrono::DateTime::from_timestamp(workload.expires_at as i64, 0).unwrap_or_default();
     let details = AccessDetailsContent {
         pod_npub: format!("container-{}", id),
         node_port: host_port,
@@ -615,16 +691,290 @@ async fn handle_spawn_request(
     };
 
     debug!("Sending access details to {}", requester_pubkey);
-    nostr.send_access_details_private_message(
-        requester_pubkey,
-        details,
-        message_type,
-    ).await?;
+    nostr
+        .send_access_details_private_message(requester_pubkey, details, message_type)
+        .await?;
 
     debug!("Access details sent successfully");
 
     info!("Workload {} provisioned for {} seconds", id, duration_secs);
     Ok(())
+}
+
+/// Handle a TopUp request (Unit 2 of the 12-month plan).
+///
+/// Looks up the workload by its `pod_npub` (which the spawn handler
+/// returned as `container-<vmid>`), verifies the requester owns it,
+/// redeems the supplied Cashu token at the mint (Unit 1), and
+/// extends `expires_at` by `redeemed_msats / spec.rate_msats_per_sec`
+/// under the existing workloads mutex.
+///
+/// Mutex discipline: redemption (a network call to the mint) happens
+/// BEFORE we re-acquire the workloads lock, so the lock is never held
+/// across an external request.
+async fn handle_topup_request(
+    config: &ProviderConfig,
+    nostr: &NostrRelaySubscriber,
+    redeemer: &dyn MintRedeemer,
+    workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
+    requester_pubkey: &str,
+    message_type: &str,
+    request: EncryptedTopUpPodRequest,
+) -> Result<()> {
+    info!(
+        "Processing topup request from {} for {}",
+        requester_pubkey, request.pod_npub
+    );
+
+    let vmid = match parse_pod_npub(&request.pod_npub) {
+        Some(v) => v,
+        None => {
+            let err_msg = format!(
+                "Could not parse pod identifier `{}`; expected `container-<id>` or numeric id",
+                request.pod_npub
+            );
+            warn!("{}", err_msg);
+            nostr
+                .send_error_response(
+                    requester_pubkey,
+                    "invalid_pod_id",
+                    &err_msg,
+                    None,
+                    message_type,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // 1. Snapshot the workload + spec under a brief read-only lock so
+    //    we know how to bill before we redeem.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let (spec_id, current_expires_at) = {
+        let lock = workloads.lock().await;
+        match lock.get(&vmid) {
+            Some(w) if w.owner_npub == requester_pubkey => (w.spec_id.clone(), w.expires_at),
+            Some(_) => {
+                drop(lock);
+                let err_msg = "Pod not owned by requester";
+                warn!("{}: vmid={}", err_msg, vmid);
+                nostr
+                    .send_error_response(requester_pubkey, "not_owner", err_msg, None, message_type)
+                    .await?;
+                return Ok(());
+            }
+            None => {
+                drop(lock);
+                let err_msg = format!("Pod {} not found", request.pod_npub);
+                warn!("{}", err_msg);
+                nostr
+                    .send_error_response(
+                        requester_pubkey,
+                        "not_found",
+                        &err_msg,
+                        None,
+                        message_type,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    if current_expires_at <= now {
+        let err_msg = format!(
+            "Pod {} lease has already expired; spawn a new pod instead",
+            request.pod_npub
+        );
+        warn!("{}", err_msg);
+        nostr
+            .send_error_response(
+                requester_pubkey,
+                "lease_expired",
+                &err_msg,
+                None,
+                message_type,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let spec = match config.specs.iter().find(|s| s.id == spec_id) {
+        Some(s) => s.clone(),
+        None => {
+            // Spec referenced by the workload no longer exists in
+            // config — provider misconfiguration. Refuse the topup
+            // rather than silently mis-billing.
+            let err_msg = format!(
+                "Pod {} references unknown spec `{}`; provider misconfiguration",
+                request.pod_npub, spec_id
+            );
+            error!("{}", err_msg);
+            nostr
+                .send_error_response(
+                    requester_pubkey,
+                    "spec_unavailable",
+                    &err_msg,
+                    None,
+                    message_type,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // 2. Redeem the topup token (no workloads lock held).
+    let payment_msats = match validate_and_redeem(
+        redeemer,
+        &config.whitelisted_mints,
+        &request.cashu_token,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let (error_type, err_msg) = redeem_error_to_response(&e);
+            error!("Topup redemption failed: {}", err_msg);
+            nostr
+                .send_error_response(requester_pubkey, error_type, &err_msg, None, message_type)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let extension_secs = payment_msats / spec.rate_msats_per_sec;
+    if extension_secs == 0 {
+        let err_msg = format!(
+            "Insufficient topup: {} msats buys 0 seconds at {} msats/sec",
+            payment_msats, spec.rate_msats_per_sec
+        );
+        warn!("{}", err_msg);
+        nostr
+            .send_error_response(
+                requester_pubkey,
+                "insufficient_payment",
+                &err_msg,
+                None,
+                message_type,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    // 3. Apply the extension under the workloads lock. We re-check
+    //    ownership and existence after re-locking to defend against
+    //    cleanup having run between our snapshot and now.
+    let new_expires_at = {
+        let mut lock = workloads.lock().await;
+        match lock.get_mut(&vmid) {
+            Some(w) if w.owner_npub == requester_pubkey => {
+                w.expires_at = w.expires_at.saturating_add(extension_secs);
+                w.expires_at
+            }
+            _ => {
+                // Vanished or ownership changed between snapshots.
+                // The token is already spent at the mint — this is a
+                // race the consumer should retry by spawning a new
+                // pod. We surface a distinct error so the CLI can
+                // explain it.
+                drop(lock);
+                let err_msg =
+                    "Pod was cleaned up before topup could be applied; token has been spent";
+                error!("{}: vmid={}", err_msg, vmid);
+                nostr
+                    .send_error_response(requester_pubkey, "race_lost", err_msg, None, message_type)
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let new_expires_dt =
+        chrono::DateTime::from_timestamp(new_expires_at as i64, 0).unwrap_or_default();
+    let response = TopUpResponseContent {
+        success: true,
+        pod_npub: request.pod_npub.clone(),
+        extended_duration_seconds: extension_secs,
+        new_expires_at: new_expires_dt.to_rfc3339(),
+        message: format!(
+            "Lease extended by {}s ({} msats @ {} msats/sec)",
+            extension_secs, payment_msats, spec.rate_msats_per_sec
+        ),
+    };
+
+    nostr
+        .send_topup_response_private_message(requester_pubkey, response, message_type)
+        .await?;
+
+    info!(
+        "Topup applied to {}: +{}s (now expires at {})",
+        request.pod_npub, extension_secs, new_expires_at
+    );
+    Ok(())
+}
+
+/// Generate a 16-character alphanumeric SSH password. Lives here
+/// (rather than `sidecar_service`) so the Nostr-DM canonical path
+/// doesn't depend on the legacy K8s pipeline that Unit 7 gates
+/// behind the `kubernetes` Cargo feature.
+fn generate_password() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..16)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
+/// Parse a pod identifier emitted by the spawn handler back into the
+/// internal vmid. Accepts both `container-<vmid>` (the format
+/// AccessDetailsContent returns to the consumer) and a bare numeric
+/// id (for callers that already know it).
+pub fn parse_pod_npub(pod_npub: &str) -> Option<u32> {
+    if let Some(rest) = pod_npub.strip_prefix("container-") {
+        rest.parse().ok()
+    } else {
+        pod_npub.parse().ok()
+    }
+}
+
+/// Translate a `RedeemError` into the `(error_type, message)` shape the
+/// Nostr error-response uses. The error-type strings are stable so
+/// consumers can reason about them programmatically (retry on
+/// `network`, give up on `already_spent`, etc.).
+fn redeem_error_to_response(err: &RedeemError) -> (&'static str, String) {
+    match err {
+        RedeemError::InvalidToken(msg) => {
+            ("invalid_token", format!("Invalid Cashu token: {}", msg))
+        }
+        RedeemError::NonWhitelistedMint { mint_url } => (
+            "non_whitelisted_mint",
+            format!("Mint {} is not accepted by this provider", mint_url),
+        ),
+        RedeemError::AlreadySpent => (
+            "token_already_spent",
+            "This Cashu token has already been spent at the mint".to_string(),
+        ),
+        RedeemError::Pending => (
+            "token_pending",
+            "Token is pending at the mint; retry shortly".to_string(),
+        ),
+        RedeemError::Network(msg) => (
+            "mint_network_error",
+            format!("Could not reach mint: {}", msg),
+        ),
+        RedeemError::UnsupportedUnit(unit) => (
+            "unsupported_unit",
+            format!("Token unit {} is not supported", unit),
+        ),
+        RedeemError::MintError(msg) => ("mint_error", format!("Mint rejected redemption: {}", msg)),
+    }
 }
 
 /// Handle a status request
@@ -637,33 +987,37 @@ async fn handle_status_request(
     message_type: &str,
     request: StatusRequestContent,
 ) -> Result<()> {
-    info!("Processing status request for pod {} from {}", request.pod_id, requester_pubkey);
+    info!(
+        "Processing status request for pod {} from {}",
+        request.pod_id, requester_pubkey
+    );
 
     // 1. Try to find the workload by ID (which could be vmid)
     let vmid = request.pod_id.parse::<u32>().ok();
-    
+
     let workload = {
         let lock = workloads.lock().await;
         if let Some(vmid) = vmid {
             lock.get(&vmid).cloned()
         } else {
             // If not a number, maybe it's a pod_npub? (not yet implemented in tracking, but we search by owner for now)
-            lock.values().find(|w| w.owner_npub == request.pod_id || w.owner_npub == requester_pubkey).cloned()
+            lock.values()
+                .find(|w| w.owner_npub == request.pod_id || w.owner_npub == requester_pubkey)
+                .cloned()
         }
     };
 
     let workload = match workload {
         Some(w) => w,
         None => {
-            let err_msg = format!("Workload {} not found or you don't have access", request.pod_id);
+            let err_msg = format!(
+                "Workload {} not found or you don't have access",
+                request.pod_id
+            );
             warn!("{}", err_msg);
-            nostr.send_error_response(
-                requester_pubkey,
-                "not_found",
-                &err_msg,
-                None,
-                message_type,
-            ).await?;
+            nostr
+                .send_error_response(requester_pubkey, "not_found", &err_msg, None, message_type)
+                .await?;
             return Ok(());
         }
     };
@@ -671,22 +1025,32 @@ async fn handle_status_request(
     // 2. Check backend status
     let status_info = match backend.get_node_status().await {
         Ok(s) => s,
-        Err(_) => crate::compute::NodeStatus { cpu_usage: 0.0, memory_used: 0, memory_total: 0, disk_used: 0, disk_total: 0 },
+        Err(_) => crate::compute::NodeStatus {
+            cpu_usage: 0.0,
+            memory_used: 0,
+            memory_total: 0,
+            disk_used: 0,
+            disk_total: 0,
+        },
     };
 
     // 3. Prepare response
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    
-    let time_remaining = workload.expires_at.saturating_sub(now);
-    let status = if time_remaining == 0 { "Expired" } else { "Running" };
 
-    let expires_dt = chrono::DateTime::from_timestamp(workload.expires_at as i64, 0).unwrap_or_default();
-    
+    let time_remaining = workload.expires_at.saturating_sub(now);
+    let status = if time_remaining == 0 {
+        "Expired"
+    } else {
+        "Running"
+    };
+
+    let expires_dt =
+        chrono::DateTime::from_timestamp(workload.expires_at as i64, 0).unwrap_or_default();
+
     // Look up spec for actual resource values
-    let spec = config.specs.iter()
-        .find(|s| s.id == workload.spec_id);
+    let spec = config.specs.iter().find(|s| s.id == workload.spec_id);
     let cpu = spec.map(|s| s.cpu_millicores).unwrap_or(1000);
     let mem = spec.map(|s| s.memory_mb).unwrap_or(1024);
     let host_port = match config.ssh_port_start {
@@ -706,11 +1070,9 @@ async fn handle_status_request(
         ssh_username: "root".to_string(),
     };
 
-    nostr.send_status_response(
-        requester_pubkey,
-        response,
-        message_type,
-    ).await?;
+    nostr
+        .send_status_response(requester_pubkey, response, message_type)
+        .await?;
 
     info!("Status response sent for workload {}", workload.vmid);
     Ok(())
@@ -718,17 +1080,15 @@ async fn handle_status_request(
 
 /// Load provider config from file
 pub fn load_config(path: &str) -> Result<ProviderConfig> {
-    let content = std::fs::read_to_string(path)
-        .context(format!("Failed to read config file: {}", path))?;
-    
-    serde_json::from_str(&content)
-        .context("Failed to parse provider config")
+    let content =
+        std::fs::read_to_string(path).context(format!("Failed to read config file: {}", path))?;
+
+    serde_json::from_str(&content).context("Failed to parse provider config")
 }
 
 /// Save provider config to file
 pub fn save_config(path: &str, config: &ProviderConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, content)
-        .context(format!("Failed to write config file: {}", path))?;
+    std::fs::write(path, content).context(format!("Failed to write config file: {}", path))?;
     Ok(())
 }
