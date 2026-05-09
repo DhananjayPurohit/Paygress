@@ -17,6 +17,7 @@
 pub mod blossom;
 pub mod blossom_crypto;
 pub mod cashu;
+pub mod client;
 pub mod durable_workload;
 pub mod nostr;
 pub mod observatory;
