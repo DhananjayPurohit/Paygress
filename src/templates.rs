@@ -111,6 +111,21 @@ pub struct TemplateDefinition {
     /// workload locally with no Paygress involved.
     pub compose_path: &'static str,
 
+    /// Extra `docker run` flags this template needs (ulimits,
+    /// sysctls, capabilities, etc.). Passed verbatim before the
+    /// image positional. Keep these minimal and well-justified —
+    /// every flag here is a cross-template attack surface.
+    /// Example: `&["--ulimit", "nofile=1048576:1048576"]` for
+    /// strfry, which tries to bump NOFILES to 1M and fails inside
+    /// Docker's default 524288 cap.
+    pub extra_docker_args: &'static [&'static str],
+
+    /// Container-internal path that holds the workload's
+    /// persistent state (LMDB for strfry, models for ollama,
+    /// chain data for bitcoind). DockerBackend mounts a
+    /// vmid-scoped volume here. None means stateless (browser).
+    pub data_path: Option<&'static str>,
+
     // ---- consumer-side defaults ----
     pub tier: &'static str,
     pub replication: ReplicationMode,
@@ -154,6 +169,11 @@ fn nostr_relay() -> TemplateDefinition {
         }],
         env,
         compose_path: "templates/nostr-relay/docker-compose.yml",
+        // strfry's startup tries to bump nofile rlimit to 1M; without
+        // this flag the container immediately exits with "Unable to
+        // set NOFILES limit to 1000000, exceeds max of 524288".
+        extra_docker_args: &["--ulimit", "nofile=1048576:1048576"],
+        data_path: Some("/app/strfry-db"),
         tier: "basic",
         replication: ReplicationMode::WarmStandby,
         min_cpu_millicores: 500,
@@ -177,6 +197,8 @@ fn inference_endpoint() -> TemplateDefinition {
         }],
         env,
         compose_path: "templates/inference-endpoint/docker-compose.yml",
+        extra_docker_args: &[],
+        data_path: Some("/root/.ollama"),
         tier: "standard",
         replication: ReplicationMode::Checkpointed,
         min_cpu_millicores: 2000,
@@ -207,6 +229,8 @@ fn headless_browser() -> TemplateDefinition {
         ],
         env,
         compose_path: "templates/headless-browser/docker-compose.yml",
+        extra_docker_args: &[],
+        data_path: None,
         tier: "basic",
         replication: ReplicationMode::None,
         min_cpu_millicores: 1000,
@@ -237,6 +261,8 @@ fn bitcoin_node() -> TemplateDefinition {
         ],
         env,
         compose_path: "templates/bitcoin-node/docker-compose.yml",
+        extra_docker_args: &[],
+        data_path: Some("/data"),
         tier: "standard",
         replication: ReplicationMode::Checkpointed,
         min_cpu_millicores: 1000,

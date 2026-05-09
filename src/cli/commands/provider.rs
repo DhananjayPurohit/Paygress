@@ -328,6 +328,10 @@ async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
             println!("  Backend:  LXD");
             println!("  Storage:  {}", config.proxmox_storage); // Used as pool name
         }
+        paygress::provider::BackendType::Docker => {
+            println!("  Backend:  Docker");
+            println!("  Note:     templates require Docker; ensure `docker` is on PATH");
+        }
     }
     println!();
 
