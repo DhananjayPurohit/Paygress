@@ -14,6 +14,7 @@ mod mcp;
 mod nostr; // Still used for PodSpec type
 mod pod_provisioning;
 mod sidecar_service;
+mod stake; // referenced by nostr::ProviderOfferContent
 
 use crate::interfaces::run_all_interfaces;
 use crate::pod_provisioning::PodProvisioningService;

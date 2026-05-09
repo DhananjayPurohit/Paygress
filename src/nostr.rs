@@ -689,6 +689,11 @@ pub struct ProviderOfferContent {
     /// Isolation level the provider promises (Unit 4 / Unit 22).
     #[serde(default)]
     pub isolation_level: IsolationLevel,
+
+    /// Optional fidelity-bond stake. Offers carrying a verifiable
+    /// stake proof are eligible for the `staked` discovery tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stake_proof: Option<crate::stake::StakeProof>,
 }
 
 /// Heartbeat content published to Nostr.
