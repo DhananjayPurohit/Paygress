@@ -40,13 +40,30 @@ pub struct BatchArgs {
     /// Comma-separated Cashu tokens, one per shard. Each token is
     /// redeemed independently; a single shard's token failure does
     /// not cancel the others.
-    #[arg(long, conflicts_with = "tokens_file")]
+    #[arg(long, conflicts_with_all = ["tokens_file", "split_token"])]
     pub tokens: Option<String>,
 
     /// Path to a file with one Cashu token per line. Lines starting
     /// with `#` and blank lines are ignored.
-    #[arg(long, conflicts_with = "tokens")]
+    #[arg(long, conflicts_with_all = ["tokens", "split_token"])]
     pub tokens_file: Option<PathBuf>,
+
+    /// One large Cashu token to split into N shards (specified via
+    /// `--shards`). The CLI opens an ephemeral wallet, swaps the
+    /// token in, and emits N tokens of approximately equal face
+    /// value before fanning out spawns.
+    ///
+    /// Caveat: uses `cdk` 0.9, which is known to fail at receive
+    /// against modern mints with v2 (66-char) keyset IDs (e.g.
+    /// mint.minibits.cash). Works today against testnut.cashu.space.
+    /// cdk 0.14 upgrade is tracked separately.
+    #[arg(long)]
+    pub split_token: Option<String>,
+
+    /// Number of shards to split `--split-token` into. Required
+    /// when `--split-token` is set; ignored otherwise.
+    #[arg(long, requires = "split_token")]
+    pub shards: Option<usize>,
 
     /// Tier on the provider's offer.
     #[arg(short, long, default_value = "basic")]
@@ -124,8 +141,10 @@ fn generate_password(len: usize) -> String {
         .collect()
 }
 
-/// Parse the token list from either --tokens or --tokens-file.
-/// Surfaced for unit-testing without spinning up the runtime.
+/// Parse the static token list from --tokens or --tokens-file. Does
+/// NOT handle --split-token (that requires a mint round-trip and
+/// lives in `materialize_tokens`). Surfaced for unit-testing the
+/// pure-input path without spinning up the runtime.
 pub fn parse_tokens(args: &BatchArgs) -> Result<Vec<String>> {
     if let Some(s) = &args.tokens {
         let v: Vec<String> = s
@@ -154,7 +173,40 @@ pub fn parse_tokens(args: &BatchArgs) -> Result<Vec<String>> {
         }
         return Ok(v);
     }
-    anyhow::bail!("either --tokens or --tokens-file is required");
+    anyhow::bail!("one of --tokens, --tokens-file, or --split-token is required");
+}
+
+/// Resolve the final per-shard token list, performing the wallet
+/// round-trip if `--split-token` was supplied. Mode selection:
+///   - `--tokens` / `--tokens-file`: defer to `parse_tokens` (pure).
+///   - `--split-token` + `--shards N`: open ephemeral wallet, swap
+///     the input token in, return N tokens of equal face value.
+/// Caller is responsible for the chosen mode being a single one
+/// (clap's `conflicts_with` enforces this at parse time).
+pub async fn materialize_tokens(args: &BatchArgs) -> Result<Vec<String>> {
+    if let Some(big_token) = &args.split_token {
+        let n = args
+            .shards
+            .ok_or_else(|| anyhow::anyhow!("--shards is required when --split-token is set"))?;
+        if n == 0 {
+            anyhow::bail!("--shards must be >= 1");
+        }
+        // Ephemeral wallet path. Use a unique filename so concurrent
+        // batch invocations on the same machine don't collide.
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "paygress-batch-split-{}.redb",
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = paygress::cashu::split_token_into_n(big_token, n, &db_path).await;
+        // Always remove the temp wallet, regardless of success — it
+        // may have eaten the input token's proofs and we don't want
+        // them lingering on disk.
+        let _ = std::fs::remove_file(&db_path);
+        return result;
+    }
+    parse_tokens(args)
 }
 
 /// Build a shard manifest entry from a successful access-details
@@ -228,7 +280,7 @@ fn manifest_entry_status_only(
 }
 
 pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
-    let tokens = parse_tokens(&args)?;
+    let tokens = materialize_tokens(&args).await?;
     let n = tokens.len();
     let relays = parse_relays(args.relays.clone());
     let nostr_key = get_or_create_identity(args.nostr_key.clone())?;
@@ -410,6 +462,8 @@ mod tests {
             provider: "npub1abc".to_string(),
             tokens: Some(s.to_string()),
             tokens_file: None,
+            split_token: None,
+            shards: None,
             tier: "basic".to_string(),
             template: "agent-sandbox".to_string(),
             output: PathBuf::from("/tmp/paygress-batch-test"),
@@ -425,6 +479,25 @@ mod tests {
             provider: "npub1abc".to_string(),
             tokens: None,
             tokens_file: Some(p),
+            split_token: None,
+            shards: None,
+            tier: "basic".to_string(),
+            template: "agent-sandbox".to_string(),
+            output: PathBuf::from("/tmp/paygress-batch-test"),
+            timeout_secs: 120,
+            image: "ubuntu:22.04".to_string(),
+            nostr_key: None,
+            relays: None,
+        }
+    }
+
+    fn args_with_split(token: &str, shards: Option<usize>) -> BatchArgs {
+        BatchArgs {
+            provider: "npub1abc".to_string(),
+            tokens: None,
+            tokens_file: None,
+            split_token: Some(token.to_string()),
+            shards,
             tier: "basic".to_string(),
             template: "agent-sandbox".to_string(),
             output: PathBuf::from("/tmp/paygress-batch-test"),
@@ -532,6 +605,54 @@ mod tests {
         };
         let e = manifest_entry_from_success(0, "provider-public-ip", "user", "pw", access);
         assert_eq!(e.host.as_deref(), Some("provider-public-ip"));
+    }
+
+    #[tokio::test]
+    async fn materialize_tokens_split_without_shards_errors() {
+        // clap's `requires = "split_token"` covers the OTHER direction
+        // (--shards without --split-token is rejected at parse time).
+        // The reverse — --split-token without --shards — is a runtime
+        // check because clap can't express "B requires A *and* A
+        // requires B" without making both flags mandatory. Pin the
+        // runtime error message so the user gets a clear fix-it.
+        let args = args_with_split("dummy-token-not-used", None);
+        let err = materialize_tokens(&args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("--shards is required"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_tokens_split_zero_shards_errors() {
+        let args = args_with_split("dummy-token-not-used", Some(0));
+        let err = materialize_tokens(&args).await.unwrap_err();
+        assert!(err.to_string().contains(">= 1"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn materialize_tokens_split_invalid_token_errors_fast() {
+        // Bogus token bytes — must fail at Token::from_str BEFORE the
+        // wallet attempts a mint round-trip (which would be slow and
+        // potentially leak a redb file). This test pins the
+        // "fail-fast on bad input" contract.
+        let args = args_with_split("not-a-real-cashu-token", Some(3));
+        let err = materialize_tokens(&args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid input token"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_tokens_falls_through_to_parse_tokens_for_static_input() {
+        // If --split-token isn't set, materialize_tokens must defer to
+        // parse_tokens with no surprises (no wallet, no I/O).
+        let args = args_with_tokens("a,b,c");
+        let v = materialize_tokens(&args).await.unwrap();
+        assert_eq!(v, vec!["a", "b", "c"]);
     }
 
     #[test]
