@@ -71,6 +71,11 @@ pub enum Template {
     /// Bitcoin full node. Long sync, large state — checkpointed
     /// makes sense; warm-standby is overkill for this Q4 demo.
     BitcoinNode,
+    /// Generic compute sandbox: Python + Node + git in /workspace.
+    /// For AI agents writing code, CI/test runners, and map-reduce
+    /// shards. Stateless by default — retry on a fresh provider is
+    /// the recovery model.
+    AgentSandbox,
 }
 
 /// Per-template "what should we do unless told otherwise" table.
@@ -112,6 +117,16 @@ pub const fn template_defaults(t: Template) -> TemplateDefaults {
             image: "ubuntu:22.04",
             replication: ReplicationMode::Checkpointed,
             summary: "Bitcoin full node; checkpointed (long sync).",
+        },
+        Template::AgentSandbox => TemplateDefaults {
+            tier: "basic",
+            // The provider resolves the real image from its template
+            // registry once `--template-slug` is forwarded; this fallback
+            // only matters when --image is not overridden AND the provider
+            // doesn't recognize the slug (which would be rejected upstream).
+            image: "nikolaik/python-nodejs:python3.12-nodejs20",
+            replication: ReplicationMode::None,
+            summary: "Python + Node + git sandbox for agents, CI, and map-reduce shards.",
         },
     }
 }
@@ -215,6 +230,7 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         Template::InferenceEndpoint => "inference-endpoint",
         Template::HeadlessBrowser => "headless-browser",
         Template::BitcoinNode => "bitcoin-node",
+        Template::AgentSandbox => "agent-sandbox",
     };
     let spawn_args = SpawnArgs {
         provider: args.provider,
