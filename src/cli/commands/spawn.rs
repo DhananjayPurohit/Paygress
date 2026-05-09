@@ -81,6 +81,24 @@ pub struct SpawnArgs {
     /// Ignored when `--replication` is not `warm-standby`.
     #[arg(long)]
     pub standby: Option<String>,
+
+    /// Primary provider's npub (warm-standby only). When you spawn
+    /// AGAINST a standby with `--provider <standby-npub>`, this tells
+    /// the standby who the primary is so it can listen for the right
+    /// `LeaseRevocation`. When you spawn AGAINST the primary, set
+    /// this to the same value as `--provider` so the primary
+    /// recognizes itself.
+    #[arg(long)]
+    pub primary_npub: Option<String>,
+
+    /// Consumer-assigned workload identifier (UUID-shaped string,
+    /// warm-standby only). The same value MUST be passed when
+    /// spawning against the primary AND each standby — it ties the
+    /// N+1 spawns into one logical workload. The
+    /// `LeaseRevocation` event uses this id, and standbys look up
+    /// their reserved slot by it on receipt.
+    #[arg(long)]
+    pub workload_id: Option<String>,
 }
 
 /// Translate the `--replication` + `--standby` CLI flags into the
@@ -277,6 +295,8 @@ pub async fn nostr_spawn_round_trip(
     ssh_pass: String,
     template_slug: Option<String>,
     replication: Option<paygress::durable_workload::ReplicationMode>,
+    primary_npub: Option<String>,
+    workload_id: Option<String>,
     relays: Vec<String>,
     nostr_key: String,
     timeout_secs: u64,
@@ -306,6 +326,8 @@ pub async fn nostr_spawn_round_trip(
         ssh_password: ssh_pass,
         template_slug,
         replication,
+        primary_npub,
+        workload_id,
     };
     let request_json = serde_json::to_string(&request)?;
 
@@ -360,6 +382,21 @@ async fn execute_nostr_spawn(
     );
 
     let replication = parse_replication_arg(&args.replication, args.standby.as_deref())?;
+    // For warm-standby, primary_npub + workload_id are required so
+    // each receiving provider can self-determine role and so the
+    // standbys share one stable id with the primary.
+    if let Some(paygress::durable_workload::ReplicationMode::WarmStandby { .. }) =
+        replication.as_ref()
+    {
+        if args.primary_npub.is_none() {
+            anyhow::bail!("--replication warm-standby requires --primary-npub <primary's npub>");
+        }
+        if args.workload_id.is_none() {
+            anyhow::bail!(
+                "--replication warm-standby requires --workload-id <consumer-assigned uuid>"
+            );
+        }
+    }
     let outcome = nostr_spawn_round_trip(
         &provider_npub,
         &args.tier,
@@ -369,6 +406,8 @@ async fn execute_nostr_spawn(
         ssh_pass.clone(),
         args.template_slug.clone(),
         replication,
+        args.primary_npub.clone(),
+        args.workload_id.clone(),
         relays,
         nostr_key,
         120,

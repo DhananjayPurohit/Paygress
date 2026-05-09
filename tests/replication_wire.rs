@@ -20,7 +20,37 @@ fn sample_v1_warm_standby() -> EncryptedSpawnPodRequest {
         replication: Some(ReplicationMode::WarmStandby {
             standby_providers: vec!["npub1b".to_string(), "npub1c".to_string()],
         }),
+        primary_npub: Some("npub1primary".to_string()),
+        workload_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
     }
+}
+
+#[test]
+fn warm_standby_carries_primary_and_workload_id() {
+    let v = sample_v1_warm_standby();
+    let json = serde_json::to_string(&v).unwrap();
+    assert!(json.contains(r#""primary_npub":"npub1primary""#));
+    assert!(json.contains(r#""workload_id":"550e8400-e29b-41d4-a716-446655440000""#));
+
+    let back: EncryptedSpawnPodRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.primary_npub.as_deref(), Some("npub1primary"));
+    assert_eq!(
+        back.workload_id.as_deref(),
+        Some("550e8400-e29b-41d4-a716-446655440000")
+    );
+}
+
+#[test]
+fn primary_npub_and_workload_id_skipped_when_unset() {
+    // Old clients (and non-replicated spawns) don't set these.
+    // skip_serializing_if keeps them off the wire so the schema
+    // looks unchanged.
+    let mut v = sample_v1_warm_standby();
+    v.primary_npub = None;
+    v.workload_id = None;
+    let json = serde_json::to_string(&v).unwrap();
+    assert!(!json.contains("primary_npub"));
+    assert!(!json.contains("workload_id"));
 }
 
 #[test]
@@ -77,4 +107,39 @@ fn checkpointed_round_trip() {
         back.replication,
         Some(ReplicationMode::Checkpointed)
     ));
+}
+
+// ==================== warm_standby_role tests ====================
+//
+// Role-routing is what makes the same EncryptedSpawnPodRequest land
+// at N+1 providers and have each pick the right path. Pin the
+// matrix so the convention (primary_npub identifies the primary;
+// standby_providers list contains only standbys) doesn't drift.
+
+use paygress::nostr::{warm_standby_role, WarmStandbyRole};
+
+#[test]
+fn role_primary_when_self_matches_primary_npub() {
+    let r = warm_standby_role("npub1primary", "npub1primary", &["npub1b".into()]);
+    assert_eq!(r, WarmStandbyRole::Primary);
+}
+
+#[test]
+fn role_standby_with_correct_index() {
+    let r = warm_standby_role(
+        "npub1c",
+        "npub1primary",
+        &["npub1b".into(), "npub1c".into(), "npub1d".into()],
+    );
+    assert_eq!(r, WarmStandbyRole::Standby { index: 1, count: 3 });
+}
+
+#[test]
+fn role_not_addressed_when_self_unknown() {
+    let r = warm_standby_role(
+        "npub1stranger",
+        "npub1primary",
+        &["npub1b".into(), "npub1c".into()],
+    );
+    assert_eq!(r, WarmStandbyRole::NotAddressed);
 }

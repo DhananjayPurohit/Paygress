@@ -681,6 +681,58 @@ pub struct EncryptedSpawnPodRequest {
     /// `LeaseRevocation` event published by #34's wiring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication: Option<crate::durable_workload::ReplicationMode>,
+
+    /// Primary provider's npub. Required when `replication` is
+    /// `WarmStandby`; ignored otherwise. Lets each receiving
+    /// provider self-determine its role: if `self.npub == primary_npub`
+    /// it acts as the primary (spawns + heartbeats); otherwise (and
+    /// only if it is in `standby_providers`) it acts as a standby
+    /// (reserves a slot, listens for revocations, promotes on signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_npub: Option<String>,
+
+    /// Consumer-assigned workload identifier (UUID-shaped string).
+    /// Required when `replication` is `WarmStandby` so the primary
+    /// and N standbys share one stable id across providers — the
+    /// `LeaseRevocation` event uses this id, and the standby looks
+    /// up its reserved slot by it on receipt. Single-provider spawns
+    /// can leave this unset; the provider derives a vmid-based id
+    /// internally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_id: Option<String>,
+}
+
+/// Pure helper for self-role detection on a `WarmStandby` spawn
+/// request. Returns the role this provider should take. Surfaced so
+/// the role-routing logic in `provider::handle_spawn_request` is
+/// unit-testable without spinning up a state machine.
+///
+/// Convention:
+///   - if `self_npub == primary_npub` → Primary
+///   - else if `self_npub` is in `standby_providers` → Standby (with index)
+///   - else → NotAddressed (provider should reject the request)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarmStandbyRole {
+    Primary,
+    Standby { index: usize, count: usize },
+    NotAddressed,
+}
+
+pub fn warm_standby_role(
+    self_npub: &str,
+    primary_npub: &str,
+    standby_providers: &[String],
+) -> WarmStandbyRole {
+    if self_npub == primary_npub {
+        return WarmStandbyRole::Primary;
+    }
+    if let Some(idx) = standby_providers.iter().position(|p| p == self_npub) {
+        return WarmStandbyRole::Standby {
+            index: idx,
+            count: standby_providers.len(),
+        };
+    }
+    WarmStandbyRole::NotAddressed
 }
 
 // NEW: Encrypted top-up request structure
@@ -839,7 +891,15 @@ pub struct HeartbeatContent {
 /// before publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseRevocationContent {
-    pub workload_id: u32,
+    /// Consumer-assigned workload identifier (the same UUID-shaped
+    /// string the consumer sent in the spawn request as
+    /// `workload_id`). Standbys key their slot table by this id and
+    /// use it to look up the matching reservation when a revocation
+    /// arrives. v0 events used a u32 (the primary's local vmid) —
+    /// the change to String is a wire-format bump, but no v0
+    /// revocations were ever published in production (#34/#41
+    /// shipped the listener, not the publisher's own consumers).
+    pub workload_id: String,
     pub primary_provider_npub: String,
     pub standby_providers: Vec<String>,
     pub reason: String,

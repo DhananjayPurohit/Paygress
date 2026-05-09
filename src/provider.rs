@@ -23,10 +23,11 @@ use crate::durable_workload::{
 };
 use crate::lxd::LxdBackend;
 use crate::nostr::{
-    parse_private_message_content, AccessDetailsContent, CapacityInfo, EncryptedSpawnPodRequest,
-    EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent, LeaseRevocationContent,
-    NostrRelaySubscriber, PodSpec, PrivateRequest, ProviderOfferContent, RelayConfig,
-    StatusRequestContent, StatusResponseContent, TopUpResponseContent,
+    parse_private_message_content, warm_standby_role, AccessDetailsContent, CapacityInfo,
+    EncryptedSpawnPodRequest, EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent,
+    LeaseRevocationContent, NostrRelaySubscriber, PodSpec, PrivateRequest, ProviderOfferContent,
+    RelayConfig, StatusRequestContent, StatusResponseContent, TopUpResponseContent,
+    WarmStandbyRole,
 };
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 use crate::templates::{TemplateDefinition, TemplateName};
@@ -176,6 +177,40 @@ pub struct WorkloadInfo {
     /// included in revocation events so a standby can restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_uri: Option<String>,
+
+    /// Consumer-assigned workload identifier (UUID-shaped string),
+    /// set from `EncryptedSpawnPodRequest.workload_id` at spawn time
+    /// for warm-standby workloads. Used by the orchestrator's
+    /// `PublishLeaseRevocation` handler so the published revocation
+    /// carries the same id the standbys keyed their slots by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_workload_id: Option<String>,
+}
+
+/// A standby slot reserved for a warm-standby workload. The
+/// consumer's spawn request was paid for and acknowledged, but no
+/// container has been created yet — the standby is "armed" and
+/// waiting for a `LeaseRevocation` event from the primary.
+///
+/// Stored in `ProviderService::standby_slots` keyed by `workload_id`
+/// (consumer-assigned UUID, shared by primary and all standbys).
+/// On revocation, the standby's promotion handler:
+///   1. Sleeps `index * promotion_delay_secs` (ordered backoff for
+///      single-writer; standby 0 promotes immediately, standby 1
+///      waits one delay window, etc.)
+///   2. Spawns the container using `container_config`
+///   3. Removes the slot, adds to `active_workloads`, registers with
+///      the state machine as primary
+#[derive(Debug, Clone)]
+pub struct StandbySlot {
+    pub workload_id: String,
+    pub primary_npub: String,
+    pub standby_index: usize,
+    pub standby_count: usize,
+    pub container_config: ContainerConfig,
+    pub spec_id: String,
+    pub expires_at: u64,
+    pub owner_npub: String,
 }
 
 /// Provider service that manages the node
@@ -199,6 +234,14 @@ pub struct ProviderService {
     /// observation per relay that ACK'd), drained on each
     /// orchestrator iteration.
     observation_buffer: Arc<Mutex<Vec<HeartbeatObservation>>>,
+
+    /// Reserved warm-standby slots, keyed by consumer-assigned
+    /// `workload_id`. Populated when a spawn request arrives with
+    /// `replication = WarmStandby` AND the role-detection helper
+    /// classifies this provider as a standby. Drained when a
+    /// matching `LeaseRevocation` arrives (slot promotes to a real
+    /// active workload) or when the slot's expiry passes (cleanup).
+    standby_slots: Arc<Mutex<HashMap<String, StandbySlot>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -275,6 +318,7 @@ impl ProviderService {
                 QuorumConfig::default(),
             ))),
             observation_buffer: Arc::new(Mutex::new(Vec::new())),
+            standby_slots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -420,6 +464,7 @@ impl ProviderService {
         let workloads = self.active_workloads.clone();
         let stats = self.stats.clone();
         let state_machine = self.state_machine.clone();
+        let standby_slots = self.standby_slots.clone();
 
         self.nostr
             .subscribe_to_pod_events(move |event| {
@@ -430,6 +475,7 @@ impl ProviderService {
                 let workloads = workloads.clone();
                 let stats = stats.clone();
                 let state_machine = state_machine.clone();
+                let standby_slots = standby_slots.clone();
 
                 Box::pin(async move {
                     let my_pubkey = nostr.public_key().to_hex();
@@ -444,8 +490,7 @@ impl ProviderService {
 
                     // Lease revocation events take a separate path
                     // (Unit 5 standby-side promotion). Public events,
-                    // no decryption, no response. v1 logs only —
-                    // promotion action lands in a follow-up.
+                    // no decryption, no response.
                     if let Some(revocation) = crate::nostr::parse_revocation_event(&event) {
                         info!(
                             "Lease revocation observed: workload_id={}, primary={}, reason={}, state_uri={:?}, standbys={:?}",
@@ -455,6 +500,35 @@ impl ProviderService {
                             revocation.state_uri,
                             revocation.standby_providers,
                         );
+                        // Look up the matching standby slot. If
+                        // present, schedule the promotion task; the
+                        // ordered backoff inside that task gives us
+                        // single-writer across N standbys (best-effort
+                        // — see scheduler for the v1 caveat).
+                        let workload_id = revocation.workload_id.clone();
+                        let primary_npub = revocation.primary_provider_npub.clone();
+                        let slot_opt = standby_slots.lock().await.get(&workload_id).cloned();
+                        if let Some(slot) = slot_opt {
+                            if slot.primary_npub != primary_npub {
+                                warn!(
+                                    "Revocation primary_npub ({}) does not match slot's primary ({}); ignoring",
+                                    primary_npub, slot.primary_npub
+                                );
+                                return Ok(());
+                            }
+                            schedule_standby_promotion(
+                                backend.clone(),
+                                workloads.clone(),
+                                state_machine.clone(),
+                                standby_slots.clone(),
+                                slot,
+                            );
+                        } else {
+                            debug!(
+                                "Revocation workload_id={} did not match any local standby slot; ignoring",
+                                workload_id
+                            );
+                        }
                         return Ok(());
                     }
 
@@ -492,6 +566,7 @@ impl ProviderService {
                                 &workloads,
                                 &stats,
                                 &state_machine,
+                                &standby_slots,
                                 &event.pubkey,
                                 &event.message_type,
                                 spawn_req,
@@ -612,14 +687,24 @@ impl ProviderService {
                 workload_id,
                 standby_providers,
             } => {
-                let state_uri = self
-                    .active_workloads
-                    .lock()
-                    .await
-                    .get(&workload_id)
-                    .and_then(|w| w.state_uri.clone());
+                // Look up the workload's consumer-assigned UUID (set
+                // at spawn time from request.workload_id). If absent,
+                // fall back to a derived id based on the local vmid —
+                // this case is unreachable for a real warm-standby
+                // workload because the spawn handler enforces the
+                // UUID, but the fallback keeps the publish call
+                // total in case of state-machine bugs.
+                let (consumer_workload_id, state_uri) = {
+                    let lock = self.active_workloads.lock().await;
+                    let entry = lock.get(&workload_id);
+                    let cid = entry
+                        .and_then(|w| w.consumer_workload_id.clone())
+                        .unwrap_or_else(|| format!("vmid-{}", workload_id));
+                    let suri = entry.and_then(|w| w.state_uri.clone());
+                    (cid, suri)
+                };
                 let revocation = LeaseRevocationContent {
-                    workload_id,
+                    workload_id: consumer_workload_id.clone(),
                     primary_provider_npub: self.get_npub(),
                     standby_providers: standby_providers.clone(),
                     reason: "heartbeat-quorum-lost-past-t2".to_string(),
@@ -629,7 +714,8 @@ impl ProviderService {
                 };
                 match self.nostr.publish_lease_revocation(revocation).await {
                     Ok(event_id) => info!(
-                        "Published lease revocation for workload {} to {} standby(s): {}",
+                        "Published lease revocation for workload {} (vmid {}) to {} standby(s): {}",
+                        consumer_workload_id,
                         workload_id,
                         standby_providers.len(),
                         event_id
@@ -742,6 +828,7 @@ async fn handle_spawn_request(
     workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: &Arc<Mutex<ProviderStats>>,
     state_machine: &Arc<Mutex<WorkloadStateMachine>>,
+    standby_slots: &Arc<Mutex<HashMap<String, StandbySlot>>>,
     requester_pubkey: &str,
     message_type: &str,
     request: EncryptedSpawnPodRequest,
@@ -750,6 +837,45 @@ async fn handle_spawn_request(
         "Processing spawn request from {} (tier: {:?})",
         requester_pubkey, request.pod_spec_id
     );
+
+    // Self-role detection for warm-standby spawns. The consumer
+    // sends the SAME shape of request to N+1 providers — the
+    // primary and each standby. Each provider compares its own
+    // npub against the request's primary_npub / standby_providers
+    // to figure out which path to take. Single-replication spawns
+    // (the common case) skip this entirely.
+    let role = compute_warm_standby_role(&nostr.get_service_public_key(), &request);
+    if matches!(role, WarmStandbyRole::NotAddressed) {
+        if request
+            .replication
+            .as_ref()
+            .map(|r| {
+                matches!(
+                    r,
+                    crate::durable_workload::ReplicationMode::WarmStandby { .. }
+                )
+            })
+            .unwrap_or(false)
+        {
+            // The consumer set replication=WarmStandby but neither
+            // designated us as primary nor included us in the
+            // standby list. Refuse to spend the token — they sent
+            // to the wrong provider.
+            let err_msg =
+                "warm-standby spawn arrived at a provider not designated as primary or standby";
+            warn!("{}", err_msg);
+            nostr
+                .send_error_response(
+                    requester_pubkey,
+                    "not_addressed",
+                    err_msg,
+                    None,
+                    message_type,
+                )
+                .await?;
+            return Ok(());
+        }
+    }
 
     // 1. Redeem Cashu token at the mint (Unit 1).
     let payment_msats = match validate_and_redeem(
@@ -960,6 +1086,95 @@ async fn handle_spawn_request(
         data_path,
     };
 
+    // ---- Standby branch ----
+    //
+    // If self is a standby for this workload (warm-standby spawn,
+    // self.npub in standby_providers), DON'T create the container
+    // yet. Reserve the slot, return a standby-confirmation
+    // AccessDetails to the consumer, and wait for a
+    // `LeaseRevocation` from the primary to trigger promotion.
+    //
+    // The token has already been redeemed at step 1, so the
+    // consumer paid for the reservation — providers earn revenue
+    // for offering standby capacity even if the primary never
+    // fails over.
+    if let WarmStandbyRole::Standby { index, count } = role {
+        let workload_id = match request.workload_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                let err_msg = "warm-standby spawn missing workload_id (consumer-assigned UUID required to coordinate primary + standbys)";
+                warn!("{}", err_msg);
+                nostr
+                    .send_error_response(
+                        requester_pubkey,
+                        "missing_workload_id",
+                        err_msg,
+                        None,
+                        message_type,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        };
+        let primary_npub = request.primary_npub.clone().unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let slot = StandbySlot {
+            workload_id: workload_id.clone(),
+            primary_npub,
+            standby_index: index,
+            standby_count: count,
+            container_config: container_config.clone(),
+            spec_id: spec.id.clone(),
+            expires_at: now + duration_secs,
+            owner_npub: requester_pubkey.to_string(),
+        };
+        info!(
+            "Reserved standby slot for workload_id={} (index {}/{}, expires at {})",
+            workload_id, index, count, slot.expires_at
+        );
+        standby_slots.lock().await.insert(workload_id.clone(), slot);
+
+        // Send a structured "standby reserved" AccessDetails so the
+        // consumer-side coordinator can confirm the reservation
+        // landed. Reuse AccessDetailsContent's shape with a
+        // distinguishing instructions block; adding a new
+        // dedicated content type would be a wire-schema bump for
+        // a single edge case.
+        let expires_dt =
+            chrono::DateTime::from_timestamp((now + duration_secs) as i64, 0).unwrap_or_default();
+        let details = AccessDetailsContent {
+            pod_npub: format!("standby-slot-{}", workload_id),
+            node_port: 0, // No live container yet; 0 signals "reserved, not running"
+            expires_at: expires_dt.to_rfc3339(),
+            cpu_millicores: spec.cpu_millicores,
+            memory_mb: spec.memory_mb,
+            pod_spec_name: spec.name.clone(),
+            pod_spec_description: spec.description.clone(),
+            instructions: vec![
+                format!(
+                    "🛏️  Standby slot reserved (index {}/{} for workload {}).",
+                    index, count, workload_id
+                ),
+                format!(
+                    "Will promote on LeaseRevocation event from primary {}.",
+                    request.primary_npub.as_deref().unwrap_or("(unset)")
+                ),
+                format!(
+                    "Expected promotion delay: {} seconds (index * 30s backoff).",
+                    index * 30
+                ),
+            ],
+            host_address: config.public_ip.clone(),
+            template_ports: Vec::new(),
+        };
+        nostr
+            .send_access_details_private_message(requester_pubkey, details, message_type)
+            .await?;
+        return Ok(());
+    }
+
     debug!("Calling backend.create_container for workload {}", id);
     if let Err(e) = backend.create_container(&container_config).await {
         let err_msg = format!("Backend failed to create workload: {}", e);
@@ -1006,6 +1221,10 @@ async fn handle_spawn_request(
         replication,
         restart_policy: crate::durable_workload::RestartPolicy::default(),
         state_uri: None,
+        // Carried through from the spawn request so the orchestrator
+        // can publish revocations addressed to the consumer's UUID
+        // (which standbys key their slot table by).
+        consumer_workload_id: request.workload_id.clone().filter(|s| !s.is_empty()),
     };
 
     workloads.lock().await.insert(id, workload.clone());
@@ -1499,4 +1718,232 @@ pub fn save_config(path: &str, config: &ProviderConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config)?;
     std::fs::write(path, content).context(format!("Failed to write config file: {}", path))?;
     Ok(())
+}
+
+/// Per-standby ordered backoff window. Standby at index `i` waits
+/// `i * STANDBY_PROMOTION_DELAY_SECS` after observing a revocation
+/// before spawning the container locally. Single-writer guarantee
+/// is best-effort: if standby 0 promotes within ~30s, standby 1
+/// will NOT see a fresh heartbeat by the time its window opens
+/// only if heartbeat cadence is > 30s. We accept a brief two-Live
+/// window as a v1 trade-off for the workloads where warm-standby
+/// makes sense (relays — idempotent; databases — needs deeper
+/// coordination than v1 ships).
+const STANDBY_PROMOTION_DELAY_SECS: u64 = 30;
+
+/// Self-role detection for a warm-standby spawn. Reads the request's
+/// `replication.standby_providers` and `primary_npub`, compares to
+/// `self_npub`, returns the role this provider should take.
+///
+/// Returns `WarmStandbyRole::Primary` for non-WarmStandby requests
+/// too — which is correct: in the single-replication path the
+/// "primary" is just "the one provider running this workload."
+fn compute_warm_standby_role(
+    self_npub: &str,
+    request: &EncryptedSpawnPodRequest,
+) -> WarmStandbyRole {
+    use crate::durable_workload::ReplicationMode;
+    match request.replication.as_ref() {
+        Some(ReplicationMode::WarmStandby { standby_providers }) => {
+            let primary = request.primary_npub.as_deref().unwrap_or("");
+            warm_standby_role(self_npub, primary, standby_providers)
+        }
+        // No-replication / Checkpointed → there's only one provider
+        // running this; treat it as primary so the existing flow
+        // is unchanged.
+        _ => WarmStandbyRole::Primary,
+    }
+}
+
+/// Spawn the standby promotion task. Runs on its own tokio task so
+/// the request handler returns immediately. Sleeps for the
+/// per-standby ordered backoff, then attempts the local spawn.
+/// Pre-emption check is left for v2 — v1 relies on the backoff
+/// window being short enough that standby 0 publishes heartbeats
+/// before standby 1's window opens (heartbeat cadence is 60s by
+/// default, backoff window is 30s — borderline; document it).
+fn schedule_standby_promotion(
+    backend: Arc<dyn ComputeBackend>,
+    workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
+    state_machine: Arc<Mutex<WorkloadStateMachine>>,
+    standby_slots: Arc<Mutex<HashMap<String, StandbySlot>>>,
+    slot: StandbySlot,
+) {
+    let delay_secs = (slot.standby_index as u64).saturating_mul(STANDBY_PROMOTION_DELAY_SECS);
+    let workload_id = slot.workload_id.clone();
+    let standby_index = slot.standby_index;
+    info!(
+        "Scheduling standby promotion for workload {} after {}s backoff (standby index {})",
+        workload_id, delay_secs, standby_index
+    );
+    tokio::spawn(async move {
+        if delay_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
+
+        // Re-check the slot is still ours to claim. If a lower-
+        // indexed standby already promoted, it should have removed
+        // its slot — but each standby manages only its OWN slots,
+        // not its peers'. So this check only guards against double-
+        // firing on the same provider (e.g. duplicate revocation
+        // events from multiple relays).
+        let still_present = {
+            let mut slots = standby_slots.lock().await;
+            slots.remove(&workload_id)
+        };
+        let slot = match still_present {
+            Some(s) => s,
+            None => {
+                debug!(
+                    "Standby slot for workload {} already drained; skipping promotion",
+                    workload_id
+                );
+                return;
+            }
+        };
+
+        info!(
+            "Promoting standby slot {} → primary (vmid {})",
+            slot.workload_id, slot.container_config.id
+        );
+        if let Err(e) = backend.create_container(&slot.container_config).await {
+            error!(
+                "Standby promotion failed for workload {}: backend error: {}",
+                slot.workload_id, e
+            );
+            // Re-insert the slot so a later revocation retry could
+            // pick it up. Operator-level alerting is left to the
+            // logs; the consumer-facing observability story for
+            // failed promotion is a follow-up.
+            standby_slots
+                .lock()
+                .await
+                .insert(slot.workload_id.clone(), slot);
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let workload = WorkloadInfo {
+            vmid: slot.container_config.id,
+            workload_type: "lxc".to_string(),
+            spec_id: slot.spec_id.clone(),
+            created_at: now,
+            expires_at: slot.expires_at,
+            owner_npub: slot.owner_npub.clone(),
+            consumer_workload_id: Some(slot.workload_id.clone()),
+            // After promotion this provider IS the primary — record
+            // replication as None so the orchestrator doesn't try
+            // to re-emit a revocation if quorum is lost again
+            // (we'd need a fresh standby topology for that, which
+            // the consumer hasn't provided post-promotion).
+            replication: crate::durable_workload::ReplicationMode::None,
+            restart_policy: crate::durable_workload::RestartPolicy::default(),
+            state_uri: None,
+        };
+        workloads
+            .lock()
+            .await
+            .insert(slot.container_config.id, workload.clone());
+
+        state_machine
+            .lock()
+            .await
+            .track(crate::durable_workload::DurableWorkload {
+                workload_id: slot.container_config.id,
+                provider_npub: String::new(), // filled by orchestrator on first heartbeat tick
+                state: crate::durable_workload::WorkloadState::Provisioning { since: now },
+                replication: workload.replication.clone(),
+                restart_policy: workload.restart_policy,
+                state_uri: workload.state_uri.clone(),
+                created_at: now,
+                expires_at: workload.expires_at,
+            });
+
+        info!(
+            "Standby promotion complete: workload {} now running locally (vmid {})",
+            slot.workload_id, slot.container_config.id
+        );
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durable_workload::ReplicationMode;
+
+    fn req_with(
+        replication: Option<ReplicationMode>,
+        primary_npub: Option<&str>,
+    ) -> EncryptedSpawnPodRequest {
+        EncryptedSpawnPodRequest {
+            cashu_token: "tok".to_string(),
+            pod_spec_id: Some("basic".to_string()),
+            pod_image: "ubuntu:22.04".to_string(),
+            ssh_username: "u".to_string(),
+            ssh_password: "p".to_string(),
+            template_slug: None,
+            replication,
+            primary_npub: primary_npub.map(|s| s.to_string()),
+            workload_id: Some("wid-test".to_string()),
+        }
+    }
+
+    #[test]
+    fn role_is_primary_for_non_warm_standby() {
+        // No-replication request → role is Primary regardless of
+        // self_npub (existing single-provider behavior unchanged).
+        let r = compute_warm_standby_role("npub1self", &req_with(None, None));
+        assert_eq!(r, WarmStandbyRole::Primary);
+
+        let r = compute_warm_standby_role(
+            "npub1self",
+            &req_with(Some(ReplicationMode::Checkpointed), None),
+        );
+        assert_eq!(r, WarmStandbyRole::Primary);
+    }
+
+    #[test]
+    fn role_is_primary_when_self_is_designated_primary() {
+        let r = compute_warm_standby_role(
+            "npub1primary",
+            &req_with(
+                Some(ReplicationMode::WarmStandby {
+                    standby_providers: vec!["npub1b".to_string(), "npub1c".to_string()],
+                }),
+                Some("npub1primary"),
+            ),
+        );
+        assert_eq!(r, WarmStandbyRole::Primary);
+    }
+
+    #[test]
+    fn role_is_standby_with_correct_index_when_self_in_list() {
+        let r = compute_warm_standby_role(
+            "npub1c",
+            &req_with(
+                Some(ReplicationMode::WarmStandby {
+                    standby_providers: vec!["npub1b".to_string(), "npub1c".to_string()],
+                }),
+                Some("npub1primary"),
+            ),
+        );
+        assert_eq!(r, WarmStandbyRole::Standby { index: 1, count: 2 });
+    }
+
+    #[test]
+    fn role_is_not_addressed_when_self_unknown_to_topology() {
+        let r = compute_warm_standby_role(
+            "npub1stranger",
+            &req_with(
+                Some(ReplicationMode::WarmStandby {
+                    standby_providers: vec!["npub1b".to_string(), "npub1c".to_string()],
+                }),
+                Some("npub1primary"),
+            ),
+        );
+        assert_eq!(r, WarmStandbyRole::NotAddressed);
+    }
 }

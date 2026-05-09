@@ -258,6 +258,13 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         template_slug: Some(template_slug.to_string()),
         replication: replication_str,
         standby: None,
+        // Deploy doesn't yet collect a primary/standby topology
+        // (see the warning printed above when replication != none).
+        // The full warm-standby flow is `paygress-cli spawn` with
+        // explicit --primary-npub / --workload-id, called once per
+        // provider in the set.
+        primary_npub: None,
+        workload_id: None,
     };
     spawn::execute(spawn_args, verbose).await
 }
