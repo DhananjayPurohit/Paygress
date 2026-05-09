@@ -54,11 +54,11 @@ thiserror = "1"
 rand = "0.8"
 
 # Cashu dependencies
-cdk-redb = "0.9.1"
-cdk = "0.9.0"
+cdk-redb = "0.14"
+cdk = { version = "0.14", default-features = false, features = ["wallet"] }
 
 # Nostr dependencies
-nostr-sdk = { version = "0.33", features = ["nip04", "nip44", "nip59"] }
+nostr-sdk = { version = "0.43", features = ["nip04", "nip44", "nip59"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

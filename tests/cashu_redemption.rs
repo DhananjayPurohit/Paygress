@@ -106,7 +106,12 @@ impl MintRedeemer for MockRedeemer {
         use std::str::FromStr;
         let token = cdk::nuts::Token::from_str(token_str)
             .map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
-        let total: u64 = token.proofs().iter().map(|p| u64::from(p.amount)).sum();
+        // cdk 0.14: Token::value() returns the proof-amount sum without
+        // requiring keyset metadata. We're not redeeming, just summing.
+        let amount = token
+            .value()
+            .map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
+        let total: u64 = amount.into();
         let unit = token.unit().unwrap_or(cdk::nuts::CurrencyUnit::Sat);
         let msats = match unit {
             cdk::nuts::CurrencyUnit::Sat => total * 1000,

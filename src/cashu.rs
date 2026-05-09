@@ -23,6 +23,7 @@ use cdk::cdk_database::{Error as DbError, WalletDatabase};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{CurrencyUnit, Token};
 use cdk::wallet::{ReceiveOptions, Wallet};
+use cdk::Amount;
 use tokio::sync::Mutex;
 
 const MSAT_PER_SAT: u64 = 1000;
@@ -125,14 +126,14 @@ pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
 /// 32-byte seed.
 pub struct CdkRedeemer {
     localstore: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync>,
-    seed: [u8; 32],
+    seed: [u8; 64],
     wallets: Mutex<HashMap<(String, CurrencyUnit), Arc<Wallet>>>,
 }
 
 impl CdkRedeemer {
     pub fn new(
         localstore: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync>,
-        seed: [u8; 32],
+        seed: [u8; 64],
     ) -> Self {
         Self {
             localstore,
@@ -155,7 +156,7 @@ impl CdkRedeemer {
             &mint_url.to_string(),
             unit,
             self.localstore.clone(),
-            &self.seed,
+            self.seed,
             None,
         )
         .map_err(|e| RedeemError::MintError(format!("wallet construction failed: {}", e)))?;
@@ -214,14 +215,20 @@ fn map_cdk_error(e: cdk::Error) -> RedeemError {
     }
 }
 
-/// Derive a 32-byte wallet seed from the provider's Nostr private key.
-/// Uses SHA-256 with a domain separator so the wallet seed is distinct
-/// from anything else derived from the same key, and stable across
-/// process restarts.
-pub fn derive_seed_from_nostr_key(nostr_private_key: &str) -> [u8; 32] {
+/// Derive a 64-byte wallet seed from the provider's Nostr private key.
+/// cdk's `Wallet::new` requires `[u8; 64]` (BIP-39-style seed length).
+/// We hash twice with distinct domain separators so the two halves
+/// are independent.
+pub fn derive_seed_from_nostr_key(nostr_private_key: &str) -> [u8; 64] {
     use cdk::secp256k1::hashes::{sha256, Hash};
-    let preimage = format!("paygress-cashu-wallet-v1:{}", nostr_private_key);
-    sha256::Hash::hash(preimage.as_bytes()).to_byte_array()
+    let h1 =
+        sha256::Hash::hash(format!("paygress-cashu-wallet-v1:a:{}", nostr_private_key).as_bytes());
+    let h2 =
+        sha256::Hash::hash(format!("paygress-cashu-wallet-v1:b:{}", nostr_private_key).as_bytes());
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&h1.to_byte_array());
+    out[32..].copy_from_slice(&h2.to_byte_array());
+    out
 }
 
 /// **Legacy face-value parser.** Returns the sum of `proof.amount` from
@@ -241,18 +248,16 @@ pub async fn extract_token_value(token_str: &str) -> anyhow::Result<u64> {
     let token = Token::from_str(token_str)
         .map_err(|e| anyhow::anyhow!("Failed to decode Cashu token: {}", e))?;
 
-    if token.proofs().is_empty() {
+    // cdk 0.14 made `Token::proofs(&keysets)` require keyset metadata,
+    // but `Token::value()` still works without — it's just the sum of
+    // proof amounts. That's exactly what this legacy function does.
+    let amount: Amount = token
+        .value()
+        .map_err(|e| anyhow::anyhow!("Failed to compute token value: {}", e))?;
+    let total_amount: u64 = amount.into();
+    if total_amount == 0 {
         return Err(anyhow::anyhow!("Token has no proofs"));
     }
-
-    let total_amount: u64 = token
-        .proofs()
-        .iter()
-        .map(|p| {
-            let amt: u64 = p.amount.into();
-            amt
-        })
-        .sum();
 
     let total_amount_msats: u64 = match token.unit().unwrap_or(CurrencyUnit::Sat) {
         CurrencyUnit::Sat => total_amount * MSAT_PER_SAT,
