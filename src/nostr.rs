@@ -544,6 +544,24 @@ pub struct OfferEventContent {
     pub pod_specs: Vec<PodSpec>, // Multiple pod specifications offered
 }
 
+/// One workload-port that a template-spawned container exposes to the
+/// consumer. Distinct from `AccessDetailsContent.node_port` (the SSH
+/// forwarding port). Empty for non-template spawns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateAccessPort {
+    /// Host port the consumer connects to.
+    pub host_port: u16,
+    /// Container-internal port (informational; for the consumer to
+    /// understand what's running).
+    pub container_port: u16,
+    /// Wire protocol (`tcp`, `http`, `ws`, `bitcoin-rpc`, ...).
+    pub protocol: String,
+    /// Human-readable label from the template definition
+    /// (e.g. `relay-ws`, `ollama-http`, `rpc`). Lets clients route
+    /// traffic by role rather than guessing port-by-port.
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessDetailsContent {
     pub pod_npub: String,             // Pod's NPUB identifier
@@ -554,6 +572,19 @@ pub struct AccessDetailsContent {
     pub pod_spec_name: String,        // Human-readable spec name
     pub pod_spec_description: String, // Spec description
     pub instructions: Vec<String>,    // SSH connection instructions
+
+    /// Host address the consumer connects to. Same string that
+    /// appears in the SSH instruction; promoted to a structured
+    /// field so programmatic clients don't have to scrape the
+    /// instruction strings.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host_address: String,
+
+    /// Workload-specific ports published by a template spawn.
+    /// Empty for non-template (legacy) spawns. Old clients without
+    /// this field continue to deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub template_ports: Vec<TemplateAccessPort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

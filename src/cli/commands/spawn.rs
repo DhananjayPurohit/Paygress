@@ -274,6 +274,9 @@ async fn execute_nostr_spawn(
                 println!("{}", "Workload Provisioned Successfully!".green().bold());
                 println!();
                 println!("  {}   {}", "Pod ID:".bold(), access.pod_npub.cyan());
+                if !access.host_address.is_empty() {
+                    println!("  {}   {}", "Host:".bold(), access.host_address.cyan());
+                }
                 println!("  {}   {}", "Expires:".bold(), access.expires_at.yellow());
                 println!(
                     "  {}   {} vCPU, {} MB RAM",
@@ -281,6 +284,20 @@ async fn execute_nostr_spawn(
                     access.cpu_millicores / 1000,
                     access.memory_mb
                 );
+                if !access.template_ports.is_empty() {
+                    println!();
+                    println!("{}", "Workload Ports:".bold());
+                    for p in &access.template_ports {
+                        println!(
+                            "  {} ({}) → {}://{}:{}",
+                            p.label.cyan(),
+                            p.protocol,
+                            p.protocol,
+                            access.host_address,
+                            p.host_port
+                        );
+                    }
+                }
                 println!();
                 println!("{}", "Connection Instructions:".bold());
                 for inst in access.instructions {
