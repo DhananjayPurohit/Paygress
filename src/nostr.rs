@@ -630,6 +630,20 @@ pub struct EncryptedSpawnPodRequest {
     /// (`#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_slug: Option<String>,
+
+    /// Replication mode requested by the consumer (Unit 5 wiring
+    /// completion). Old clients that don't set this field default to
+    /// `ReplicationMode::None` — same shape as before, no behavior
+    /// change for unspecified spawns.
+    ///
+    /// `WarmStandby { standby_providers }` is the load-bearing
+    /// variant: the consumer sends the SAME spawn request to every
+    /// provider in the standby set; each provider determines its own
+    /// role (primary if it is not in the standby list, standby
+    /// otherwise) and the orchestrator coordinates failover via the
+    /// `LeaseRevocation` event published by #34's wiring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<crate::durable_workload::ReplicationMode>,
 }
 
 // NEW: Encrypted top-up request structure
