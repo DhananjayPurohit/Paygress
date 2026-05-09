@@ -17,12 +17,16 @@ use crate::cashu::{
 };
 use crate::compute::{ComputeBackend, ContainerConfig, PortMapping};
 use crate::docker::DockerBackend;
+use crate::durable_workload::{
+    DurableWorkload, HeartbeatObservation, QuorumConfig, StateMachineEvent, WorkloadState,
+    WorkloadStateMachine,
+};
 use crate::lxd::LxdBackend;
 use crate::nostr::{
     parse_private_message_content, AccessDetailsContent, CapacityInfo, EncryptedSpawnPodRequest,
-    EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent, NostrRelaySubscriber,
-    PodSpec, PrivateRequest, ProviderOfferContent, RelayConfig, StatusRequestContent,
-    StatusResponseContent, TopUpResponseContent,
+    EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent, LeaseRevocationContent,
+    NostrRelaySubscriber, PodSpec, PrivateRequest, ProviderOfferContent, RelayConfig,
+    StatusRequestContent, StatusResponseContent, TopUpResponseContent,
 };
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 use crate::templates::{TemplateDefinition, TemplateName};
@@ -153,6 +157,25 @@ pub struct WorkloadInfo {
     pub created_at: u64,
     pub expires_at: u64,
     pub owner_npub: String,
+
+    /// Replication mode chosen at spawn time. `None` for the default
+    /// single-container path (no failover); `WarmStandby` registers a
+    /// list of standby providers so the orchestrator emits a
+    /// `LeaseRevocation` on local eviction. `Checkpointed` is reserved
+    /// for Unit 6 (consumer-side respawn from Blossom checkpoint).
+    #[serde(default)]
+    pub replication: crate::durable_workload::ReplicationMode,
+
+    /// Restart policy applied when the workload is locally evicted
+    /// without a warm-standby. Default: `OnFailure { max_attempts: 3 }`.
+    #[serde(default)]
+    pub restart_policy: crate::durable_workload::RestartPolicy,
+
+    /// Optional Blossom URI of the latest published checkpoint for
+    /// this workload. Populated by Unit 6 (checkpoint pipeline);
+    /// included in revocation events so a standby can restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_uri: Option<String>,
 }
 
 /// Provider service that manages the node
@@ -163,6 +186,19 @@ pub struct ProviderService {
     redeemer: Arc<dyn MintRedeemer>,
     active_workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: Arc<Mutex<ProviderStats>>,
+
+    /// Workload state machine (Unit 5 wiring). Keyed by vmid; each
+    /// entry tracks the lifecycle of one local workload through
+    /// `Provisioning → Live → Suspect → Evicted/Respawning/Failed`.
+    /// The orchestrator loop ticks this against the buffered
+    /// `HeartbeatObservation`s and acts on emitted events.
+    state_machine: Arc<Mutex<WorkloadStateMachine>>,
+
+    /// Buffered heartbeat observations awaiting the next orchestrator
+    /// tick. Filled by the heartbeat loop after each publish (one
+    /// observation per relay that ACK'd), drained on each
+    /// orchestrator iteration.
+    observation_buffer: Arc<Mutex<Vec<HeartbeatObservation>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -235,6 +271,10 @@ impl ProviderService {
                 total_jobs_completed: 0,
                 uptime_start: now,
             })),
+            state_machine: Arc::new(Mutex::new(WorkloadStateMachine::new(
+                QuorumConfig::default(),
+            ))),
+            observation_buffer: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -252,7 +292,8 @@ impl ProviderService {
         // Publish initial offer
         self.publish_offer().await?;
 
-        // Run heartbeat loop and request listener concurrently
+        // Run heartbeat loop, request listener, cleanup loop, and
+        // orchestrator loop (Unit 5 wiring) concurrently.
         tokio::select! {
             result = self.heartbeat_loop() => {
                 error!("Heartbeat loop exited: {:?}", result);
@@ -264,6 +305,10 @@ impl ProviderService {
             }
             result = self.cleanup_loop() => {
                 error!("Cleanup loop exited: {:?}", result);
+                result
+            }
+            result = self.orchestrator_loop() => {
+                error!("Orchestrator loop exited: {:?}", result);
                 result
             }
         }
@@ -339,7 +384,27 @@ impl ProviderService {
             version: crate::nostr::SCHEMA_VERSION,
         };
 
-        self.nostr.publish_heartbeat(heartbeat).await?;
+        let (_event_id, accepting_relays) = self.nostr.publish_heartbeat(heartbeat).await?;
+
+        // Push one HeartbeatObservation per accepting relay into the
+        // shared buffer. The orchestrator loop drains these on its
+        // next tick to drive the workload state machine. Observations
+        // use `now` for both `seen_at` and `event_timestamp` because
+        // we just published; if a relay didn't ACK we don't fabricate
+        // an observation for it.
+        if !accepting_relays.is_empty() {
+            let provider_npub = self.get_npub();
+            let mut buf = self.observation_buffer.lock().await;
+            for relay_url in accepting_relays {
+                buf.push(HeartbeatObservation {
+                    provider_npub: provider_npub.clone(),
+                    relay_url,
+                    seen_at: now,
+                    event_timestamp: now,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -354,6 +419,7 @@ impl ProviderService {
         let redeemer = self.redeemer.clone();
         let workloads = self.active_workloads.clone();
         let stats = self.stats.clone();
+        let state_machine = self.state_machine.clone();
 
         self.nostr
             .subscribe_to_pod_events(move |event| {
@@ -363,6 +429,7 @@ impl ProviderService {
                 let redeemer = redeemer.clone();
                 let workloads = workloads.clone();
                 let stats = stats.clone();
+                let state_machine = state_machine.clone();
 
                 Box::pin(async move {
                     let my_pubkey = nostr.public_key().to_hex();
@@ -408,6 +475,7 @@ impl ProviderService {
                                 redeemer.as_ref(),
                                 &workloads,
                                 &stats,
+                                &state_machine,
                                 &event.pubkey,
                                 &event.message_type,
                                 spawn_req,
@@ -457,6 +525,141 @@ impl ProviderService {
         Ok(())
     }
 
+    /// Orchestrator loop (Unit 5 wiring).
+    ///
+    /// Every 15s, drain the observation buffer, advance the workload
+    /// state machine, and act on each emitted `StateMachineEvent`.
+    /// 15s is chosen to be much shorter than `t1=120s` and `t2=300s`
+    /// so transitions are detected promptly, but not so short that
+    /// idle providers churn — the underlying state machine is a pure
+    /// function and the work is bounded by the number of tracked
+    /// workloads.
+    async fn orchestrator_loop(&self) -> Result<()> {
+        let interval = tokio::time::Duration::from_secs(15);
+        info!("Orchestrator loop starting (cadence: 15s)");
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+
+            // Drain buffered observations. We pass them to the state
+            // machine and clear the buffer so the next tick only sees
+            // newer observations — a stale ACK older than `stale_secs`
+            // would already be ignored by the state machine, but
+            // draining keeps the buffer bounded regardless.
+            let observations: Vec<HeartbeatObservation> = {
+                let mut buf = self.observation_buffer.lock().await;
+                std::mem::take(&mut *buf)
+            };
+
+            // Tick the state machine. Holds the state machine lock
+            // across the tick (a short, pure operation).
+            let events = {
+                let mut sm = self.state_machine.lock().await;
+                sm.tick(now, &observations)
+            };
+
+            if events.is_empty() {
+                continue;
+            }
+
+            for event in events {
+                self.handle_state_machine_event(event, now).await;
+            }
+        }
+    }
+
+    /// Translate one `StateMachineEvent` into provider actions.
+    /// Logged regardless; events that require I/O (revocation publish,
+    /// respawn) are dispatched to the appropriate subsystem.
+    async fn handle_state_machine_event(&self, event: StateMachineEvent, now: u64) {
+        match event {
+            StateMachineEvent::EnteredLive { workload_id } => {
+                info!("Workload {} entered Live", workload_id);
+            }
+            StateMachineEvent::EnteredSuspect { workload_id } => {
+                warn!(
+                    "Workload {} entered Suspect (heartbeat quorum lost)",
+                    workload_id
+                );
+            }
+            StateMachineEvent::Evicted {
+                workload_id,
+                reason,
+            } => {
+                error!("Workload {} evicted: {}", workload_id, reason);
+            }
+            StateMachineEvent::PublishLeaseRevocation {
+                workload_id,
+                standby_providers,
+            } => {
+                let state_uri = self
+                    .active_workloads
+                    .lock()
+                    .await
+                    .get(&workload_id)
+                    .and_then(|w| w.state_uri.clone());
+                let revocation = LeaseRevocationContent {
+                    workload_id,
+                    primary_provider_npub: self.get_npub(),
+                    standby_providers: standby_providers.clone(),
+                    reason: "heartbeat-quorum-lost-past-t2".to_string(),
+                    revoked_at: now,
+                    state_uri,
+                    version: crate::nostr::SCHEMA_VERSION,
+                };
+                match self.nostr.publish_lease_revocation(revocation).await {
+                    Ok(event_id) => info!(
+                        "Published lease revocation for workload {} to {} standby(s): {}",
+                        workload_id,
+                        standby_providers.len(),
+                        event_id
+                    ),
+                    Err(e) => error!(
+                        "Failed to publish lease revocation for workload {}: {}",
+                        workload_id, e
+                    ),
+                }
+            }
+            StateMachineEvent::AttemptRespawn {
+                workload_id,
+                attempt,
+            } => {
+                info!(
+                    "Attempting respawn of workload {} (attempt {})",
+                    workload_id, attempt
+                );
+                // The full respawn path requires reconstructing the
+                // ContainerConfig from the original spawn, which lives
+                // in active_workloads only as `WorkloadInfo` (no image
+                // / port mapping retained). Capturing the original
+                // ContainerConfig is a follow-up. For now we record
+                // the failure so the state machine can retry / fail
+                // out deterministically rather than hanging in
+                // Respawning forever.
+                let mut sm = self.state_machine.lock().await;
+                sm.notify_respawn_failed(
+                    workload_id,
+                    "respawn handler not yet implemented (follow-up)",
+                );
+            }
+            StateMachineEvent::Failed {
+                workload_id,
+                reason,
+            } => {
+                error!("Workload {} marked Failed: {}", workload_id, reason);
+                // Drop from active_workloads so cleanup_loop doesn't
+                // also try to delete a container that was never
+                // successfully respawned.
+                let mut wl = self.active_workloads.lock().await;
+                wl.remove(&workload_id);
+            }
+        }
+    }
+
     /// Cleanup expired workloads
     async fn cleanup_loop(&self) -> Result<()> {
         let interval = tokio::time::Duration::from_secs(30);
@@ -484,6 +687,13 @@ impl ProviderService {
                         Ok(_) => self.backend.delete_container(vmid).await,
                         Err(e) => Err(e),
                     };
+
+                    // Untrack from the state machine regardless of
+                    // backend stop/delete success — the lease is over,
+                    // and we don't want the orchestrator continuing
+                    // to drive transitions on a workload nobody is
+                    // serving anymore.
+                    self.state_machine.lock().await.untrack(vmid);
 
                     match result {
                         Ok(_) => {
@@ -515,6 +725,7 @@ async fn handle_spawn_request(
     redeemer: &dyn MintRedeemer,
     workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     stats: &Arc<Mutex<ProviderStats>>,
+    state_machine: &Arc<Mutex<WorkloadStateMachine>>,
     requester_pubkey: &str,
     message_type: &str,
     request: EncryptedSpawnPodRequest,
@@ -742,9 +953,31 @@ async fn handle_spawn_request(
         created_at: now,
         expires_at: now + duration_secs,
         owner_npub: requester_pubkey.to_string(),
+        // Replication / restart-policy / state-uri default to the
+        // safe single-container values. The Nostr request schema
+        // doesn't yet carry replication preferences (would be a
+        // breaking change for consumers); a follow-up will add an
+        // optional field once Unit 5 wiring proves out end-to-end.
+        replication: crate::durable_workload::ReplicationMode::default(),
+        restart_policy: crate::durable_workload::RestartPolicy::default(),
+        state_uri: None,
     };
 
     workloads.lock().await.insert(id, workload.clone());
+
+    // Register the workload with the state machine (Unit 5 wiring).
+    // Starts in `Provisioning`; the orchestrator promotes it to
+    // `Live` on the first observation tick that sees quorum.
+    state_machine.lock().await.track(DurableWorkload {
+        workload_id: id,
+        provider_npub: nostr.get_service_public_key(),
+        state: WorkloadState::Provisioning { since: now },
+        replication: workload.replication.clone(),
+        restart_policy: workload.restart_policy,
+        state_uri: workload.state_uri.clone(),
+        created_at: now,
+        expires_at: workload.expires_at,
+    });
 
     // Update stats
     {
