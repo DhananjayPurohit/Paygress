@@ -139,6 +139,7 @@ fn container_config_carries_template_data() {
             .map(|s| s.to_string())
             .collect(),
         data_path: def.data_path.map(|p| p.to_string()),
+        volume_encryption_key: None,
     };
     assert_eq!(cfg.template_ports.len(), 1);
     assert_eq!(cfg.template_ports[0].container_port, 7777);

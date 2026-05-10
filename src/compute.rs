@@ -61,6 +61,23 @@ pub struct ContainerConfig {
     /// Docker backend mounts a vmid-scoped volume there.
     /// `None` = stateless (no volume created).
     pub data_path: Option<String>,
+
+    /// Optional 32-byte LUKS key for the persistent data volume.
+    /// When set (Phase 2 of consumer-encrypted-volumes), the
+    /// `DockerBackend` creates a LUKS-on-loop file instead of a
+    /// plain Docker named volume; the key is fed to `cryptsetup
+    /// luksFormat`/`luksOpen` over stdin and never persisted to
+    /// disk. On `delete_container` the LUKS header is erased
+    /// (`cryptsetup luksErase`) so the keyslots are unrecoverable
+    /// even if the operator forensically extracts the underlying
+    /// file.
+    ///
+    /// Provider populates this from
+    /// `EncryptedSpawnPodRequest.volume_encryption.decoded_key()`
+    /// when present; `None` means a plain volume (today's default).
+    /// `data_path: None` makes this field a no-op (stateless
+    /// workloads have nothing to encrypt).
+    pub volume_encryption_key: Option<[u8; 32]>,
 }
 
 #[async_trait]
