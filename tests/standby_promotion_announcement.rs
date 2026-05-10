@@ -11,8 +11,8 @@ use paygress::nostr::{StandbyPromotionAnnouncementContent, KIND_STANDBY_PROMOTIO
 fn sample() -> StandbyPromotionAnnouncementContent {
     StandbyPromotionAnnouncementContent {
         workload_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-        new_primary_npub:
-            "npub1hyr9m7zeegr98w4e07gvdpqrk25jfp3vku8029u8pcxsc48dq6nqxtwztv".to_string(),
+        new_primary_npub: "npub1hyr9m7zeegr98w4e07gvdpqrk25jfp3vku8029u8pcxsc48dq6nqxtwztv"
+            .to_string(),
         promoted_at: 1_780_000_000,
         version: paygress::nostr::SCHEMA_VERSION,
     }
@@ -62,8 +62,8 @@ fn unexpected_extra_fields_are_ignored() {
         "previous_primary_npub": "npub1old",
         "replication_topology": {"factor": 3},
     });
-    let parsed: StandbyPromotionAnnouncementContent =
-        serde_json::from_value(with_extra).expect("forward-compat extra fields must not break parse");
+    let parsed: StandbyPromotionAnnouncementContent = serde_json::from_value(with_extra)
+        .expect("forward-compat extra fields must not break parse");
     assert_eq!(parsed.workload_id, "wid-future");
 }
 
