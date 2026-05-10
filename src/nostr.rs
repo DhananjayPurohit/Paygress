@@ -483,10 +483,26 @@ impl NostrRelaySubscriber {
         let receiver_keys = self.keys.clone();
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
 
-        // Subscribe to messages sent TO us
+        // Subscribe to messages sent TO us. Constrain to events
+        // published AFTER subscription start: relays deliver
+        // historical events matching a subscription filter alongside
+        // new ones, so without `since` we'd match old DMs from prior
+        // sessions (e.g. an `AccessDetailsContent` for a different
+        // workload_id from yesterday's test) before the actual
+        // response to the spawn we just sent. The 60s back-off
+        // accommodates clock skew between consumer and relays —
+        // relays MAY reject `since` values too far in the future,
+        // and a small lookback covers the case where the provider
+        // has already responded by the time we subscribe.
+        let subscribe_since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(60);
         let filter = Filter::new()
             .pubkeys(vec![receiver_pk])
-            .kinds(vec![Kind::EncryptedDirectMessage, Kind::GiftWrap]);
+            .kinds(vec![Kind::EncryptedDirectMessage, Kind::GiftWrap])
+            .since(nostr_sdk::Timestamp::from_secs(subscribe_since));
 
         let _ = client.subscribe(filter, None).await;
 
