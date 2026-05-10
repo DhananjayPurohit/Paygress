@@ -26,6 +26,19 @@ fn generate_password(len: usize) -> String {
         .collect()
 }
 
+/// Decode a Nostr secret key (`nsec1...` bech32 or 64-hex) to its
+/// raw 32-byte form. Used by `--encrypt-volume` to feed the consumer's
+/// nsec into the volume-key KDF.
+fn nsec_to_bytes(nostr_key: &str) -> Result<[u8; 32]> {
+    use std::str::FromStr;
+    let secret = nostr_sdk::SecretKey::from_str(nostr_key)
+        .map_err(|e| anyhow::anyhow!("invalid nsec/hex secret key: {}", e))?;
+    Ok(secret
+        .as_secret_bytes()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("nostr_sdk::SecretKey returned a non-32-byte secret"))?)
+}
+
 #[derive(Args)]
 pub struct SpawnArgs {
     /// Provider npub (Nostr mode) - if omitted, uses --server for HTTP mode
@@ -99,6 +112,21 @@ pub struct SpawnArgs {
     /// their reserved slot by it on receipt.
     #[arg(long)]
     pub workload_id: Option<String>,
+
+    /// Encrypt the workload's persistent data volume with a key
+    /// derived from your nsec + workload-id. Defends against
+    /// post-eviction disk forensics, lazy host backups, co-tenant
+    /// attacks on shared storage, and cold-disk seizure. Does NOT
+    /// defend against a live host kernel reading process memory or
+    /// extracting the LUKS key from the keyring — that requires
+    /// a confidential VM (`isolation-level=attested-research-tier`).
+    ///
+    /// When set, `--workload-id` becomes effectively required (the
+    /// CLI generates a UUID if you don't supply one and prints it
+    /// so you can re-supply it on respawn / top-up to recover the
+    /// same key).
+    #[arg(long)]
+    pub encrypt_volume: bool,
 }
 
 /// Translate the `--replication` + `--standby` CLI flags into the
@@ -286,6 +314,7 @@ pub enum NostrSpawnOutcome {
 /// the interactive `spawn` command (via `execute_nostr_spawn`) and
 /// by the batch coordinator (`commands::batch`) which needs a
 /// machine-readable result per shard.
+#[allow(clippy::too_many_arguments)]
 pub async fn nostr_spawn_round_trip(
     provider_npub: &str,
     tier: &str,
@@ -297,6 +326,7 @@ pub async fn nostr_spawn_round_trip(
     replication: Option<paygress::durable_workload::ReplicationMode>,
     primary_npub: Option<String>,
     workload_id: Option<String>,
+    volume_encryption: Option<paygress::nostr::VolumeEncryption>,
     relays: Vec<String>,
     nostr_key: String,
     timeout_secs: u64,
@@ -328,6 +358,7 @@ pub async fn nostr_spawn_round_trip(
         replication,
         primary_npub,
         workload_id,
+        volume_encryption,
     };
     let request_json = serde_json::to_string(&request)?;
 
@@ -397,6 +428,32 @@ async fn execute_nostr_spawn(
             );
         }
     }
+
+    // Volume encryption: derive a 32-byte key from (nsec, workload_id)
+    // and ship it inside the encrypted spawn DM. The provider creates
+    // a LUKS-encrypted volume keyed by these bytes (Phase 2 of the
+    // confidentiality plan; today the provider parses but doesn't
+    // yet act). If the consumer didn't supply --workload-id, mint a
+    // UUIDv4 so the key is reproducible on respawn.
+    let mut effective_workload_id = args.workload_id.clone();
+    let volume_encryption = if args.encrypt_volume {
+        if effective_workload_id.is_none() {
+            let id = uuid::Uuid::new_v4().to_string();
+            println!(
+                "  {} {}",
+                "Generated workload-id (save this for respawn):".bold(),
+                id.cyan()
+            );
+            effective_workload_id = Some(id);
+        }
+        let workload_id = effective_workload_id.as_ref().unwrap();
+        let nsec_bytes = nsec_to_bytes(&nostr_key)?;
+        let key = paygress::volume_encryption::derive_volume_key(&nsec_bytes, workload_id);
+        Some(paygress::nostr::VolumeEncryption::v1(key))
+    } else {
+        None
+    };
+
     let outcome = nostr_spawn_round_trip(
         &provider_npub,
         &args.tier,
@@ -407,7 +464,8 @@ async fn execute_nostr_spawn(
         args.template_slug.clone(),
         replication,
         args.primary_npub.clone(),
-        args.workload_id.clone(),
+        effective_workload_id,
+        volume_encryption,
         relays,
         nostr_key,
         120,

@@ -24,6 +24,7 @@ pub mod observatory;
 pub mod reputation;
 pub mod stake;
 pub mod templates;
+pub mod volume_encryption;
 
 // Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;

@@ -21,6 +21,7 @@ fn spawn_request_omits_template_slug_when_none() {
         replication: None,
         primary_npub: None,
         workload_id: None,
+        volume_encryption: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(
@@ -41,6 +42,7 @@ fn spawn_request_includes_template_slug_when_set() {
         replication: None,
         primary_npub: None,
         workload_id: None,
+        volume_encryption: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains(r#""template_slug":"nostr-relay""#));

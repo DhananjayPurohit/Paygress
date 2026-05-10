@@ -22,6 +22,7 @@ fn sample_v1_warm_standby() -> EncryptedSpawnPodRequest {
         }),
         primary_npub: Some("npub1primary".to_string()),
         workload_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        volume_encryption: None,
     }
 }
 
