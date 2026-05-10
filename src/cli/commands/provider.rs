@@ -229,7 +229,7 @@ pub async fn execute(args: ProviderArgs, verbose: bool) -> Result<()> {
     }
 }
 
-async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
+async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
     println!("{}", "🔧 Paygress Provider Setup".blue().bold());
     println!("{}", "━".repeat(50).blue());
     println!();
@@ -659,7 +659,7 @@ async fn execute_setup_multi(args: SetupMultiArgs, _verbose: bool) -> Result<()>
     Ok(())
 }
 
-async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
+async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
     println!("{}", "🚀 Starting Paygress Provider".blue().bold());
     println!();
 

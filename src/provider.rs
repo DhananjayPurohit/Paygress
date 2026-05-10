@@ -629,7 +629,6 @@ impl ProviderService {
                         }
                         PrivateRequest::Status(status_req) => {
                             if let Err(e) = handle_status_request(
-                                backend.as_ref(),
                                 &config,
                                 &nostr,
                                 &workloads,
@@ -1875,7 +1874,6 @@ fn redeem_error_to_response(err: &RedeemError) -> (&'static str, String) {
 
 /// Handle a status request
 async fn handle_status_request(
-    backend: &dyn ComputeBackend,
     config: &ProviderConfig,
     nostr: &NostrRelaySubscriber,
     workloads: &Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
@@ -1918,19 +1916,7 @@ async fn handle_status_request(
         }
     };
 
-    // 2. Check backend status
-    let status_info = match backend.get_node_status().await {
-        Ok(s) => s,
-        Err(_) => crate::compute::NodeStatus {
-            cpu_usage: 0.0,
-            memory_used: 0,
-            memory_total: 0,
-            disk_used: 0,
-            disk_total: 0,
-        },
-    };
-
-    // 3. Prepare response
+    // 2. Prepare response
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();

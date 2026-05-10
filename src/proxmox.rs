@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Proxmox API client for container and VM management
 pub struct ProxmoxClient {
