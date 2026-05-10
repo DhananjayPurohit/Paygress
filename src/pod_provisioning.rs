@@ -122,6 +122,7 @@ impl PodProvisioningService {
             replication: None,
             primary_npub: None,
             workload_id: None,
+            volume_encryption: None,
         };
 
         // Use the existing logic from main.rs handle_spawn_pod_request

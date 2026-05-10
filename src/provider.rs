@@ -1888,6 +1888,7 @@ mod tests {
             replication,
             primary_npub: primary_npub.map(|s| s.to_string()),
             workload_id: Some("wid-test".to_string()),
+            volume_encryption: None,
         }
     }
 

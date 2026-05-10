@@ -700,6 +700,103 @@ pub struct EncryptedSpawnPodRequest {
     /// internally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_id: Option<String>,
+
+    /// Optional encryption key for the workload's persistent data
+    /// volume. When set, the provider creates a LUKS-encrypted
+    /// volume (instead of a plain one) for `template.data_path` and
+    /// destroys the volume header on tenancy end so post-eviction
+    /// disk forensics reveal only ciphertext.
+    ///
+    /// Threat model: protects against post-eviction snooping, lazy
+    /// host-operator backups, co-tenant attacks on shared storage,
+    /// and cold-disk forensics if the host is seized. Does NOT
+    /// protect against a live host with `CAP_SYS_PTRACE` reading
+    /// /proc/<pid>/mem or extracting the LUKS key from the kernel
+    /// keyring while the workload runs — that requires hardware
+    /// confidential VMs (SEV-SNP / TDX), which the
+    /// `attested-research-tier` `IsolationLevel` is reserved for.
+    ///
+    /// The key travels inside this Nostr DM, which is itself
+    /// NIP-04 / NIP-17 encrypted to the provider's pubkey, so it is
+    /// never visible on relays or in transit. The provider holds it
+    /// only in memory while the workload runs.
+    ///
+    /// Old clients that don't set this field get plain volumes —
+    /// same shape as before, no behavior change for unspecified
+    /// spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_encryption: Option<VolumeEncryption>,
+}
+
+/// Wire-format request to encrypt the workload's data volume.
+///
+/// The `key_b64` is a 32-byte symmetric key, base64-encoded
+/// (URL-safe, no padding). Provider feeds it to `cryptsetup
+/// luksFormat` as a passphrase (raw bytes, no hashing on top).
+///
+/// `algorithm` is a forward-compat tag so a future schema bump can
+/// introduce e.g. `xchacha20-poly1305` or hardware-attested keying
+/// without breaking existing requests. v1 supports `luks2-aes-xts`
+/// only; providers reject unknown algorithms with a structured
+/// `UnsupportedVolumeEncryption` error so old providers seeing a
+/// future-algorithm request fail loud rather than silently fall
+/// back to plain volumes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeEncryption {
+    /// Schema version. v1 = LUKS2 + AES-XTS-Plain64, key supplied
+    /// directly. Bump for new key-derivation flows (e.g. attested
+    /// key release from a TPM / TEE).
+    #[serde(default = "volume_encryption_default_version")]
+    pub version: u8,
+
+    /// Algorithm tag. v1 only accepts `luks2-aes-xts`.
+    pub algorithm: String,
+
+    /// 32-byte key, base64 (URL-safe, unpadded). Consumer derives
+    /// from a stable secret + workload_id so the same key recurs
+    /// on respawn / standby promotion (the standby decrypts the
+    /// checkpoint with it).
+    pub key_b64: String,
+}
+
+fn volume_encryption_default_version() -> u8 {
+    1
+}
+
+impl VolumeEncryption {
+    /// Algorithm tag for the v1 wire format. Spelled out so callers
+    /// don't need to know the LUKS internals.
+    pub const ALGORITHM_V1: &'static str = "luks2-aes-xts";
+    pub const VERSION_V1: u8 = 1;
+
+    /// Build a v1 VolumeEncryption from a raw 32-byte key.
+    pub fn v1(key: [u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        Self {
+            version: Self::VERSION_V1,
+            algorithm: Self::ALGORITHM_V1.to_string(),
+            key_b64: URL_SAFE_NO_PAD.encode(key),
+        }
+    }
+
+    /// Decode the base64 key back to raw bytes. Errors if the
+    /// payload is malformed or the wrong length for the declared
+    /// algorithm.
+    pub fn decoded_key(&self) -> Result<[u8; 32], anyhow::Error> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let bytes = URL_SAFE_NO_PAD
+            .decode(self.key_b64.as_bytes())
+            .map_err(|e| anyhow::anyhow!("volume_encryption.key_b64 invalid base64: {}", e))?;
+        if bytes.len() != 32 {
+            anyhow::bail!(
+                "volume_encryption.key_b64 decoded to {} bytes, expected 32",
+                bytes.len()
+            );
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
 }
 
 /// Pure helper for self-role detection on a `WarmStandby` spawn

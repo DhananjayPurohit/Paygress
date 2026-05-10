@@ -91,6 +91,7 @@ impl PaygressClient {
             replication: None,
             primary_npub: None,
             workload_id: None,
+            volume_encryption: None,
         };
         let json = serde_json::to_string(&payload)?;
         self.send_and_parse(provider_npub, json, parse_spawn_response)

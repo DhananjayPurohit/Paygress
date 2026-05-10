@@ -336,6 +336,7 @@ pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
                 None,
                 None,
                 None,
+                None,
                 relays,
                 nostr_key,
                 timeout,
