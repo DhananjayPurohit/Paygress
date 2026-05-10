@@ -76,6 +76,13 @@ pub enum Template {
     /// shards. Stateless by default — retry on a fresh provider is
     /// the recovery model.
     AgentSandbox,
+    /// OpenClaw — open-source personal AI assistant Gateway
+    /// (openclaw.ai). Connects outbound to chat apps and tools;
+    /// keeps memory + per-skill credentials in /data/.openclaw.
+    /// Checkpointed so the user's assistant identity survives a
+    /// provider restart.
+    #[value(name = "openclaw")]
+    OpenClaw,
 }
 
 /// Per-template "what should we do unless told otherwise" table.
@@ -127,6 +134,15 @@ pub const fn template_defaults(t: Template) -> TemplateDefaults {
             image: "nikolaik/python-nodejs:python3.12-nodejs20",
             replication: ReplicationMode::None,
             summary: "Python + Node + git sandbox for agents, CI, and map-reduce shards.",
+        },
+        Template::OpenClaw => TemplateDefaults {
+            tier: "standard",
+            // The provider resolves the real image from its template
+            // registry; this fallback is only consulted when the
+            // provider doesn't recognize the slug.
+            image: "ghcr.io/openclaw/openclaw:latest",
+            replication: ReplicationMode::Checkpointed,
+            summary: "OpenClaw personal AI assistant Gateway; checkpointed.",
         },
     }
 }
@@ -231,6 +247,7 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         Template::HeadlessBrowser => "headless-browser",
         Template::BitcoinNode => "bitcoin-node",
         Template::AgentSandbox => "agent-sandbox",
+        Template::OpenClaw => "openclaw",
     };
     // Translate the deploy CLI's replication enum to the spawn CLI's
     // string form. Deploy doesn't yet collect --standby (each

@@ -51,6 +51,14 @@ pub enum TemplateName {
     /// means "retry from scratch", which is what the upstream caller
     /// already does.
     AgentSandbox,
+    /// OpenClaw — open-source personal AI assistant Gateway
+    /// (openclaw.ai). Connects to chat apps (WhatsApp/Telegram/
+    /// Discord/Slack/Signal/iMessage) outbound, holds persistent
+    /// memory + tool credentials in `~/.openclaw`, exposes a local
+    /// HTTP control plane on 18789 for the user's companion app.
+    /// Checkpointed because the memory + chat-app credentials are
+    /// personal and should survive a provider restart.
+    OpenClaw,
 }
 
 impl TemplateName {
@@ -63,6 +71,7 @@ impl TemplateName {
             Self::HeadlessBrowser => "headless-browser",
             Self::BitcoinNode => "bitcoin-node",
             Self::AgentSandbox => "agent-sandbox",
+            Self::OpenClaw => "openclaw",
         }
     }
 
@@ -73,17 +82,19 @@ impl TemplateName {
             "headless-browser" => Some(Self::HeadlessBrowser),
             "bitcoin-node" => Some(Self::BitcoinNode),
             "agent-sandbox" => Some(Self::AgentSandbox),
+            "openclaw" => Some(Self::OpenClaw),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 5] {
+    pub fn all() -> [Self; 6] {
         [
             Self::NostrRelay,
             Self::InferenceEndpoint,
             Self::HeadlessBrowser,
             Self::BitcoinNode,
             Self::AgentSandbox,
+            Self::OpenClaw,
         ]
     }
 }
@@ -154,6 +165,7 @@ impl TemplateDefinition {
             TemplateName::HeadlessBrowser => headless_browser(),
             TemplateName::BitcoinNode => bitcoin_node(),
             TemplateName::AgentSandbox => agent_sandbox(),
+            TemplateName::OpenClaw => openclaw(),
         }
     }
 
@@ -423,5 +435,54 @@ mod tests {
         let def = TemplateDefinition::lookup(TemplateName::AgentSandbox);
         assert_eq!(def.data_path, Some("/workspace"));
         assert_eq!(def.env.get("WORKSPACE"), Some(&"/workspace"));
+    }
+}
+
+fn openclaw() -> TemplateDefinition {
+    let mut env = HashMap::new();
+    // Gateway HTTP control plane bind. The companion app + the
+    // installed-skill webhooks need to hit this; consumers reach it
+    // via the host-port mapping surfaced in AccessDetails.
+    env.insert("OPENCLAW_GATEWAY_PORT", "18789");
+    env.insert("OPENCLAW_GATEWAY_HOST", "0.0.0.0");
+    // Persist config + memory + sessions + per-skill credentials
+    // here so a checkpoint round-trip preserves them. Matches the
+    // upstream default at ~/.openclaw.
+    env.insert("OPENCLAW_CONFIG_DIR", "/data/.openclaw");
+    TemplateDefinition {
+        name: TemplateName::OpenClaw,
+        summary: "OpenClaw — open-source personal AI assistant Gateway (openclaw.ai). Connects outbound to chat apps (WhatsApp/Telegram/Discord/Slack/Signal/iMessage), keeps persistent memory + tool credentials in /data/.openclaw, exposes the Gateway control plane on 18789. Checkpointed because the memory + credentials are personal and should survive provider restarts.",
+        // TODO(openclaw-image): swap to a paygress-pinned image
+        // (`ghcr.io/dhananjaypurohit/paygress-openclaw:<ver>`) once
+        // we publish one — same pattern as agent-sandbox. Today's
+        // best public image is the upstream openclaw repo's own
+        // GHCR build; if upstream stops publishing, deploys break
+        // until the paygress-pinned image lands.
+        image: "ghcr.io/openclaw/openclaw:latest",
+        ports: vec![Port {
+            container_port: 18789,
+            protocol: "http",
+            label: "openclaw-gateway",
+        }],
+        env,
+        compose_path: "templates/openclaw/docker-compose.yml",
+        extra_docker_args: &[],
+        // ~/.openclaw inside the container — config, memory store,
+        // sessions, and per-skill OAuth tokens. The agent's whole
+        // identity lives here; lose it and the user reauthenticates
+        // every chat-app integration.
+        data_path: Some("/data/.openclaw"),
+        tier: "standard",
+        // Personal assistant state is irreplaceable from the
+        // consumer's POV — checkpointed gives them a Blossom-stored
+        // restore point on provider crash. Warm-standby is overkill
+        // (the assistant doesn't need sub-minute recovery).
+        replication: ReplicationMode::Checkpointed,
+        // Node 24 + memory store + concurrent chat-app integrations:
+        // 1 vCPU is fine at idle, 2 GB lets the JS heap breathe under
+        // bursty webhook activity (Telegram + Discord + Slack at once).
+        min_cpu_millicores: 1000,
+        min_memory_mb: 2048,
+        min_storage_gb: 5,
     }
 }
