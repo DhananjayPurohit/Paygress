@@ -265,11 +265,15 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         // provider in the set.
         primary_npub: None,
         workload_id: None,
-        // Per-template encryption defaults land with Phase 2; for now
-        // deploy does not flip --encrypt-volume on its own. Consumers
-        // who want encryption use `paygress-cli spawn --encrypt-volume`
-        // directly.
+        // `spawn::execute` honors the template's encrypt-by-default
+        // policy via `template_default_encrypts_volume(template_slug)`,
+        // so leaving both flags `false` here means stateful templates
+        // (data_path: Some(_)) get LUKS encryption automatically. To
+        // override at the deploy CLI, expose `--encrypt-volume` /
+        // `--no-encrypt-volume` flags here in a follow-up; today the
+        // overrides live on `paygress-cli spawn`.
         encrypt_volume: false,
+        no_encrypt_volume: false,
     };
     spawn::execute(spawn_args, verbose).await
 }
