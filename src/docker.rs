@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::compute::{ComputeBackend, ContainerConfig, NodeStatus};
+use crate::luks::{create_encrypted_volume, destroy_encrypted_volume};
 
 /// Docker backend. Stateless wrapper around the `docker` CLI.
 pub struct DockerBackend {
@@ -140,10 +141,29 @@ impl ComputeBackend for DockerBackend {
         }
 
         // Persistent state volume (vmid-scoped so two instances of
-        // the same template don't share state).
+        // the same template don't share state). Two paths:
+        //   - encrypted: provision a LUKS-on-loop file, mount its
+        //     ext4 on the host, bind-mount the mountpoint into the
+        //     container at `data_path`. Host operator's
+        //     post-eviction `tar` reveals only ciphertext.
+        //   - plain: use a Docker named volume (the historical
+        //     default; host operator can `tar` /var/lib/docker/...).
         if let Some(path) = &config.data_path {
-            args.push("-v".into());
-            args.push(format!("paygress-{}-data:{}", config.id, path));
+            match config.volume_encryption_key.as_ref() {
+                Some(key) => {
+                    let vol = create_encrypted_volume(config.id, config.storage_gb, key)
+                        .await
+                        .with_context(|| {
+                            format!("create LUKS-encrypted volume for id={}", config.id)
+                        })?;
+                    args.push("-v".into());
+                    args.push(format!("{}:{}", vol.mount_path.display(), path));
+                }
+                None => {
+                    args.push("-v".into());
+                    args.push(format!("paygress-{}-data:{}", config.id, path));
+                }
+            }
         }
 
         // Image must be the last positional arg so docker treats
@@ -187,10 +207,27 @@ impl ComputeBackend for DockerBackend {
     async fn delete_container(&self, id: u32) -> Result<()> {
         let name = Self::name_for(id);
         let _ = self.docker(&["rm", "-f", &name]).await;
-        // Best-effort: also remove the per-vmid data volume so a
+        // Best-effort: also remove BOTH possible volume backings so a
         // re-spawn doesn't inherit stale state.
+        //   1. The Docker named volume (used when volume_encryption_key
+        //      is None — historical default path).
+        //   2. The LUKS-on-loop volume (used when the consumer set
+        //      --encrypt-volume). Idempotent: the destroy helper
+        //      treats "no LUKS file at the expected id" as a no-op.
+        //      luksErase inside destroy is the load-bearing step —
+        //      it overwrites the LUKS header so the keyslots are
+        //      unrecoverable even if the operator extracted the
+        //      file before this ran.
         let volume = format!("paygress-{}-data", id);
         let _ = self.docker(&["volume", "rm", "-f", &volume]).await;
+        if let Err(e) = destroy_encrypted_volume(id).await {
+            // Never propagate: cleanup_loop relies on this being
+            // best-effort. A leaked mapper entry (e.g. provider
+            // process killed mid-cleanup) gets re-cleaned on the
+            // next delete attempt at the same id, since the helper
+            // is idempotent.
+            tracing::warn!("destroy_encrypted_volume(id={}) non-fatal: {}", id, e);
+        }
         Ok(())
     }
 
@@ -258,6 +295,7 @@ mod tests {
             },
             extra_runtime_args: vec!["--ulimit".to_string(), "nofile=1024:1024".to_string()],
             data_path: Some("/var/data".to_string()),
+            volume_encryption_key: None,
         };
 
         // Mirror the logic in `create_container` for assertion.

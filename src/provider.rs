@@ -1069,6 +1069,49 @@ async fn handle_spawn_request(
         .as_ref()
         .and_then(|t| t.data_path.map(|p| p.to_string()));
 
+    // Volume encryption (Phase 2): decode the consumer-supplied key
+    // from the spawn request. Silently None for stateless workloads
+    // (data_path is None) since there's nothing to encrypt — saves
+    // surfacing a confusing "key supplied but ignored" warning to a
+    // consumer who set --encrypt-volume on a stateless template.
+    let volume_encryption_key = match (&data_path, request.volume_encryption.as_ref()) {
+        (Some(_), Some(ve)) => match ve.decoded_key() {
+            Ok(key) => {
+                info!(
+                    "Spawn request includes volume_encryption (algorithm={}, version={}); will create LUKS-encrypted data volume",
+                    ve.algorithm, ve.version
+                );
+                Some(key)
+            }
+            Err(e) => {
+                error!(
+                    "Rejecting spawn: malformed volume_encryption.key_b64: {}",
+                    e
+                );
+                let err_payload = ErrorResponseContent {
+                    error_type: "invalid_volume_encryption".to_string(),
+                    message: format!("volume_encryption rejected: {}", e),
+                    details: None,
+                };
+                let _ = nostr
+                    .send_error_response_private_message(
+                        requester_pubkey,
+                        err_payload,
+                        message_type,
+                    )
+                    .await;
+                return Ok(());
+            }
+        },
+        (None, Some(_)) => {
+            warn!(
+                "Spawn request set volume_encryption but template has no data_path; encryption is a no-op for stateless workloads"
+            );
+            None
+        }
+        _ => None,
+    };
+
     // 7. Create Container
     let container_config = ContainerConfig {
         id,
@@ -1084,6 +1127,7 @@ async fn handle_spawn_request(
         template_env,
         extra_runtime_args,
         data_path,
+        volume_encryption_key,
     };
 
     // ---- Standby branch ----
