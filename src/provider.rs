@@ -227,6 +227,14 @@ pub struct StandbySlot {
     /// primary on the first watchdog tick (race window: 0–60s while
     /// waiting for the primary's next heartbeat to land on the relay).
     pub created_at: u64,
+    /// Npubs of the OTHER standbys for this workload (excludes self
+    /// and the primary). Used at promotion-time to detect that a
+    /// lower-indexed peer has already promoted: a freshly-promoted
+    /// peer publishes a heartbeat from its own npub immediately, and
+    /// this standby queries those npubs before claiming the slot
+    /// itself. Without this list, every standby would promote
+    /// independently after the silence window, producing split-brain.
+    pub peer_standby_npubs: Vec<String>,
 }
 
 /// Provider service that manages the node
@@ -563,6 +571,7 @@ impl ProviderService {
                                 workloads.clone(),
                                 state_machine.clone(),
                                 standby_slots.clone(),
+                                nostr.clone(),
                                 slot,
                             );
                         } else {
@@ -965,6 +974,7 @@ impl ProviderService {
                     self.active_workloads.clone(),
                     self.state_machine.clone(),
                     self.standby_slots.clone(),
+                    self.nostr.clone(),
                     slot,
                 );
             }
@@ -1360,6 +1370,23 @@ async fn handle_spawn_request(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        // Compute peer-standby npubs: the full standby set minus
+        // self. Used at promotion-time to detect that a lower-indexed
+        // peer has already promoted (their fresh heartbeat under
+        // their own npub is the dedup signal). For non-WarmStandby
+        // replication this branch is unreachable (role would be
+        // Primary), so we can safely default to empty.
+        let self_npub = nostr.get_service_public_key();
+        let peer_standby_npubs: Vec<String> = match request.replication.as_ref() {
+            Some(crate::durable_workload::ReplicationMode::WarmStandby { standby_providers }) => {
+                standby_providers
+                    .iter()
+                    .filter(|p| !crate::nostr::npubs_equal(p, &self_npub))
+                    .cloned()
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let slot = StandbySlot {
             workload_id: workload_id.clone(),
             primary_npub,
@@ -1370,6 +1397,7 @@ async fn handle_spawn_request(
             expires_at: now + duration_secs,
             owner_npub: requester_pubkey.to_string(),
             created_at: now,
+            peer_standby_npubs,
         };
         info!(
             "Reserved standby slot for workload_id={} (index {}/{}, expires at {})",
@@ -1996,18 +2024,31 @@ fn compute_warm_standby_role(
     }
 }
 
+/// How fresh a peer-standby heartbeat must be (in seconds, relative
+/// to the moment we evaluate it) to count as evidence that a peer
+/// has already promoted to primary. Heartbeat cadence is 60s; we
+/// give two cadences of grace so a momentarily-flaky relay
+/// subscription doesn't make a higher-indexed standby falsely
+/// proceed and split-brain.
+const PEER_PROMOTION_FRESH_SECS: u64 = 120;
+
 /// Spawn the standby promotion task. Runs on its own tokio task so
 /// the request handler returns immediately. Sleeps for the
-/// per-standby ordered backoff, then attempts the local spawn.
-/// Pre-emption check is left for v2 — v1 relies on the backoff
-/// window being short enough that standby 0 publishes heartbeats
-/// before standby 1's window opens (heartbeat cadence is 60s by
-/// default, backoff window is 30s — borderline; document it).
+/// per-standby ordered backoff, then:
+///   1. Pre-emption check — query heartbeats from peer standbys.
+///      If any has a fresh heartbeat (within the last
+///      PEER_PROMOTION_FRESH_SECS), assume that peer has already
+///      promoted; drop the slot and return without spawning.
+///   2. Spawn the container locally.
+///   3. Publish a heartbeat immediately so higher-indexed peers
+///      see fresh evidence on their next pre-emption check and
+///      back off without spawning a duplicate primary.
 fn schedule_standby_promotion(
     backend: Arc<dyn ComputeBackend>,
     workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     state_machine: Arc<Mutex<WorkloadStateMachine>>,
     standby_slots: Arc<Mutex<HashMap<String, StandbySlot>>>,
+    nostr: NostrRelaySubscriber,
     slot: StandbySlot,
 ) {
     let delay_secs = (slot.standby_index as u64).saturating_mul(STANDBY_PROMOTION_DELAY_SECS);
@@ -2042,6 +2083,47 @@ fn schedule_standby_promotion(
                 return;
             }
         };
+
+        // Pre-emption check: has a peer standby already promoted?
+        // Query heartbeats from each peer's npub; if any is fresh
+        // (published within the last PEER_PROMOTION_FRESH_SECS),
+        // that peer is now primary and we should NOT promote.
+        // Without this check N standbys all promote at silence-
+        // detection + index*backoff, producing N concurrent
+        // primaries running the same workload (split-brain).
+        if !slot.peer_standby_npubs.is_empty() {
+            match nostr
+                .get_latest_heartbeats_multi(slot.peer_standby_npubs.clone())
+                .await
+            {
+                Ok(peer_heartbeats) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Some((peer_npub, hb)) = peer_heartbeats
+                        .iter()
+                        .find(|(_, hb)| now.saturating_sub(hb.timestamp) <= PEER_PROMOTION_FRESH_SECS)
+                    {
+                        info!(
+                            "Peer standby {} already promoted (fresh heartbeat at {}s ago, threshold {}s); \
+                             dropping slot for workload {} without spawning",
+                            peer_npub,
+                            now.saturating_sub(hb.timestamp),
+                            PEER_PROMOTION_FRESH_SECS,
+                            slot.workload_id
+                        );
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to query peer standby heartbeats for workload {}: {}; proceeding with promotion (best-effort)",
+                        slot.workload_id, e
+                    );
+                }
+            }
+        }
 
         info!(
             "Promoting standby slot {} → primary (vmid {})",
@@ -2084,10 +2166,11 @@ fn schedule_standby_promotion(
             restart_policy: crate::durable_workload::RestartPolicy::default(),
             state_uri: None,
         };
-        workloads
-            .lock()
-            .await
-            .insert(slot.container_config.id, workload.clone());
+        let active_workloads_count = {
+            let mut w = workloads.lock().await;
+            w.insert(slot.container_config.id, workload.clone());
+            w.len() as u32
+        };
 
         state_machine
             .lock()
@@ -2107,6 +2190,30 @@ fn schedule_standby_promotion(
             "Standby promotion complete: workload {} now running locally (vmid {})",
             slot.workload_id, slot.container_config.id
         );
+
+        // Publish a heartbeat IMMEDIATELY so higher-indexed peer
+        // standbys see fresh evidence of an already-promoted peer
+        // on their next pre-emption check. Without this the
+        // periodic heartbeat loop runs every 60s and a peer's
+        // backoff might expire before the first heartbeat lands,
+        // producing a duplicate primary.
+        let immediate_heartbeat = HeartbeatContent {
+            provider_npub: nostr.get_service_public_key(),
+            timestamp: now,
+            active_workloads: active_workloads_count,
+            available_capacity: CapacityInfo {
+                cpu_available: 0,
+                memory_mb_available: 0,
+                storage_gb_available: 0,
+            },
+            version: crate::nostr::SCHEMA_VERSION,
+        };
+        if let Err(e) = nostr.publish_heartbeat(immediate_heartbeat).await {
+            warn!(
+                "Post-promotion heartbeat publish failed for workload {}: {}; periodic loop will catch up on next tick",
+                slot.workload_id, e
+            );
+        }
     });
 }
 
