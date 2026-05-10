@@ -1,0 +1,51 @@
+# OpenClaw — open-source personal AI assistant Gateway (openclaw.ai).
+#
+# The Gateway is a local control plane that manages chat-app sessions
+# (WhatsApp/Telegram/Discord/Slack/Signal/iMessage), tools, and
+# memory. It listens on 18789 for the companion app + skill webhooks.
+# Inbound chat-app traffic is NOT served by the Gateway — those
+# integrations are outbound to the upstream APIs / WebSockets.
+#
+# Smoke test (local):
+#   docker compose -f templates/openclaw/docker-compose.yml up -d
+#   curl http://localhost:18789/health
+#   docker logs paygress-openclaw -f
+#
+# First-run setup is interactive: visit http://<host>:18789 in a
+# browser to OAuth-link your chat apps. Credentials persist to the
+# `openclaw-data` volume (mounted at /data/.openclaw inside the
+# container) and survive restarts.
+services:
+  openclaw:
+    # TODO(openclaw-image): swap to a paygress-pinned image once we
+    # publish one (`ghcr.io/dhananjaypurohit/paygress-openclaw:<ver>`).
+    # Tracks the upstream OpenClaw GHCR build today.
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: paygress-openclaw
+    restart: unless-stopped
+    # Host port is configurable via OPENCLAW_HOST_PORT; defaults to
+    # 18789 to match the upstream documented port.
+    ports:
+      - "${OPENCLAW_HOST_PORT:-18789}:18789"
+    environment:
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_GATEWAY_HOST: "0.0.0.0"
+      # Persist all stateful data here so a restart preserves the
+      # user's chat-app credentials, memory, and skill config.
+      OPENCLAW_CONFIG_DIR: /data/.openclaw
+    volumes:
+      - openclaw-data:/data/.openclaw
+    # The upstream image's default entrypoint runs the Gateway. If
+    # using a base node image instead, override:
+    #   command: ["openclaw", "gateway", "--port", "18789", "--verbose"]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "wget -qO- http://localhost:18789/health >/dev/null 2>&1 || exit 1"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  openclaw-data:
