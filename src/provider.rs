@@ -41,6 +41,15 @@ pub enum BackendType {
     /// can't run natively. Provider must have the `docker` CLI
     /// installed and accessible to the running user.
     Docker,
+    /// KVM/qemu backend. Each spawn is its own VM with its own
+    /// kernel — no co-tenant attacks via container escape.
+    /// Publishes `IsolationLevel::DedicatedHost` on the offer so
+    /// consumers filtering by `--isolation-level dedicated-host`
+    /// match this provider. Requires `/dev/kvm` and
+    /// `qemu-system-x86_64` on the host. Killer templates (Docker
+    /// images) are NOT served on this backend in v1; consumers get
+    /// vanilla Ubuntu VMs with SSH access.
+    Kvm,
 }
 
 impl Default for BackendType {
@@ -273,6 +282,17 @@ impl ProviderService {
                 &config.proxmox_bridge,  // Reuse bridge for network
             )),
             BackendType::Docker => Arc::new(DockerBackend::new()),
+            BackendType::Kvm => {
+                // Fail-fast: surface the "this host doesn't have
+                // KVM" error at provider startup, not at first
+                // spawn (when a paying consumer has already
+                // committed a Cashu token).
+                if let Err(e) = crate::kvm::KvmBackend::check_kvm_available().await {
+                    tracing::error!("KVM backend selected but unavailable: {}", e);
+                    anyhow::bail!("KVM backend unavailable: {}", e);
+                }
+                Arc::new(crate::kvm::KvmBackend::new(crate::kvm::KvmConfig::default()))
+            }
         };
 
         // Initialize Nostr client
@@ -373,7 +393,17 @@ impl ProviderService {
             total_jobs_completed: stats.total_jobs_completed,
             api_endpoint: None, // TODO: Add if supporting direct API
             version: crate::nostr::SCHEMA_VERSION,
-            isolation_level: crate::nostr::IsolationLevel::SharedKernel,
+            // Derive isolation tier from the configured backend.
+            // KVM is per-VM (DedicatedHost). Docker / LXD / Proxmox
+            // share the host kernel (SharedKernel) — same tier as
+            // historical default. SEV-SNP / TDX gets its own
+            // backend later and bumps to AttestedResearchTier.
+            isolation_level: match self.config.backend_type {
+                BackendType::Kvm => crate::nostr::IsolationLevel::DedicatedHost,
+                BackendType::Proxmox | BackendType::LXD | BackendType::Docker => {
+                    crate::nostr::IsolationLevel::SharedKernel
+                }
+            },
             stake_proof: None,
         };
 
