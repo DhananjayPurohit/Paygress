@@ -855,7 +855,7 @@ pub fn warm_standby_role(
 /// `"npub1primary"` working, and cannot create false positives in
 /// production (where every input is a real key in one of the two
 /// canonical forms).
-fn npubs_equal(a: &str, b: &str) -> bool {
+pub fn npubs_equal(a: &str, b: &str) -> bool {
     let pa = nostr_sdk::PublicKey::parse(a);
     let pb = nostr_sdk::PublicKey::parse(b);
     match (pa, pb) {
