@@ -177,6 +177,30 @@ impl TemplateDefinition {
     }
 }
 
+/// Default policy for `--encrypt-volume` on the spawn CLI: should
+/// the consumer's data volume be LUKS-encrypted at rest *unless
+/// they explicitly pass `--no-encrypt-volume`*?
+///
+/// Rule: yes for every template that holds persistent state
+/// (`data_path: Some(_)`). Stateless templates have nothing to
+/// encrypt and the default is a no-op for them.
+///
+/// Why this rule and not "Checkpointed only": every persistent-state
+/// template leaks the *same* class of data to a curious operator —
+/// strfry's LMDB has relay subscribers' message graph, ollama's
+/// model dir carries any RAG context, openclaw's config dir holds
+/// chat-app credentials, bitcoind's chaindata carries the wallet
+/// pubkeys. The replication mode is a recovery-model knob, not a
+/// confidentiality knob; encryption is justified in all of them.
+/// Modest LUKS overhead beats a confused consumer-vs-template-
+/// author trust split.
+///
+/// Pure function over the template name — testable without
+/// touching the filesystem or the network.
+pub fn template_default_encrypts_volume(name: TemplateName) -> bool {
+    TemplateDefinition::lookup(name).data_path.is_some()
+}
+
 fn nostr_relay() -> TemplateDefinition {
     let mut env = HashMap::new();
     env.insert("STRFRY_DB_PATH", "/app/strfry-db");
@@ -484,5 +508,52 @@ fn openclaw() -> TemplateDefinition {
         min_cpu_millicores: 1000,
         min_memory_mb: 2048,
         min_storage_gb: 5,
+    }
+}
+
+#[cfg(test)]
+mod default_policy_tests {
+    use super::*;
+
+    #[test]
+    fn templates_with_persistent_state_default_to_encrypted() {
+        // Anything with a `data_path` should get encrypted by default.
+        // Stateful templates today: nostr-relay, inference-endpoint,
+        // bitcoin-node, agent-sandbox, openclaw.
+        for name in TemplateName::all() {
+            let def = TemplateDefinition::lookup(name);
+            let expected = def.data_path.is_some();
+            assert_eq!(
+                template_default_encrypts_volume(name),
+                expected,
+                "template {:?} default-encrypt mismatch (data_path={:?})",
+                name,
+                def.data_path,
+            );
+        }
+    }
+
+    #[test]
+    fn nostr_relay_encrypts_by_default() {
+        // strfry's LMDB carries subscribers' message graph; encrypting
+        // it at rest is justified even though replication is
+        // warm-standby (recovery mode is orthogonal to confidentiality).
+        assert!(template_default_encrypts_volume(TemplateName::NostrRelay));
+    }
+
+    #[test]
+    fn headless_browser_does_not_encrypt_by_default() {
+        // Stateless template — nothing to encrypt. The default is a
+        // no-op for it.
+        assert!(!template_default_encrypts_volume(
+            TemplateName::HeadlessBrowser
+        ));
+    }
+
+    #[test]
+    fn openclaw_encrypts_by_default() {
+        // OpenClaw's /data/.openclaw holds chat-app OAuth tokens —
+        // arguably the load-bearing reason this default exists.
+        assert!(template_default_encrypts_volume(TemplateName::OpenClaw));
     }
 }
