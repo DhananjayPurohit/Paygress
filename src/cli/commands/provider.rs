@@ -332,6 +332,12 @@ async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
             println!("  Backend:  Docker");
             println!("  Note:     templates require Docker; ensure `docker` is on PATH");
         }
+        paygress::provider::BackendType::Kvm => {
+            println!("  Backend:  KVM/qemu (per-VM isolation, dedicated-host tier)");
+            println!(
+                "  Note:     requires /dev/kvm + qemu-system-x86_64; killer templates not served"
+            );
+        }
     }
     println!();
 
