@@ -113,20 +113,32 @@ pub struct SpawnArgs {
     #[arg(long)]
     pub workload_id: Option<String>,
 
-    /// Encrypt the workload's persistent data volume with a key
-    /// derived from your nsec + workload-id. Defends against
+    /// Force-encrypt the workload's persistent data volume with a
+    /// key derived from your nsec + workload-id. Defends against
     /// post-eviction disk forensics, lazy host backups, co-tenant
     /// attacks on shared storage, and cold-disk seizure. Does NOT
     /// defend against a live host kernel reading process memory or
-    /// extracting the LUKS key from the keyring — that requires
-    /// a confidential VM (`isolation-level=attested-research-tier`).
+    /// extracting the LUKS key from the keyring — that requires a
+    /// confidential VM (`isolation-level=attested-research-tier`).
     ///
-    /// When set, `--workload-id` becomes effectively required (the
-    /// CLI generates a UUID if you don't supply one and prints it
-    /// so you can re-supply it on respawn / top-up to recover the
-    /// same key).
-    #[arg(long)]
+    /// You usually do not need this flag: encryption defaults ON
+    /// for any template that holds persistent state (`data_path:
+    /// Some(_)`). Use `--no-encrypt-volume` to opt out.
+    ///
+    /// When encryption is on (by flag or by default), the CLI
+    /// derives the key deterministically from your nsec +
+    /// workload-id; if `--workload-id` is not supplied, a UUIDv4
+    /// is generated and printed so you can re-supply it on respawn
+    /// / top-up to recover the same key.
+    #[arg(long, conflicts_with = "no_encrypt_volume")]
     pub encrypt_volume: bool,
+
+    /// Opt out of the per-template default for encrypted volumes.
+    /// Use when you've consciously decided the workload's data
+    /// doesn't warrant the LUKS overhead, or when debugging an
+    /// encryption-related provider issue.
+    #[arg(long, conflicts_with = "encrypt_volume")]
+    pub no_encrypt_volume: bool,
 }
 
 /// Translate the `--replication` + `--standby` CLI flags into the
@@ -431,12 +443,34 @@ async fn execute_nostr_spawn(
 
     // Volume encryption: derive a 32-byte key from (nsec, workload_id)
     // and ship it inside the encrypted spawn DM. The provider creates
-    // a LUKS-encrypted volume keyed by these bytes (Phase 2 of the
-    // confidentiality plan; today the provider parses but doesn't
-    // yet act). If the consumer didn't supply --workload-id, mint a
-    // UUIDv4 so the key is reproducible on respawn.
+    // a LUKS-encrypted volume keyed by these bytes.
+    //
+    // Three-way truth table for whether to encrypt:
+    //   --no-encrypt-volume        → false (explicit opt-out)
+    //   --encrypt-volume           → true  (explicit force-on)
+    //   neither + known template   → template_default_encrypts_volume
+    //   neither + unknown template → false (consumer didn't ask)
+    //
+    // The "by default" case reaches in via the template_slug; if the
+    // consumer supplied a slug the CLI knows, we honor that template's
+    // policy. Custom-image spawns (no slug) keep the historical
+    // "off-by-default" behavior so we don't surprise existing scripts.
+    let template_default_encrypt = args
+        .template_slug
+        .as_deref()
+        .and_then(paygress::templates::TemplateName::from_slug)
+        .map(paygress::templates::template_default_encrypts_volume)
+        .unwrap_or(false);
+    let should_encrypt = if args.no_encrypt_volume {
+        false
+    } else if args.encrypt_volume {
+        true
+    } else {
+        template_default_encrypt
+    };
+
     let mut effective_workload_id = args.workload_id.clone();
-    let volume_encryption = if args.encrypt_volume {
+    let volume_encryption = if should_encrypt {
         if effective_workload_id.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
             println!(
@@ -449,6 +483,12 @@ async fn execute_nostr_spawn(
         let workload_id = effective_workload_id.as_ref().unwrap();
         let nsec_bytes = nsec_to_bytes(&nostr_key)?;
         let key = paygress::volume_encryption::derive_volume_key(&nsec_bytes, workload_id);
+        if !args.encrypt_volume && template_default_encrypt {
+            println!(
+                "  {} (template default; pass --no-encrypt-volume to skip)",
+                "Encrypting persistent data volume".green()
+            );
+        }
         Some(paygress::nostr::VolumeEncryption::v1(key))
     } else {
         None
