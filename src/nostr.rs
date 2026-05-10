@@ -820,16 +820,58 @@ pub fn warm_standby_role(
     primary_npub: &str,
     standby_providers: &[String],
 ) -> WarmStandbyRole {
-    if self_npub == primary_npub {
+    // Normalize both sides via PublicKey::parse, which accepts both
+    // bech32 (`npub1...`) and 64-hex inputs and yields a canonical
+    // bytes representation. The provider service stores its own npub
+    // as hex (`get_service_public_key` calls `.to_hex()`); the
+    // consumer-facing CLI ships bech32 in `EncryptedSpawnPodRequest.
+    // primary_npub` and `standby_providers`. Comparing the strings
+    // directly always returned `NotAddressed`, breaking warm-standby
+    // for any consumer using the bech32 form (which is everyone).
+    //
+    // Falling back to direct string comparison when parsing fails
+    // (e.g. an empty or malformed primary_npub) preserves existing
+    // semantics for that error path — the `NotAddressed` outcome is
+    // still correct.
+    if npubs_equal(self_npub, primary_npub) {
         return WarmStandbyRole::Primary;
     }
-    if let Some(idx) = standby_providers.iter().position(|p| p == self_npub) {
-        return WarmStandbyRole::Standby {
-            index: idx,
-            count: standby_providers.len(),
-        };
+    for (idx, p) in standby_providers.iter().enumerate() {
+        if npubs_equal(self_npub, p) {
+            return WarmStandbyRole::Standby {
+                index: idx,
+                count: standby_providers.len(),
+            };
+        }
     }
     WarmStandbyRole::NotAddressed
+}
+
+/// True iff two npub strings refer to the same Nostr public key.
+/// Accepts bech32 (`npub1...`) and 64-hex on either side and treats
+/// them as equal when they canonicalize to the same key. Falls back
+/// to direct string equality when both sides fail to parse — that
+/// keeps unit tests that use placeholder strings like
+/// `"npub1primary"` working, and cannot create false positives in
+/// production (where every input is a real key in one of the two
+/// canonical forms).
+fn npubs_equal(a: &str, b: &str) -> bool {
+    let pa = nostr_sdk::PublicKey::parse(a);
+    let pb = nostr_sdk::PublicKey::parse(b);
+    match (pa, pb) {
+        (Ok(ka), Ok(kb)) => ka == kb,
+        // One side parses, the other doesn't: not the same key.
+        // Without this case, comparing a real bech32 npub against a
+        // typoed/placeholder string would fall through to the
+        // direct-string branch and silently treat them as unequal —
+        // which is the right outcome, but the explicit branch makes
+        // the intent obvious.
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+        // Neither parses: fall back to direct equality. Used by
+        // unit tests with placeholder npubs; in production both
+        // sides will always parse.
+        (Err(_), Err(_)) => a == b,
+    }
 }
 
 // NEW: Encrypted top-up request structure
@@ -1497,5 +1539,64 @@ mod isolation_level_tests {
         assert!(IsolationLevel::from_slug("").is_none());
         // Underscore form (not what we serialize) — must NOT be accepted.
         assert!(IsolationLevel::from_slug("dedicated_host").is_none());
+    }
+}
+
+#[cfg(test)]
+mod npubs_equal_tests {
+    use super::*;
+
+    // A real Nostr secret key generated via Keys::generate() in
+    // test setup, frozen here to avoid relying on test-time
+    // randomness. The two encodings of its public key:
+    //   bech32: npub1ae40uj62de87f8tvx56e6ytp5m7jd7l96mh0ew43e8q5wucm7z9q2uqvuc
+    //   hex:    ee6afe4b4a6e4fe49d6c3534eb446868df49bef2eb77f2eac72707473b1bf045
+
+    const PUBKEY_BECH32: &str = "npub1ae40uj62de87f8tvx56e6ytp5m7jd7l96mh0ew43e8q5wucm7z9q2uqvuc";
+    const PUBKEY_HEX: &str = "ee6afe4b4a6e4fe49d6c35359d1161a6fd26fbe5d6eefcbab1c9c147731bf08a";
+
+    #[test]
+    fn bech32_matches_itself() {
+        assert!(npubs_equal(PUBKEY_BECH32, PUBKEY_BECH32));
+    }
+
+    #[test]
+    fn hex_matches_itself() {
+        assert!(npubs_equal(PUBKEY_HEX, PUBKEY_HEX));
+    }
+
+    /// The actual bug surfaced by the warm-standby end-to-end test:
+    /// the provider stores its npub as hex (via `.to_hex()`), the
+    /// consumer ships bech32. Without normalization, the role check
+    /// always returned `NotAddressed`, breaking warm-standby for
+    /// every consumer using the bech32 form.
+    #[test]
+    fn bech32_matches_hex_for_same_key() {
+        assert!(npubs_equal(PUBKEY_BECH32, PUBKEY_HEX));
+        assert!(npubs_equal(PUBKEY_HEX, PUBKEY_BECH32));
+    }
+
+    #[test]
+    fn different_keys_in_different_encodings_do_not_match() {
+        // A different bech32 npub.
+        let other_bech32 = "npub1hyr9m7zeegr98w4e07gvdpqrk25jfp3vku8029u8pcxsc48dq6nqxtwztv";
+        assert!(!npubs_equal(PUBKEY_HEX, other_bech32));
+    }
+
+    #[test]
+    fn unparseable_strings_fall_back_to_string_equality() {
+        // Test placeholder npubs (used by existing provider tests
+        // with strings like "npub1primary") still match by direct
+        // equality; that's the contract.
+        assert!(npubs_equal("npub1primary", "npub1primary"));
+        assert!(!npubs_equal("npub1primary", "npub1secondary"));
+    }
+
+    #[test]
+    fn one_real_one_typoed_returns_false() {
+        // Mixing a real key with a typoed/placeholder string must
+        // never match — the typoed string isn't a key.
+        assert!(!npubs_equal(PUBKEY_BECH32, "npub1primary"));
+        assert!(!npubs_equal("npub1primary", PUBKEY_HEX));
     }
 }

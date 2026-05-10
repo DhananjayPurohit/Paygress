@@ -24,6 +24,14 @@ pub enum ProviderAction {
     /// Initial setup - configure Proxmox connection and provider settings
     Setup(SetupArgs),
 
+    /// Scaffold N independent provider configs on the SAME host —
+    /// fresh nsec, distinct vmid range, distinct cashu wallet redb,
+    /// distinct config file path per provider. Used for end-to-end
+    /// warm-standby failover testing on a single VPS, where you want
+    /// 3 separate paygress-provider processes (primary + 2 standbys)
+    /// publishing distinct offers to Nostr.
+    SetupMulti(SetupMultiArgs),
+
     /// Start the provider service (heartbeats + request handler)
     Start(StartArgs),
 
@@ -105,6 +113,69 @@ pub struct SetupArgs {
     pub mints: String,
 }
 
+/// Scaffold N independent providers on the same host.
+///
+/// What `setup-multi` produces
+/// ---------------------------
+/// Per provider i in 0..count:
+///   - /etc/paygress/provider-<name>-<i>.json — full config
+///   - Fresh `nsec` (independent Nostr identity per provider)
+///   - vmid range: [1000 + i*1000, 1999 + i*1000) — non-overlapping
+///   - cashu_wallet_db_path: ./paygress-<name>-<i>.redb
+///   - provider_name: "<name>-<i>"
+///
+/// Plus a systemd template unit (printed, not installed) the
+/// operator can drop in and enable per-instance.
+///
+/// Why this exists
+/// ---------------
+/// End-to-end warm-standby failover testing needs 3 distinct
+/// providers. Running 3 separate `paygress-cli provider setup`
+/// invocations each requires hand-editing the resulting JSONs to
+/// give them non-overlapping vmid ranges and redb paths — annoying
+/// and error-prone. This subcommand does it in one shot. Designed
+/// for the test loop, but operators running multiple provider
+/// instances on one beefy host (e.g. burst capacity, geo-fencing
+/// per provider) can reuse the same scaffolding for production.
+#[derive(Args)]
+pub struct SetupMultiArgs {
+    /// Number of providers to scaffold. Defaults to 3 (primary + 2
+    /// standbys is the minimum interesting warm-standby topology).
+    #[arg(long, default_value_t = 3)]
+    pub count: usize,
+
+    /// Compute backend the providers will use. All N providers share
+    /// the same backend on the same host — they're scheduling against
+    /// the same Docker daemon / KVM /dev/kvm / LXD socket. The vmid
+    /// ranges are partitioned so they don't collide on container ids.
+    #[arg(long, default_value = "docker", value_parser = parse_backend)]
+    pub backend: paygress::provider::BackendType,
+
+    /// Common prefix for the N providers' display names + filenames.
+    /// Each provider gets `"<name>-<i>"` (zero-indexed). Pick
+    /// something short — it lands in `provider_name`, the systemd
+    /// instance name, the redb filename, and the config filename.
+    #[arg(long, default_value = "paygress")]
+    pub name: String,
+
+    /// Whitelisted Cashu mints (comma-separated). Same list applied
+    /// to every provider (they're all on the same host so they have
+    /// the same network reachability).
+    #[arg(long, default_value = "http://localhost:3338")]
+    pub mints: String,
+
+    /// Public IP address (auto-detected if not provided). Same value
+    /// applied to every provider since they share the host.
+    #[arg(long)]
+    pub public_ip: Option<String>,
+
+    /// Skip the systemd template-unit instructions section. Useful
+    /// when scripting `setup-multi` in CI or when the operator
+    /// already has their own service-management story.
+    #[arg(long)]
+    pub no_systemd: bool,
+}
+
 #[derive(Args)]
 pub struct StartArgs {
     /// Path to configuration file
@@ -149,6 +220,7 @@ pub struct TunnelArgs {
 pub async fn execute(args: ProviderArgs, verbose: bool) -> Result<()> {
     match args.action {
         ProviderAction::Setup(setup_args) => execute_setup(setup_args, verbose).await,
+        ProviderAction::SetupMulti(multi_args) => execute_setup_multi(multi_args, verbose).await,
         ProviderAction::Start(start_args) => execute_start(start_args, verbose).await,
         ProviderAction::Stop => execute_stop(verbose).await,
         ProviderAction::Status => execute_status(verbose).await,
@@ -381,6 +453,210 @@ fn parse_backend(s: &str) -> std::result::Result<paygress::provider::BackendType
             other
         )),
     }
+}
+
+/// Per-instance vmid range size. Each scaffolded provider gets
+/// 1000 ids of headroom (1000-1999, 2000-2999, etc.). Plenty for
+/// a test loop; a production multi-tenant host would likely pick a
+/// larger window. Pulled out as a constant so the test below pins
+/// the partition geometry.
+const SETUP_MULTI_VMID_RANGE_SIZE: u32 = 1000;
+
+/// Scaffold a fresh `ProviderConfig` for instance `i` of a
+/// `setup-multi` invocation. Pure function — no IO, no clock — so
+/// the partition logic (vmid range, paths, names) is unit-testable.
+fn build_multi_config(
+    args: &SetupMultiArgs,
+    i: usize,
+    public_ip: &str,
+    nostr_nsec: String,
+    specs: Vec<paygress::nostr::PodSpec>,
+    mints: Vec<String>,
+) -> paygress::provider::ProviderConfig {
+    use paygress::provider::ProviderConfig;
+    let provider_name = format!("{}-{}", args.name, i);
+    let i32 = i as u32;
+    let vmid_start = 1000 + i32 * SETUP_MULTI_VMID_RANGE_SIZE;
+    let vmid_end = vmid_start + SETUP_MULTI_VMID_RANGE_SIZE - 1;
+    ProviderConfig {
+        backend_type: args.backend,
+        public_ip: public_ip.to_string(),
+        // Proxmox-only fields are left empty; setup-multi is for
+        // KVM/Docker/LXD where Proxmox-via-API doesn't apply.
+        proxmox_url: String::new(),
+        proxmox_token_id: String::new(),
+        proxmox_token_secret: String::new(),
+        proxmox_node: "pve".to_string(),
+        proxmox_storage: "local-lvm".to_string(),
+        proxmox_template: "local:vztmpl/ubuntu-22.04-standard.tar.zst".to_string(),
+        proxmox_bridge: "vmbr0".to_string(),
+        vmid_range_start: vmid_start,
+        vmid_range_end: vmid_end,
+        nostr_private_key: nostr_nsec,
+        nostr_relays: vec![
+            "wss://relay.damus.io".to_string(),
+            "wss://nos.lol".to_string(),
+            "wss://relay.nostr.band".to_string(),
+        ],
+        provider_name: provider_name.clone(),
+        provider_location: None,
+        capabilities: vec!["lxc".to_string(), "vm".to_string()],
+        specs,
+        whitelisted_mints: mints,
+        heartbeat_interval_secs: 60,
+        minimum_duration_seconds: 60,
+        tunnel_enabled: false,
+        tunnel_interface: None,
+        ssh_port_start: None,
+        ssh_port_end: None,
+        // Each provider gets its own redb so they don't fight over
+        // one wallet's localstore (cdk's per-process write lock
+        // would serialize all redemptions otherwise).
+        cashu_wallet_db_path: format!("./paygress-{}.redb", provider_name),
+    }
+}
+
+fn config_path_for(name: &str, i: usize) -> String {
+    format!("/etc/paygress/provider-{}-{}.json", name, i)
+}
+
+async fn execute_setup_multi(args: SetupMultiArgs, _verbose: bool) -> Result<()> {
+    use nostr_sdk::ToBech32;
+    use paygress::nostr::PodSpec;
+
+    println!("{}", "🔧 Paygress Multi-Provider Setup".blue().bold());
+    println!("{}", "━".repeat(50).blue());
+    println!("  Count:    {}", args.count.to_string().yellow());
+    println!("  Backend:  {:?}", args.backend);
+    println!("  Prefix:   {}", args.name.yellow());
+    println!();
+
+    if args.count < 2 {
+        anyhow::bail!("--count must be >= 2 (use plain `provider setup` for a single instance)");
+    }
+    if args.count > 32 {
+        anyhow::bail!(
+            "--count {} is unreasonably large; the vmid partition runs out at 32 \
+             (32 * 1000 = 32000, just below the kernel's typical max-pids cap)",
+            args.count
+        );
+    }
+
+    // Resolve public IP once and apply to all instances. They share
+    // the host so the IP is the same.
+    let public_ip = match args.public_ip.clone() {
+        Some(ip) => ip,
+        None => {
+            println!("  {} Auto-detecting public IP...", "⚙".yellow());
+            match reqwest::get("https://api.ipify.org").await {
+                Ok(resp) => resp
+                    .text()
+                    .await
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "127.0.0.1".to_string()),
+                Err(_) => "127.0.0.1".to_string(),
+            }
+        }
+    };
+    println!("  {} Public IP: {}", "✓".green(), public_ip);
+
+    let specs = vec![
+        PodSpec {
+            id: "basic".to_string(),
+            name: "Basic".to_string(),
+            description: "1 vCPU, 1GB RAM".to_string(),
+            cpu_millicores: 1000,
+            memory_mb: 1024,
+            rate_msats_per_sec: 50,
+        },
+        PodSpec {
+            id: "standard".to_string(),
+            name: "Standard".to_string(),
+            description: "2 vCPU, 2GB RAM".to_string(),
+            cpu_millicores: 2000,
+            memory_mb: 2048,
+            rate_msats_per_sec: 100,
+        },
+    ];
+    let mints: Vec<String> = args
+        .mints
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    println!();
+    let mut written: Vec<(String, String)> = Vec::new(); // (path, npub)
+    for i in 0..args.count {
+        let keys = nostr_sdk::Keys::generate();
+        let nsec = keys
+            .secret_key()
+            .to_bech32()
+            .map_err(|e| anyhow::anyhow!("encode nsec: {}", e))?;
+        let npub = keys
+            .public_key()
+            .to_bech32()
+            .map_err(|e| anyhow::anyhow!("encode npub: {}", e))?;
+
+        let cfg = build_multi_config(&args, i, &public_ip, nsec, specs.clone(), mints.clone());
+        let path = config_path_for(&args.name, i);
+        save_config(&path, &cfg)?;
+        println!(
+            "  {} {} → {} (vmid {}-{})",
+            "✓".green(),
+            cfg.provider_name.yellow(),
+            path,
+            cfg.vmid_range_start,
+            cfg.vmid_range_end,
+        );
+        println!("      npub: {}", npub.cyan());
+        written.push((path, npub));
+    }
+
+    if !args.no_systemd {
+        println!();
+        println!("{}", "━".repeat(50).blue());
+        println!(
+            "{}",
+            "systemd template unit (drop in if not present):".bold()
+        );
+        println!();
+        println!("  /etc/systemd/system/paygress-provider@.service");
+        println!();
+        println!("    [Unit]");
+        println!("    Description=Paygress Provider (instance %i)");
+        println!("    After=network.target");
+        println!();
+        println!("    [Service]");
+        println!("    Type=simple");
+        println!("    ExecStart=/usr/local/bin/paygress-cli provider start \\");
+        println!(
+            "        --config /etc/paygress/provider-{}-%i.json",
+            args.name
+        );
+        println!("    Restart=always");
+        println!("    RestartSec=10");
+        println!();
+        println!("    [Install]");
+        println!("    WantedBy=multi-user.target");
+        println!();
+        println!(
+            "  Then enable each instance: systemctl enable --now paygress-provider@{{0..{}}}",
+            args.count - 1
+        );
+    }
+
+    println!();
+    println!("{}", "━".repeat(50).blue());
+    println!("{}", "🎉 Multi-Provider Setup Complete".green().bold());
+    println!();
+    println!("Verify with: {} list", "paygress-cli".cyan());
+    println!(
+        "(after starting the services, all {} should appear with distinct npubs)",
+        args.count
+    );
+
+    Ok(())
 }
 
 async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
@@ -820,4 +1096,113 @@ fn update_provider_tunnel_config(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod setup_multi_tests {
+    use super::*;
+    use paygress::nostr::PodSpec;
+
+    fn args(count: usize) -> SetupMultiArgs {
+        SetupMultiArgs {
+            count,
+            backend: paygress::provider::BackendType::Docker,
+            name: "test".to_string(),
+            mints: "http://localhost:3338".to_string(),
+            public_ip: Some("203.0.113.1".to_string()),
+            no_systemd: true,
+        }
+    }
+
+    fn empty_specs() -> Vec<PodSpec> {
+        vec![]
+    }
+
+    #[test]
+    fn vmid_ranges_do_not_overlap() {
+        let a = args(5);
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for i in 0..5 {
+            let cfg = build_multi_config(
+                &a,
+                i,
+                "203.0.113.1",
+                "nsec1placeholder".to_string(),
+                empty_specs(),
+                vec![],
+            );
+            ranges.push((cfg.vmid_range_start, cfg.vmid_range_end));
+        }
+        // No overlap between any pair: either a is fully below b
+        // or b is fully below a.
+        for (i, (a_lo, a_hi)) in ranges.iter().enumerate() {
+            for (j, (b_lo, b_hi)) in ranges.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    a_hi < b_lo || b_hi < a_lo,
+                    "vmid ranges {} and {} overlap: ({},{}) vs ({},{})",
+                    i,
+                    j,
+                    a_lo,
+                    a_hi,
+                    b_lo,
+                    b_hi
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redb_paths_are_unique_per_instance() {
+        let a = args(3);
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                build_multi_config(
+                    &a,
+                    i,
+                    "203.0.113.1",
+                    "nsec1placeholder".to_string(),
+                    empty_specs(),
+                    vec![],
+                )
+                .cashu_wallet_db_path
+            })
+            .collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            paths.len(),
+            unique.len(),
+            "redb paths must be unique per instance: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn config_path_is_filesystem_safe() {
+        // No whitespace, no dots in the prefix-name slot. The
+        // name="test" + i=2 should produce a clean path.
+        let path = config_path_for("test", 2);
+        assert_eq!(path, "/etc/paygress/provider-test-2.json");
+    }
+
+    #[test]
+    fn provider_names_carry_the_index() {
+        let a = args(3);
+        let names: Vec<String> = (0..3)
+            .map(|i| {
+                build_multi_config(
+                    &a,
+                    i,
+                    "203.0.113.1",
+                    "nsec1placeholder".to_string(),
+                    empty_specs(),
+                    vec![],
+                )
+                .provider_name
+            })
+            .collect();
+        assert_eq!(names, vec!["test-0", "test-1", "test-2"]);
+    }
 }

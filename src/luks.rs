@@ -153,6 +153,23 @@ pub async fn create_encrypted_volume(
         img.display()
     );
 
+    // 0. Pre-create cleanup. A previous spawn at the same id may
+    //    have left a `/dev/mapper/paygress-<id>-luks` entry behind
+    //    (e.g. our own `destroy_encrypted_volume` lazy-umount'd the
+    //    mountpoint and the kernel hadn't released it by the time
+    //    `luksClose` ran, so `luksClose` saw EBUSY and silently
+    //    failed). Subsequent spawns at the same id then trip on
+    //    `luksOpen: device already exists`. Make the create path
+    //    self-healing by running destroy first — it's idempotent
+    //    and a no-op when nothing is leftover.
+    if let Err(e) = destroy_encrypted_volume(id).await {
+        warn!(
+            "pre-create cleanup of id={} returned {}; continuing — \
+             create steps will surface any persistent state",
+            id, e
+        );
+    }
+
     // 1. mkdir -p the parent directories. Both volumes/ and mounts/
     //    must exist before the next steps; they survive across
     //    spawns (best-effort once-per-host).
@@ -423,5 +440,27 @@ mod tests {
     fn paths_for_different_ids_do_not_collide() {
         assert_ne!(image_path(1), image_path(2));
         assert_ne!(mount_path(1), mount_path(2));
+    }
+
+    /// `destroy_encrypted_volume` must be a no-op when nothing
+    /// exists at the given id. The pre-create cleanup in
+    /// `create_encrypted_volume` relies on this — if destroy
+    /// surfaced an error on "nothing to clean up", the create
+    /// would short-circuit on a fresh host.
+    ///
+    /// Marked `#[ignore]` because it shells out to `cryptsetup` /
+    /// `umount` / `rm` and exercises the real filesystem; runs as
+    /// part of the VPS acceptance suite, not on a build host.
+    #[tokio::test]
+    #[ignore]
+    async fn destroy_is_a_no_op_when_nothing_exists() {
+        // High id deliberately chosen so it can't collide with a
+        // real spawn on the host.
+        let res = destroy_encrypted_volume(99_999).await;
+        assert!(
+            res.is_ok(),
+            "destroy_encrypted_volume must succeed on a never-created id, got {:?}",
+            res
+        );
     }
 }
