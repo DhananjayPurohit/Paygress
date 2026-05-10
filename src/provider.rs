@@ -857,6 +857,30 @@ impl ProviderService {
                     }
                 }
             }
+            drop(workloads);
+
+            // Expire reserved-but-never-promoted standby slots whose
+            // lease window has passed. Without this, a standby slot
+            // for a workload that never failed over (the common case
+            // — primaries usually outlive their lease) accumulates in
+            // the slots map until process restart. The watchdog skips
+            // promotion-on-silence checks for past-expiry slots
+            // anyway, but the memory grows unbounded across long-
+            // running providers serving many warm-standby workloads.
+            let mut slots = self.standby_slots.lock().await;
+            let expired_slots: Vec<String> = slots
+                .iter()
+                .filter(|(_, slot)| slot.expires_at <= now)
+                .map(|(workload_id, _)| workload_id.clone())
+                .collect();
+            for workload_id in expired_slots {
+                if let Some(slot) = slots.remove(&workload_id) {
+                    info!(
+                        "Expiring standby slot for workload {} (index {}/{}, primary {}, expired at {})",
+                        workload_id, slot.standby_index, slot.standby_count, slot.primary_npub, slot.expires_at
+                    );
+                }
+            }
         }
     }
 
@@ -2331,5 +2355,74 @@ mod tests {
         // positive threshold; so primary is treated as alive. Better
         // false-negative (no promotion) than panic.
         assert!(!primary_is_silent(100, 200, 180));
+    }
+
+    // ----- standby slot expiry: cleanup_loop selection -----
+
+    fn make_slot(workload_id: &str, expires_at: u64) -> StandbySlot {
+        StandbySlot {
+            workload_id: workload_id.to_string(),
+            primary_npub: "npub1primary".to_string(),
+            standby_index: 0,
+            standby_count: 1,
+            container_config: ContainerConfig {
+                id: 1,
+                name: "test".to_string(),
+                image: "img".to_string(),
+                cpu_cores: 1,
+                memory_mb: 1024,
+                storage_gb: 10,
+                password: "p".to_string(),
+                ssh_key: None,
+                host_port: None,
+                template_ports: vec![],
+                template_env: HashMap::new(),
+                extra_runtime_args: vec![],
+                data_path: None,
+                volume_encryption_key: None,
+            },
+            spec_id: "basic".to_string(),
+            expires_at,
+            owner_npub: "npub1owner".to_string(),
+            created_at: 0,
+            peer_standby_npubs: vec![],
+        }
+    }
+
+    fn select_expired(slots: &HashMap<String, StandbySlot>, now: u64) -> Vec<String> {
+        slots
+            .iter()
+            .filter(|(_, slot)| slot.expires_at <= now)
+            .map(|(workload_id, _)| workload_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn select_expired_returns_only_past_expiry_slots() {
+        let mut slots = HashMap::new();
+        slots.insert("active".to_string(), make_slot("active", 2_000));
+        slots.insert("expired".to_string(), make_slot("expired", 999));
+        let mut expired = select_expired(&slots, 1_000);
+        expired.sort();
+        assert_eq!(expired, vec!["expired".to_string()]);
+    }
+
+    #[test]
+    fn select_expired_treats_expires_at_equals_now_as_expired() {
+        // A slot whose lease ends *exactly now* should be reaped on
+        // this tick, not held over for the next 30s tick. expires_at
+        // is the FIRST instant the lease no longer applies.
+        let mut slots = HashMap::new();
+        slots.insert("boundary".to_string(), make_slot("boundary", 1_000));
+        let expired = select_expired(&slots, 1_000);
+        assert_eq!(expired, vec!["boundary".to_string()]);
+    }
+
+    #[test]
+    fn select_expired_returns_empty_when_no_slots_expired() {
+        let mut slots = HashMap::new();
+        slots.insert("a".to_string(), make_slot("a", 9_999));
+        slots.insert("b".to_string(), make_slot("b", 9_999));
+        assert!(select_expired(&slots, 1_000).is_empty());
     }
 }
