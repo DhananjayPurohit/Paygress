@@ -30,6 +30,7 @@ pub mod volume_encryption;
 pub mod compute;
 pub mod discovery;
 pub mod docker;
+pub mod luks;
 pub mod lxd;
 pub mod provider;
 pub mod proxmox;

@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         template_env,
         extra_runtime_args,
         data_path: def.data_path.map(|p| p.to_string()),
+        volume_encryption_key: None,
     };
 
     let docker_id = backend.create_container(&cfg).await?;
