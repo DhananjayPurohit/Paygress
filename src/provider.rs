@@ -356,8 +356,9 @@ impl ProviderService {
         // Publish initial offer
         self.publish_offer().await?;
 
-        // Run heartbeat loop, request listener, cleanup loop, and
-        // orchestrator loop (Unit 5 wiring) concurrently.
+        // Run heartbeat loop, request listener, cleanup loop,
+        // orchestrator loop (Unit 5 wiring), and standby watchdog
+        // (closes the hard-crash failover gap) concurrently.
         tokio::select! {
             result = self.heartbeat_loop() => {
                 error!("Heartbeat loop exited: {:?}", result);
@@ -373,6 +374,10 @@ impl ProviderService {
             }
             result = self.orchestrator_loop() => {
                 error!("Orchestrator loop exited: {:?}", result);
+                result
+            }
+            result = self.standby_watchdog_loop() => {
+                error!("Standby watchdog loop exited: {:?}", result);
                 result
             }
         }
@@ -839,6 +844,155 @@ impl ProviderService {
             }
         }
     }
+
+    /// Standby watchdog: detect a primary that has stopped publishing
+    /// heartbeats and promote ourselves on its behalf.
+    ///
+    /// Why this exists
+    /// ---------------
+    /// PR #43 wired the standby's `LeaseRevocation` listener: when
+    /// the primary's orchestrator emits a revocation event (graceful
+    /// "I can no longer keep this workload alive"), the standby
+    /// promotes after `index * STANDBY_PROMOTION_DELAY_SECS`. That
+    /// covers the *graceful* failover case — primary still has
+    /// network access to publish, just decided to give up the lease.
+    ///
+    /// It does NOT cover **hard crash**: primary process dies, host
+    /// loses network, kernel panics, etc. No revocation event ever
+    /// fires; standbys never promote. Without this loop, paygress's
+    /// warm-standby promise reduces to "high-availability against
+    /// the workload itself dying, not against the provider hosting
+    /// it dying" — which is the more common failure mode.
+    ///
+    /// How it works
+    /// ------------
+    /// Every `STANDBY_WATCHDOG_INTERVAL_SECS`, the standby:
+    ///   1. Snapshots its `standby_slots`.
+    ///   2. Batches the unique primary npubs across those slots and
+    ///      asks Nostr for the latest heartbeat per primary.
+    ///   3. For each slot whose primary's last heartbeat is older
+    ///      than `STANDBY_HEARTBEAT_SILENCE_SECS`, fires
+    ///      `schedule_standby_promotion(slot)`.
+    ///
+    /// The race with the existing revocation listener is handled by
+    /// `schedule_standby_promotion` itself: it removes the slot from
+    /// the map atomically inside the spawned task, so first caller
+    /// wins. Watchdog and revocation listener can both fire for the
+    /// same slot; only one promotion runs.
+    async fn standby_watchdog_loop(&self) -> Result<()> {
+        let interval = tokio::time::Duration::from_secs(STANDBY_WATCHDOG_INTERVAL_SECS);
+        info!(
+            "Standby watchdog loop starting (cadence: {}s, silence threshold: {}s)",
+            STANDBY_WATCHDOG_INTERVAL_SECS, STANDBY_HEARTBEAT_SILENCE_SECS
+        );
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let slots: Vec<StandbySlot> = {
+                let lock = self.standby_slots.lock().await;
+                lock.values().cloned().collect()
+            };
+            if slots.is_empty() {
+                continue;
+            }
+
+            // Dedupe primaries — many slots may share one primary
+            // (single workload with N standbys), no point querying
+            // its heartbeat once per slot.
+            let primary_npubs: Vec<String> = slots
+                .iter()
+                .map(|s| s.primary_npub.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let heartbeats = match self.nostr.get_latest_heartbeats_multi(primary_npubs).await {
+                Ok(hb) => hb,
+                Err(e) => {
+                    warn!(
+                        "standby watchdog: heartbeat batch query failed: {}; \
+                         skipping this tick (will retry next interval)",
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+
+            for slot in slots {
+                let last_seen = heartbeats
+                    .get(&slot.primary_npub)
+                    .map(|hb| hb.timestamp)
+                    .unwrap_or(0);
+                if !primary_is_silent(now, last_seen, STANDBY_HEARTBEAT_SILENCE_SECS) {
+                    continue;
+                }
+                let silence_secs = now.saturating_sub(last_seen);
+                warn!(
+                    "Primary {} silent for {}s on slot workload_id={} (threshold {}s); \
+                     triggering standby promotion (assumes hard crash; revocation \
+                     listener and watchdog dedupe via slot.remove)",
+                    slot.primary_npub,
+                    silence_secs,
+                    slot.workload_id,
+                    STANDBY_HEARTBEAT_SILENCE_SECS
+                );
+                schedule_standby_promotion(
+                    self.backend.clone(),
+                    self.active_workloads.clone(),
+                    self.state_machine.clone(),
+                    self.standby_slots.clone(),
+                    slot,
+                );
+            }
+        }
+    }
+}
+
+/// Cadence at which the standby watchdog re-queries heartbeats. 30s
+/// matches `cleanup_loop` so we don't add a new periodic on the box.
+const STANDBY_WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+/// Heartbeat-silence threshold: how long without a primary heartbeat
+/// before we treat the primary as crashed. 180s = 3× the default
+/// 60s heartbeat cadence — gives the primary two missed beats of
+/// grace (transient relay flake, brief network blip) before
+/// promotion fires. Configurable in `ProviderConfig` is a
+/// follow-up; today it's a constant so the silence window is
+/// uniform across all standbys.
+const STANDBY_HEARTBEAT_SILENCE_SECS: u64 = 180;
+
+/// Pure-function silence check, factored out for unit testing. The
+/// watchdog calls this for each (now, last_seen, threshold) tuple.
+///
+/// Returns `true` iff the primary should be treated as crashed:
+///   - `last_seen == 0`              — we've never seen a heartbeat
+///                                     for this primary. Treat as
+///                                     silent immediately; the slot
+///                                     wouldn't exist if the primary
+///                                     hadn't acknowledged the
+///                                     spawn DM at standby-time, so
+///                                     this means the primary went
+///                                     silent before publishing any
+///                                     heartbeat we could see.
+///   - `now - last_seen >= threshold` — we've seen heartbeats but
+///                                     the most recent is older than
+///                                     the silence window.
+///
+/// The `last_seen == 0` short-circuit is intentional. Without it, a
+/// brand-new standby that just received a spawn for a primary it
+/// hasn't yet observed via Nostr would NOT promote on a primary
+/// crash that happened before any heartbeat reached us — exactly the
+/// failure mode the watchdog is supposed to catch.
+fn primary_is_silent(now: u64, last_seen: u64, threshold: u64) -> bool {
+    if last_seen == 0 {
+        return true;
+    }
+    now.saturating_sub(last_seen) >= threshold
 }
 
 // Clone impl removed as ComputeBackend is Arc'd
@@ -2020,5 +2174,48 @@ mod tests {
             ),
         );
         assert_eq!(r, WarmStandbyRole::NotAddressed);
+    }
+
+    // ----- standby watchdog: primary_is_silent decision -----
+    //
+    // The pure-function gate the watchdog uses to decide whether to
+    // fire `schedule_standby_promotion` for a slot. Pinning the
+    // edge cases here so a future refactor can't silently flip the
+    // semantics that the warm-standby crash-detection promise rests
+    // on.
+
+    #[test]
+    fn fresh_primary_heartbeat_is_not_silent() {
+        // Heartbeat 60s old, threshold 180s — comfortably alive.
+        assert!(!primary_is_silent(1_000_000, 999_940, 180));
+    }
+
+    #[test]
+    fn primary_just_past_threshold_is_silent() {
+        // 180s old vs 180s threshold — promotion fires.
+        assert!(primary_is_silent(1_000_000, 999_820, 180));
+        // 179s old — still alive (one second of grace).
+        assert!(!primary_is_silent(1_000_000, 999_821, 180));
+    }
+
+    #[test]
+    fn never_seen_primary_is_immediately_silent() {
+        // last_seen == 0 means "no heartbeat ever observed for this
+        // primary". A standby with a slot but no observed heartbeat
+        // means the primary went silent before we could see one —
+        // exactly the failure mode the watchdog must catch.
+        assert!(primary_is_silent(1_000_000, 0, 180));
+        // Even with a tiny "now" value, the unset-marker case still
+        // returns true.
+        assert!(primary_is_silent(50, 0, 180));
+    }
+
+    #[test]
+    fn clock_skew_underflow_does_not_panic_or_misfire() {
+        // last_seen > now (clock went backwards or relay returned
+        // a future-stamped event). saturating_sub yields 0; 0 < any
+        // positive threshold; so primary is treated as alive. Better
+        // false-negative (no promotion) than panic.
+        assert!(!primary_is_silent(100, 200, 180));
     }
 }
