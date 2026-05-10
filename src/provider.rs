@@ -26,8 +26,8 @@ use crate::nostr::{
     parse_private_message_content, warm_standby_role, AccessDetailsContent, CapacityInfo,
     EncryptedSpawnPodRequest, EncryptedTopUpPodRequest, ErrorResponseContent, HeartbeatContent,
     LeaseRevocationContent, NostrRelaySubscriber, PodSpec, PrivateRequest, ProviderOfferContent,
-    RelayConfig, StatusRequestContent, StatusResponseContent, TopUpResponseContent,
-    WarmStandbyRole,
+    RelayConfig, StandbyPromotionAnnouncementContent, StatusRequestContent, StatusResponseContent,
+    TopUpResponseContent, WarmStandbyRole,
 };
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 use crate::templates::{TemplateDefinition, TemplateName};
@@ -2024,25 +2024,16 @@ fn compute_warm_standby_role(
     }
 }
 
-/// How fresh a peer-standby heartbeat must be (in seconds, relative
-/// to the moment we evaluate it) to count as evidence that a peer
-/// has already promoted to primary. Heartbeat cadence is 60s; we
-/// give two cadences of grace so a momentarily-flaky relay
-/// subscription doesn't make a higher-indexed standby falsely
-/// proceed and split-brain.
-const PEER_PROMOTION_FRESH_SECS: u64 = 120;
-
 /// Spawn the standby promotion task. Runs on its own tokio task so
 /// the request handler returns immediately. Sleeps for the
 /// per-standby ordered backoff, then:
-///   1. Pre-emption check — query heartbeats from peer standbys.
-///      If any has a fresh heartbeat (within the last
-///      PEER_PROMOTION_FRESH_SECS), assume that peer has already
-///      promoted; drop the slot and return without spawning.
+///   1. Pre-emption check — query for any
+///      `StandbyPromotionAnnouncement` event for this workload_id
+///      authored by a peer standby. If one exists, drop the slot
+///      without spawning (a peer beat us to it).
 ///   2. Spawn the container locally.
-///   3. Publish a heartbeat immediately so higher-indexed peers
-///      see fresh evidence on their next pre-emption check and
-///      back off without spawning a duplicate primary.
+///   3. Publish a `StandbyPromotionAnnouncement` so higher-indexed
+///      peers' pre-emption check finds it and they back off.
 fn schedule_standby_promotion(
     backend: Arc<dyn ComputeBackend>,
     workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
@@ -2084,40 +2075,34 @@ fn schedule_standby_promotion(
             }
         };
 
-        // Pre-emption check: has a peer standby already promoted?
-        // Query heartbeats from each peer's npub; if any is fresh
-        // (published within the last PEER_PROMOTION_FRESH_SECS),
-        // that peer is now primary and we should NOT promote.
-        // Without this check N standbys all promote at silence-
-        // detection + index*backoff, producing N concurrent
-        // primaries running the same workload (split-brain).
+        // Pre-emption check: has a peer standby already promoted
+        // for this exact workload_id? Query the dedicated
+        // `StandbyPromotionAnnouncement` event kind (38386), which
+        // is published exactly once per promotion. Heartbeats can't
+        // serve this role: every standby provider runs a periodic
+        // heartbeat loop regardless of promotion state, so a fresh
+        // heartbeat from a peer means "peer is online", NOT "peer
+        // promoted". The announcement event is unambiguous.
         if !slot.peer_standby_npubs.is_empty() {
             match nostr
-                .get_latest_heartbeats_multi(slot.peer_standby_npubs.clone())
+                .query_standby_promotion_announcements(&slot.workload_id, &slot.peer_standby_npubs)
                 .await
             {
-                Ok(peer_heartbeats) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if let Some((peer_npub, hb)) = peer_heartbeats.iter().find(|(_, hb)| {
-                        now.saturating_sub(hb.timestamp) <= PEER_PROMOTION_FRESH_SECS
-                    }) {
-                        info!(
-                            "Peer standby {} already promoted (fresh heartbeat at {}s ago, threshold {}s); \
-                             dropping slot for workload {} without spawning",
-                            peer_npub,
-                            now.saturating_sub(hb.timestamp),
-                            PEER_PROMOTION_FRESH_SECS,
-                            slot.workload_id
-                        );
-                        return;
-                    }
+                Ok(Some(announcement)) => {
+                    info!(
+                        "Peer standby {} already promoted workload {} at {}; dropping slot without spawning",
+                        announcement.new_primary_npub,
+                        announcement.workload_id,
+                        announcement.promoted_at
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    // No peer has announced — proceed with promotion.
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to query peer standby heartbeats for workload {}: {}; proceeding with promotion (best-effort)",
+                        "Failed to query peer promotion announcements for workload {}: {}; proceeding with promotion (best-effort)",
                         slot.workload_id, e
                     );
                 }
@@ -2189,27 +2174,28 @@ fn schedule_standby_promotion(
             "Standby promotion complete: workload {} now running locally (vmid {})",
             slot.workload_id, slot.container_config.id
         );
+        let _ = active_workloads_count; // currently unused now that we publish announcement instead of heartbeat
 
-        // Publish a heartbeat IMMEDIATELY so higher-indexed peer
-        // standbys see fresh evidence of an already-promoted peer
-        // on their next pre-emption check. Without this the
-        // periodic heartbeat loop runs every 60s and a peer's
-        // backoff might expire before the first heartbeat lands,
-        // producing a duplicate primary.
-        let immediate_heartbeat = HeartbeatContent {
-            provider_npub: nostr.get_service_public_key(),
-            timestamp: now,
-            active_workloads: active_workloads_count,
-            available_capacity: CapacityInfo {
-                cpu_available: 0,
-                memory_mb_available: 0,
-                storage_gb_available: 0,
-            },
+        // Publish a `StandbyPromotionAnnouncement` IMMEDIATELY so
+        // higher-indexed peer standbys see it on their next
+        // pre-emption check (which fires after their per-index
+        // backoff). Without this announcement, peers would either
+        // produce a duplicate primary (no signal) or both drop
+        // their slots (heartbeat-based dedup, since every peer
+        // emits its own periodic heartbeat regardless of
+        // promotion state).
+        let announcement = StandbyPromotionAnnouncementContent {
+            workload_id: slot.workload_id.clone(),
+            new_primary_npub: nostr.get_service_public_key(),
+            promoted_at: now,
             version: crate::nostr::SCHEMA_VERSION,
         };
-        if let Err(e) = nostr.publish_heartbeat(immediate_heartbeat).await {
+        if let Err(e) = nostr
+            .publish_standby_promotion_announcement(announcement)
+            .await
+        {
             warn!(
-                "Post-promotion heartbeat publish failed for workload {}: {}; periodic loop will catch up on next tick",
+                "Post-promotion announcement publish failed for workload {}: {}; peer standbys will not back off and may produce a duplicate primary",
                 slot.workload_id, e
             );
         }

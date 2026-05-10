@@ -41,6 +41,17 @@ pub const KIND_PROVIDER_HEARTBEAT_EPHEMERAL: u16 = 20384;
 /// and each standby is added as a `#p` tag for filterable subscriptions.
 pub const KIND_LEASE_REVOCATION: u16 = 38385;
 
+/// Published by a standby provider IMMEDIATELY after it finishes
+/// promoting a workload to local primary. Other standbys for the
+/// same workload check for one of these events before claiming
+/// their own slot, so only the lowest-indexed standby that wins
+/// the promotion race actually spawns a container — the rest see
+/// the announcement and drop their slot. NIP-33 addressable: the
+/// `d` tag is `paygress:promoted:v1:<workload_id>`, so subsequent
+/// announcements for the same workload (e.g. a re-failover) replace
+/// the previous one rather than accumulating.
+pub const KIND_STANDBY_PROMOTION_ANNOUNCEMENT: u16 = 38386;
+
 /// Schema version for offer + heartbeat payloads. Old payloads
 /// without this field deserialize to `1` via `#[serde(default)]`.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -1099,6 +1110,29 @@ pub struct LeaseRevocationContent {
     pub version: u8,
 }
 
+/// Published by a standby provider IMMEDIATELY after it finishes
+/// promoting a workload to local primary. Distinguishable from a
+/// regular periodic heartbeat because the heartbeat says "this
+/// provider is online" whereas this event says "this provider has
+/// just claimed this workload's primary role". Higher-indexed
+/// peers query for these events at promotion-time and drop their
+/// slot if they see one from a peer for the same workload_id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandbyPromotionAnnouncementContent {
+    /// Consumer-assigned workload identifier (the same UUID-shaped
+    /// string used by `LeaseRevocationContent.workload_id` and the
+    /// spawn request's `workload_id`).
+    pub workload_id: String,
+    /// The npub of the standby provider that has just promoted to
+    /// primary. Peers compare this against their own npub to
+    /// confirm the claim is from a peer (not themselves).
+    pub new_primary_npub: String,
+    /// Unix-second timestamp at which the promotion completed.
+    pub promoted_at: u64,
+    #[serde(default = "default_schema_version")]
+    pub version: u8,
+}
+
 /// Provider info as seen by discovery clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfo {
@@ -1297,6 +1331,99 @@ impl NostrRelaySubscriber {
                 Err(e.into())
             }
         }
+    }
+
+    /// Publish a `StandbyPromotionAnnouncement` for a freshly-
+    /// promoted workload. NIP-33 addressable: `d` tag is
+    /// `paygress:promoted:v1:<workload_id>` so a re-failover for
+    /// the same workload replaces the prior announcement.
+    pub async fn publish_standby_promotion_announcement(
+        &self,
+        announcement: StandbyPromotionAnnouncementContent,
+    ) -> Result<String> {
+        let content = serde_json::to_string(&announcement)?;
+        let d_tag = format!(
+            "paygress:promoted:v{}:{}",
+            announcement.version, announcement.workload_id
+        );
+        let v_tag = announcement.version.to_string();
+        let tags = vec![
+            Tag::hashtag("paygress"),
+            Tag::hashtag("paygress-promoted"),
+            Tag::parse(["d", d_tag.as_str()])?,
+            Tag::parse(["v", v_tag.as_str()])?,
+            Tag::parse(["workload", announcement.workload_id.as_str()])?,
+        ];
+
+        let event = EventBuilder::new(Kind::Custom(KIND_STANDBY_PROMOTION_ANNOUNCEMENT), content)
+            .tags(tags)
+            .sign_with_keys(&self.keys)?;
+        let event_id = event.id.to_hex();
+
+        match self.client.send_event(&event).await {
+            Ok(out) => {
+                info!(
+                    "📢 Standby promotion announcement published for workload {}: {} accepted by {} relay(s)",
+                    announcement.workload_id,
+                    event_id,
+                    out.success.len()
+                );
+                Ok(event_id)
+            }
+            Err(e) => {
+                error!("Failed to publish standby promotion announcement: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Query for any `StandbyPromotionAnnouncement` for `workload_id`
+    /// authored by one of `peer_npubs`. Returns the first matching
+    /// event's content (or None). The watchdog/promotion path uses
+    /// this BEFORE spawning a container to detect that a peer has
+    /// already promoted; if any event is found, the local standby
+    /// drops its slot rather than producing a duplicate primary.
+    pub async fn query_standby_promotion_announcements(
+        &self,
+        workload_id: &str,
+        peer_npubs: &[String],
+    ) -> Result<Option<StandbyPromotionAnnouncementContent>> {
+        if peer_npubs.is_empty() {
+            return Ok(None);
+        }
+        let mut authors = Vec::new();
+        for npub in peer_npubs {
+            if let Ok(pk) = nostr_sdk::PublicKey::parse(npub) {
+                authors.push(pk);
+            }
+        }
+        if authors.is_empty() {
+            return Ok(None);
+        }
+
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_STANDBY_PROMOTION_ANNOUNCEMENT))
+            .authors(authors)
+            .custom_tag(
+                nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::D),
+                format!("paygress:promoted:v{}:{}", SCHEMA_VERSION, workload_id),
+            );
+
+        let events = self
+            .client
+            .fetch_events(filter, std::time::Duration::from_secs(5))
+            .await?;
+
+        for event in events.iter() {
+            if let Ok(content) =
+                serde_json::from_str::<StandbyPromotionAnnouncementContent>(&event.content)
+            {
+                if content.workload_id == workload_id {
+                    return Ok(Some(content));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Query all provider offers from relays
