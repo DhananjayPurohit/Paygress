@@ -42,17 +42,31 @@ pub enum ProviderAction {
 
 #[derive(Args)]
 pub struct SetupArgs {
-    /// Proxmox API URL (e.g., https://192.168.1.100:8006/api2/json)
-    #[arg(long)]
-    pub proxmox_url: String,
+    /// Compute backend the provider will use to run consumer
+    /// workloads. Determines the offer's `isolation_level`:
+    ///   - `proxmox` / `lxd` / `docker` → `shared-kernel`
+    ///   - `kvm`                          → `dedicated-host` (per-VM)
+    /// Default is `proxmox` for backwards compatibility with
+    /// existing setups; new operators on bare-metal Linux usually
+    /// want `--backend kvm` (no Proxmox install needed) or
+    /// `--backend docker` (for the killer-templates path).
+    #[arg(long, default_value = "proxmox", value_parser = parse_backend)]
+    pub backend: paygress::provider::BackendType,
 
-    /// Proxmox API token ID (e.g., root@pam!paygress)
-    #[arg(long)]
-    pub token_id: String,
+    /// Proxmox API URL (e.g., https://192.168.1.100:8006/api2/json).
+    /// Required only when `--backend proxmox`.
+    #[arg(long, required_if_eq("backend", "proxmox"))]
+    pub proxmox_url: Option<String>,
 
-    /// Proxmox API token secret
-    #[arg(long)]
-    pub token_secret: String,
+    /// Proxmox API token ID (e.g., root@pam!paygress).
+    /// Required only when `--backend proxmox`.
+    #[arg(long, required_if_eq("backend", "proxmox"))]
+    pub token_id: Option<String>,
+
+    /// Proxmox API token secret.
+    /// Required only when `--backend proxmox`.
+    #[arg(long, required_if_eq("backend", "proxmox"))]
+    pub token_secret: Option<String>,
 
     /// Proxmox node name
     #[arg(long, default_value = "pve")]
@@ -231,13 +245,16 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         }
     };
 
-    // Create configuration
+    // Create configuration. proxmox_* fields are only meaningful
+    // for `backend == Proxmox`; for other backends they're stored
+    // as empty strings (the JSON keeps the same shape so rolling
+    // back to Proxmox just needs `--proxmox-url ...` re-supplied).
     let config = ProviderConfig {
-        backend_type: Default::default(),
+        backend_type: args.backend,
         public_ip,
-        proxmox_url: args.proxmox_url,
-        proxmox_token_id: args.token_id,
-        proxmox_token_secret: args.token_secret,
+        proxmox_url: args.proxmox_url.unwrap_or_default(),
+        proxmox_token_id: args.token_id.unwrap_or_default(),
+        proxmox_token_secret: args.token_secret.unwrap_or_default(),
         proxmox_node: args.node,
         proxmox_storage: args.storage,
         proxmox_template: args.template,
@@ -268,8 +285,44 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
     save_config(CONFIG_PATH, &config)?;
     println!("  {} Configuration saved to {}", "✓".green(), CONFIG_PATH);
 
-    // Test Proxmox connection
+    // Per-backend startup check. Skip the Proxmox round-trip for
+    // backends that don't talk to Proxmox; for KVM, surface the
+    // /dev/kvm + qemu requirement at setup time so the operator
+    // doesn't discover it at first-spawn.
     println!();
+    match args.backend {
+        paygress::provider::BackendType::Kvm => {
+            println!("  {} Verifying KVM availability...", "⚙".yellow());
+            match paygress::kvm::KvmBackend::check_kvm_available().await {
+                Ok(version) => println!(
+                    "  {} KVM available — {} (offer publishes isolation_level=dedicated-host)",
+                    "✓".green(),
+                    version
+                ),
+                Err(e) => println!("  {} KVM unavailable: {}", "✗".red(), e),
+            }
+            return finalize_setup(&args.name);
+        }
+        paygress::provider::BackendType::Docker => {
+            println!("  {} Backend = Docker; no Proxmox check.", "⚙".yellow());
+            println!(
+                "  {} Ensure `docker` is on PATH and the service user can run it.",
+                "→".cyan()
+            );
+            return finalize_setup(&args.name);
+        }
+        paygress::provider::BackendType::LXD => {
+            println!("  {} Backend = LXD; no Proxmox check.", "⚙".yellow());
+            println!(
+                "  {} Ensure `lxc` is on PATH and the service user is in the `lxd` group.",
+                "→".cyan()
+            );
+            return finalize_setup(&args.name);
+        }
+        paygress::provider::BackendType::Proxmox => { /* fall through */ }
+    }
+
+    // Proxmox-only path: validate the API connection.
     println!("  {} Testing Proxmox connection...", "⚙".yellow());
 
     match paygress::proxmox::ProxmoxClient::new(
@@ -297,6 +350,12 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         }
     }
 
+    finalize_setup(&args.name)
+}
+
+/// Print the post-setup "Setup Complete!" banner. Extracted from
+/// `execute_setup` so per-backend early-returns share one ending.
+fn finalize_setup(provider_name: &str) -> Result<()> {
     println!();
     println!("{}", "━".repeat(50).blue());
     println!("{}", "🎉 Setup Complete!".green().bold());
@@ -304,9 +363,24 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
     println!("To start your provider, run:");
     println!("  {} provider start", "paygress-cli".cyan());
     println!();
-    println!("Your provider name: {}", args.name.yellow());
-
+    println!("Your provider name: {}", provider_name.yellow());
     Ok(())
+}
+
+/// clap value-parser for `--backend`. Maps the kebab-case slug
+/// (`proxmox` / `lxd` / `docker` / `kvm`) onto the
+/// `BackendType` enum, with a friendly error listing valid values.
+fn parse_backend(s: &str) -> std::result::Result<paygress::provider::BackendType, String> {
+    match s {
+        "proxmox" => Ok(paygress::provider::BackendType::Proxmox),
+        "lxd" => Ok(paygress::provider::BackendType::LXD),
+        "docker" => Ok(paygress::provider::BackendType::Docker),
+        "kvm" => Ok(paygress::provider::BackendType::Kvm),
+        other => Err(format!(
+            "unknown backend `{}` (expected one of: proxmox, lxd, docker, kvm)",
+            other
+        )),
+    }
 }
 
 async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {

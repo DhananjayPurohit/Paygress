@@ -274,6 +274,7 @@ impl PaygressMcpServer {
                 min_uptime: params.min_uptime,
                 min_memory_mb: None,
                 min_cpu: None,
+                isolation_level: None,
             })
         } else {
             None
@@ -310,6 +311,7 @@ impl PaygressMcpServer {
             params.ssh_user.clone(),
             ssh_pass.clone(),
             params.template.clone(),
+            None,
             None,
             None,
             None,
@@ -409,6 +411,7 @@ impl PaygressMcpServer {
                     ssh_user.clone(),
                     ssh_pass.clone(),
                     template,
+                    None,
                     None,
                     None,
                     None,

@@ -291,6 +291,11 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         // overrides live on `paygress-cli spawn`.
         encrypt_volume: false,
         no_encrypt_volume: false,
+        // Deploy doesn't expose --isolation-level today; consumers
+        // who need a stricter tier use `paygress-cli spawn` directly.
+        // The default (None) means deploy accepts any tier the
+        // provider offers — matching today's behavior.
+        isolation_level: None,
     };
     spawn::execute(spawn_args, verbose).await
 }

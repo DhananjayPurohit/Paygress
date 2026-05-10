@@ -87,6 +87,7 @@ impl DiscoveryClient {
                 total_jobs_completed: offer.total_jobs_completed,
                 last_seen,
                 is_online,
+                isolation_level: offer.isolation_level,
             };
 
             // Apply filters
@@ -108,6 +109,11 @@ impl DiscoveryClient {
                 }
                 if let Some(min_cpu) = f.min_cpu {
                     if !provider.specs.iter().any(|s| s.cpu_millicores >= min_cpu) {
+                        continue;
+                    }
+                }
+                if let Some(min_iso) = f.isolation_level {
+                    if !provider.isolation_level.meets(min_iso) {
                         continue;
                     }
                 }
@@ -388,6 +394,7 @@ mod tests {
             total_jobs_completed: 10,
             last_seen: 0,
             is_online: true,
+            isolation_level: crate::nostr::IsolationLevel::SharedKernel,
         }];
 
         let table = DiscoveryClient::format_provider_table(&providers);

@@ -139,6 +139,28 @@ pub struct SpawnArgs {
     /// encryption-related provider issue.
     #[arg(long, conflicts_with = "encrypt_volume")]
     pub no_encrypt_volume: bool,
+
+    /// Minimum isolation tier the provider must offer.
+    /// `shared-kernel` (containers, weakest), `dedicated-host`
+    /// (per-VM, no co-tenants), or `attested-research-tier`
+    /// (SEV-SNP / TDX confidential VM). Stricter tiers also match.
+    /// The CLI verifies the provider's offer meets this tier
+    /// BEFORE the Cashu token is sent — a tier mismatch fails
+    /// fast and never spends the token.
+    #[arg(long, value_parser = parse_isolation_level_arg)]
+    pub isolation_level: Option<paygress::nostr::IsolationLevel>,
+}
+
+/// clap value-parser for the `--isolation-level` flag. Mirrors the
+/// one in `list.rs` (kept local to avoid cross-command coupling).
+fn parse_isolation_level_arg(s: &str) -> Result<paygress::nostr::IsolationLevel, String> {
+    paygress::nostr::IsolationLevel::from_slug(s).ok_or_else(|| {
+        format!(
+            "unknown isolation level `{}` (expected one of: \
+             shared-kernel, dedicated-host, attested-research-tier)",
+            s
+        )
+    })
 }
 
 /// Translate the `--replication` + `--standby` CLI flags into the
@@ -339,6 +361,7 @@ pub async fn nostr_spawn_round_trip(
     primary_npub: Option<String>,
     workload_id: Option<String>,
     volume_encryption: Option<paygress::nostr::VolumeEncryption>,
+    isolation_level: Option<paygress::nostr::IsolationLevel>,
     relays: Vec<String>,
     nostr_key: String,
     timeout_secs: u64,
@@ -358,6 +381,23 @@ pub async fn nostr_spawn_round_trip(
     // spending the token rather than after.
     if !provider.specs.iter().any(|s| s.id == tier) {
         anyhow::bail!("Tier '{}' not available on this provider", tier);
+    }
+
+    // Isolation-tier pre-check: if caller demanded a minimum tier,
+    // refuse the spawn (and never spend the token) when the
+    // provider's offer doesn't meet it. The check uses
+    // `IsolationLevel::meets`, so `dedicated-host` matches both
+    // `dedicated-host` and `attested-research-tier` providers.
+    if let Some(min_iso) = isolation_level {
+        if !provider.isolation_level.meets(min_iso) {
+            anyhow::bail!(
+                "provider's isolation tier `{}` does not meet requested minimum `{}`; \
+                 try `paygress-cli list --isolation-level {}` to discover providers that do",
+                provider.isolation_level.slug(),
+                min_iso.slug(),
+                min_iso.slug(),
+            );
+        }
     }
 
     let request = EncryptedSpawnPodRequest {
@@ -506,6 +546,7 @@ async fn execute_nostr_spawn(
         args.primary_npub.clone(),
         effective_workload_id,
         volume_encryption,
+        args.isolation_level,
         relays,
         nostr_key,
         120,

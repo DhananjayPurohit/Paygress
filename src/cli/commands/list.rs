@@ -12,7 +12,20 @@ use indicatif::{ProgressBar, ProgressStyle};
 use super::identity::parse_relays;
 use crate::api::PaygressClient;
 use paygress::discovery::DiscoveryClient;
-use paygress::nostr::ProviderFilter;
+use paygress::nostr::{IsolationLevel, ProviderFilter};
+
+/// clap value-parser for the `--isolation-level` flag. Mirrors
+/// `IsolationLevel::from_slug` but errors with a list of valid
+/// values instead of returning `None`.
+fn parse_isolation_level(s: &str) -> Result<IsolationLevel, String> {
+    IsolationLevel::from_slug(s).ok_or_else(|| {
+        format!(
+            "unknown isolation level `{}` (expected one of: \
+             shared-kernel, dedicated-host, attested-research-tier)",
+            s
+        )
+    })
+}
 
 #[derive(Args)]
 pub struct ListArgs {
@@ -26,6 +39,16 @@ pub struct ListArgs {
     /// Filter by capability (lxc, vm)
     #[arg(long)]
     pub capability: Option<String>,
+
+    /// Minimum isolation tier the provider must offer.
+    /// `shared-kernel` (containers, weakest), `dedicated-host`
+    /// (per-VM, no co-tenants), or `attested-research-tier`
+    /// (SEV-SNP / TDX, host operator can't see guest memory).
+    /// Stricter tiers also match — e.g.
+    /// `--isolation-level dedicated-host` matches both
+    /// `dedicated-host` and `attested-research-tier` providers.
+    #[arg(long, value_parser = parse_isolation_level)]
+    pub isolation_level: Option<paygress::nostr::IsolationLevel>,
 
     /// Sort by (price, uptime, capacity, jobs)
     #[arg(long, default_value = "price")]
@@ -90,6 +113,7 @@ async fn execute_nostr_list(args: ListArgs, verbose: bool) -> Result<()> {
         min_uptime: None,
         min_memory_mb: None,
         min_cpu: None,
+        isolation_level: args.isolation_level,
     };
 
     let mut providers = client.list_providers(Some(filter)).await?;

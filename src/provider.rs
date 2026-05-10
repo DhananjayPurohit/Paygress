@@ -32,7 +32,7 @@ use crate::nostr::{
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 use crate::templates::{TemplateDefinition, TemplateName};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendType {
     Proxmox,
     LXD,

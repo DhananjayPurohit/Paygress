@@ -912,7 +912,7 @@ pub struct CapacityInfo {
 /// Provider isolation level (Unit 4 surfaces this on offers from
 /// Q1; Unit 22 will populate it with the real research-tier
 /// implementation). `#[serde(default)]` so v0 offers parse cleanly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum IsolationLevel {
     /// Default LXC / shared-kernel container.
@@ -922,6 +922,50 @@ pub enum IsolationLevel {
     DedicatedHost,
     /// Attested AMD SEV-SNP / Intel TDX research tier (year-2 R9).
     AttestedResearchTier,
+}
+
+impl IsolationLevel {
+    /// Numeric strength ordering used for "minimum acceptable tier"
+    /// comparisons. Higher = more isolated. NOT a Deserialize hint
+    /// (the wire format is the kebab-case slug); just a helper for
+    /// the consumer's `--isolation-level` filter to decide whether
+    /// a provider's offer meets the consumer's threshold.
+    ///
+    /// SharedKernel = 0, DedicatedHost = 1, AttestedResearchTier = 2.
+    /// `meets(min)` returns true iff `self >= min` in this ordering.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::SharedKernel => 0,
+            Self::DedicatedHost => 1,
+            Self::AttestedResearchTier => 2,
+        }
+    }
+
+    /// True iff this offer's isolation tier is at least as strong
+    /// as `min`. Used by the consumer's offer filter.
+    pub fn meets(self, min: IsolationLevel) -> bool {
+        self.rank() >= min.rank()
+    }
+
+    /// Parse the kebab-case slug used on the CLI and the wire.
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s {
+            "shared-kernel" => Some(Self::SharedKernel),
+            "dedicated-host" => Some(Self::DedicatedHost),
+            "attested-research-tier" => Some(Self::AttestedResearchTier),
+            _ => None,
+        }
+    }
+
+    /// Inverse of `from_slug` — for displaying a provider's tier
+    /// to the consumer.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::SharedKernel => "shared-kernel",
+            Self::DedicatedHost => "dedicated-host",
+            Self::AttestedResearchTier => "attested-research-tier",
+        }
+    }
 }
 
 fn default_schema_version() -> u8 {
@@ -1026,6 +1070,11 @@ pub struct ProviderInfo {
     pub total_jobs_completed: u64,
     pub last_seen: u64, // Timestamp of last heartbeat
     pub is_online: bool,
+    /// Isolation tier the provider promises (mirrored from
+    /// `ProviderOfferContent.isolation_level`). Consumers filtering
+    /// by `--isolation-level` match on this. Defaults to
+    /// `SharedKernel` for v0 offers (no field on the wire).
+    pub isolation_level: IsolationLevel,
 }
 
 /// Filter for querying providers
@@ -1035,6 +1084,10 @@ pub struct ProviderFilter {
     pub min_uptime: Option<f32>,
     pub min_memory_mb: Option<u64>,
     pub min_cpu: Option<u64>,
+    /// Minimum acceptable isolation tier. `Some(DedicatedHost)`
+    /// matches `DedicatedHost` and `AttestedResearchTier` providers
+    /// (anything stricter is also acceptable). `None` = no filter.
+    pub isolation_level: Option<IsolationLevel>,
 }
 
 impl NostrRelaySubscriber {
@@ -1399,4 +1452,50 @@ pub struct StatusResponseContent {
     pub ssh_host: String,
     pub ssh_port: u16,
     pub ssh_username: String,
+}
+
+#[cfg(test)]
+mod isolation_level_tests {
+    use super::IsolationLevel;
+
+    #[test]
+    fn rank_orders_isolation_strength() {
+        assert!(IsolationLevel::SharedKernel.rank() < IsolationLevel::DedicatedHost.rank());
+        assert!(IsolationLevel::DedicatedHost.rank() < IsolationLevel::AttestedResearchTier.rank());
+    }
+
+    #[test]
+    fn meets_accepts_equal_or_stricter_tiers() {
+        // SharedKernel as the minimum: any tier qualifies.
+        assert!(IsolationLevel::SharedKernel.meets(IsolationLevel::SharedKernel));
+        assert!(IsolationLevel::DedicatedHost.meets(IsolationLevel::SharedKernel));
+        assert!(IsolationLevel::AttestedResearchTier.meets(IsolationLevel::SharedKernel));
+        // DedicatedHost as the minimum: SharedKernel does NOT qualify.
+        assert!(!IsolationLevel::SharedKernel.meets(IsolationLevel::DedicatedHost));
+        assert!(IsolationLevel::DedicatedHost.meets(IsolationLevel::DedicatedHost));
+        assert!(IsolationLevel::AttestedResearchTier.meets(IsolationLevel::DedicatedHost));
+        // AttestedResearchTier as the minimum: only it qualifies.
+        assert!(!IsolationLevel::SharedKernel.meets(IsolationLevel::AttestedResearchTier));
+        assert!(!IsolationLevel::DedicatedHost.meets(IsolationLevel::AttestedResearchTier));
+        assert!(IsolationLevel::AttestedResearchTier.meets(IsolationLevel::AttestedResearchTier));
+    }
+
+    #[test]
+    fn slug_round_trips() {
+        for level in [
+            IsolationLevel::SharedKernel,
+            IsolationLevel::DedicatedHost,
+            IsolationLevel::AttestedResearchTier,
+        ] {
+            assert_eq!(IsolationLevel::from_slug(level.slug()), Some(level));
+        }
+    }
+
+    #[test]
+    fn from_slug_rejects_unknown() {
+        assert!(IsolationLevel::from_slug("paranoid-mode").is_none());
+        assert!(IsolationLevel::from_slug("").is_none());
+        // Underscore form (not what we serialize) — must NOT be accepted.
+        assert!(IsolationLevel::from_slug("dedicated_host").is_none());
+    }
 }
