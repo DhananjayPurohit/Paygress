@@ -3,13 +3,10 @@
 // Used by end users to discover available providers on Nostr
 // and interact with them for spawning workloads.
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use anyhow::Result;
+use tracing::info;
 
-use crate::nostr::{
-    NostrRelaySubscriber, PodSpec, ProviderFilter, ProviderInfo, ProviderOfferContent, RelayConfig,
-};
+use crate::nostr::{NostrRelaySubscriber, ProviderFilter, ProviderInfo, RelayConfig};
 
 /// Discovery client for finding providers
 pub struct DiscoveryClient {
@@ -404,6 +401,7 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nostr::PodSpec;
 
     #[test]
     fn test_format_provider_table() {

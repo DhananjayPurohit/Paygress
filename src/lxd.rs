@@ -7,7 +7,7 @@ use crate::compute::{ComputeBackend, ContainerConfig, NodeStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct LxdBackend {
     storage_pool: String,
