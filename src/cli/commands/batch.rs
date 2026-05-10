@@ -102,6 +102,28 @@ pub struct BatchArgs {
     /// CLI's default relay list.
     #[arg(long)]
     pub relays: Option<String>,
+
+    /// Minimum isolation tier the provider must offer. Stricter
+    /// tiers also match. One of: `shared-kernel`, `dedicated-host`,
+    /// `attested-research-tier`. Applied uniformly to every shard
+    /// (they all spawn against the same `--provider`, so the check
+    /// is per-batch, not per-shard). The check runs before any
+    /// Cashu token is sent.
+    #[arg(long, value_parser = parse_isolation_level_arg)]
+    pub isolation_level: Option<paygress::nostr::IsolationLevel>,
+}
+
+/// clap value-parser for `--isolation-level`. Local to batch to
+/// avoid cross-command coupling; kept symmetric with the helpers in
+/// `list.rs` and `spawn.rs`.
+fn parse_isolation_level_arg(s: &str) -> Result<paygress::nostr::IsolationLevel, String> {
+    paygress::nostr::IsolationLevel::from_slug(s).ok_or_else(|| {
+        format!(
+            "unknown isolation level `{}` (expected one of: \
+             shared-kernel, dedicated-host, attested-research-tier)",
+            s
+        )
+    })
 }
 
 /// Per-shard outcome that lands in the JSON manifest. Fields are a
@@ -323,6 +345,7 @@ pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
         let timeout = args.timeout_secs;
         let ssh_user = "user".to_string();
         let ssh_pass = generate_password(16);
+        let iso = args.isolation_level;
 
         let handle = tokio::spawn(async move {
             let outcome = nostr_spawn_round_trip(
@@ -337,7 +360,7 @@ pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
                 None,
                 None,
                 None,
-                None,
+                iso,
                 relays,
                 nostr_key,
                 timeout,
@@ -476,6 +499,7 @@ mod tests {
             image: "ubuntu:22.04".to_string(),
             nostr_key: None,
             relays: None,
+            isolation_level: None,
         }
     }
 
@@ -493,6 +517,7 @@ mod tests {
             image: "ubuntu:22.04".to_string(),
             nostr_key: None,
             relays: None,
+            isolation_level: None,
         }
     }
 
@@ -510,6 +535,7 @@ mod tests {
             image: "ubuntu:22.04".to_string(),
             nostr_key: None,
             relays: None,
+            isolation_level: None,
         }
     }
 

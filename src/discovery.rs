@@ -226,11 +226,16 @@ impl DiscoveryClient {
 
         let mut output = String::new();
 
+        // Replaced the historically-uniform `LXC/VM` column with
+        // `TIER` (the offer's isolation level) — every provider
+        // today reports `lxc/vm`, so the old column was decorative.
+        // `TIER` is the only column that distinguishes a Docker
+        // provider from a per-VM KVM provider in the listing.
         writeln!(&mut output, "┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
         writeln!(
             &mut output,
             "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^6} │",
-            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "LXC/VM", "ONLINE"
+            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "TIER", "ONLINE"
         )
         .unwrap();
         writeln!(&mut output, "├──────────────────────────────────────────────────────────────────────────────────────────────────────┤").unwrap();
@@ -245,7 +250,13 @@ impl DiscoveryClient {
                 .min()
                 .map(|r| format!("{}m/s", r))
                 .unwrap_or_else(|| "-".to_string());
-            let capabilities = p.capabilities.join("/");
+            // Compact tier label that fits the 10-char column.
+            // `attested-research-tier` is too long; abbreviate.
+            let tier = match p.isolation_level {
+                crate::nostr::IsolationLevel::SharedKernel => "shared",
+                crate::nostr::IsolationLevel::DedicatedHost => "dedicated",
+                crate::nostr::IsolationLevel::AttestedResearchTier => "attested",
+            };
             let online = if p.is_online { "✓" } else { "✗" };
 
             writeln!(
@@ -256,7 +267,7 @@ impl DiscoveryClient {
                 truncate_str(location, 10),
                 p.uptime_percent,
                 cheapest,
-                capabilities,
+                tier,
                 online
             )
             .unwrap();
@@ -317,6 +328,26 @@ impl DiscoveryClient {
             &mut output,
             "│ Supports:   {}",
             provider.capabilities.join(", ")
+        )
+        .unwrap();
+        // Full slug here (vs the abbreviated form in the table).
+        // Annotated so a reader who's only just discovering the
+        // tier system understands what each label means without
+        // bouncing to the docs.
+        let iso_annotation = match provider.isolation_level {
+            crate::nostr::IsolationLevel::SharedKernel => " (containers; co-tenant boundary only)",
+            crate::nostr::IsolationLevel::DedicatedHost => {
+                " (per-VM; no co-tenants, but operator can read guest)"
+            }
+            crate::nostr::IsolationLevel::AttestedResearchTier => {
+                " (SEV-SNP / TDX; operator cannot read guest memory)"
+            }
+        };
+        writeln!(
+            &mut output,
+            "│ Isolation:  {}{}",
+            provider.isolation_level.slug(),
+            iso_annotation
         )
         .unwrap();
         writeln!(
