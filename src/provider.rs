@@ -220,6 +220,13 @@ pub struct StandbySlot {
     pub spec_id: String,
     pub expires_at: u64,
     pub owner_npub: String,
+    /// Unix-second timestamp at which the slot was reserved. Used as
+    /// the silence-baseline by the watchdog when no primary heartbeat
+    /// has been observed yet — without this, a fresh slot would treat
+    /// `last_seen == 0` as immediate silence and promote a healthy
+    /// primary on the first watchdog tick (race window: 0–60s while
+    /// waiting for the primary's next heartbeat to land on the relay).
+    pub created_at: u64,
 }
 
 /// Provider service that manages the node
@@ -928,10 +935,22 @@ impl ProviderService {
                     .get(&slot.primary_npub)
                     .map(|hb| hb.timestamp)
                     .unwrap_or(0);
-                if !primary_is_silent(now, last_seen, STANDBY_HEARTBEAT_SILENCE_SECS) {
+                // When no heartbeat has been observed yet (last_seen == 0),
+                // fall back to the slot's reservation timestamp. This
+                // gives a fresh standby a full silence-window of grace
+                // before promoting — otherwise the watchdog would fire
+                // on the first tick (0-30s after spawn) and promote a
+                // healthy primary that simply hasn't published its next
+                // heartbeat yet.
+                let silence_baseline = if last_seen == 0 {
+                    slot.created_at
+                } else {
+                    last_seen
+                };
+                if !primary_is_silent(now, silence_baseline, STANDBY_HEARTBEAT_SILENCE_SECS) {
                     continue;
                 }
-                let silence_secs = now.saturating_sub(last_seen);
+                let silence_secs = now.saturating_sub(silence_baseline);
                 warn!(
                     "Primary {} silent for {}s on slot workload_id={} (threshold {}s); \
                      triggering standby promotion (assumes hard crash; revocation \
@@ -967,32 +986,25 @@ const STANDBY_WATCHDOG_INTERVAL_SECS: u64 = 30;
 const STANDBY_HEARTBEAT_SILENCE_SECS: u64 = 180;
 
 /// Pure-function silence check, factored out for unit testing. The
-/// watchdog calls this for each (now, last_seen, threshold) tuple.
+/// watchdog calls this for each (now, baseline, threshold) tuple,
+/// where `baseline` is either the timestamp of the most-recently
+/// observed primary heartbeat or, when none has been observed yet,
+/// the slot's reservation timestamp. The caller is responsible for
+/// picking the right baseline — this function only does the
+/// arithmetic.
 ///
-/// Returns `true` iff the primary should be treated as crashed:
-///   - `last_seen == 0`              — we've never seen a heartbeat
-///                                     for this primary. Treat as
-///                                     silent immediately; the slot
-///                                     wouldn't exist if the primary
-///                                     hadn't acknowledged the
-///                                     spawn DM at standby-time, so
-///                                     this means the primary went
-///                                     silent before publishing any
-///                                     heartbeat we could see.
-///   - `now - last_seen >= threshold` — we've seen heartbeats but
-///                                     the most recent is older than
-///                                     the silence window.
+/// Returns `true` iff `now - baseline >= threshold`, meaning the
+/// primary has been silent (relative to the chosen baseline) for at
+/// least the threshold window.
 ///
-/// The `last_seen == 0` short-circuit is intentional. Without it, a
-/// brand-new standby that just received a spawn for a primary it
-/// hasn't yet observed via Nostr would NOT promote on a primary
-/// crash that happened before any heartbeat reached us — exactly the
-/// failure mode the watchdog is supposed to catch.
-fn primary_is_silent(now: u64, last_seen: u64, threshold: u64) -> bool {
-    if last_seen == 0 {
-        return true;
+/// `baseline == 0` is treated as "unknown" and returns `false` — the
+/// caller forgot to provide a baseline, and we'd rather not promote
+/// than promote spuriously.
+fn primary_is_silent(now: u64, baseline: u64, threshold: u64) -> bool {
+    if baseline == 0 {
+        return false;
     }
-    now.saturating_sub(last_seen) >= threshold
+    now.saturating_sub(baseline) >= threshold
 }
 
 // Clone impl removed as ComputeBackend is Arc'd
@@ -1357,6 +1369,7 @@ async fn handle_spawn_request(
             spec_id: spec.id.clone(),
             expires_at: now + duration_secs,
             owner_npub: requester_pubkey.to_string(),
+            created_at: now,
         };
         info!(
             "Reserved standby slot for workload_id={} (index {}/{}, expires at {})",
@@ -2199,20 +2212,43 @@ mod tests {
     }
 
     #[test]
-    fn never_seen_primary_is_immediately_silent() {
-        // last_seen == 0 means "no heartbeat ever observed for this
-        // primary". A standby with a slot but no observed heartbeat
-        // means the primary went silent before we could see one —
-        // exactly the failure mode the watchdog must catch.
-        assert!(primary_is_silent(1_000_000, 0, 180));
-        // Even with a tiny "now" value, the unset-marker case still
-        // returns true.
-        assert!(primary_is_silent(50, 0, 180));
+    fn unset_baseline_is_not_silent() {
+        // baseline == 0 is the "unknown / caller forgot" sentinel.
+        // The watchdog must always pass either a real last-heartbeat
+        // timestamp or the slot's reservation timestamp; a 0 here
+        // means the caller mis-wired the lookup, in which case
+        // returning false (alive) is the safe failure mode — better
+        // a missed promotion than a spurious one against a healthy
+        // primary.
+        assert!(!primary_is_silent(1_000_000, 0, 180));
+        assert!(!primary_is_silent(50, 0, 180));
+    }
+
+    #[test]
+    fn fresh_slot_within_grace_window_is_not_silent() {
+        // No heartbeat observed yet, baseline = slot.created_at.
+        // 30s after reservation, still 150s of grace — primary is
+        // alive (just hasn't published its first heartbeat to us
+        // yet, or it landed on a relay we're not subscribed to).
+        let created_at = 1_000_000;
+        let now = created_at + 30;
+        assert!(!primary_is_silent(now, created_at, 180));
+    }
+
+    #[test]
+    fn fresh_slot_past_grace_window_is_silent() {
+        // No heartbeat observed yet AND we've waited the full
+        // silence window since slot reservation. Either the primary
+        // crashed before publishing any heartbeat we could see, or
+        // it never came up. Either way, promote.
+        let created_at = 1_000_000;
+        let now = created_at + 180;
+        assert!(primary_is_silent(now, created_at, 180));
     }
 
     #[test]
     fn clock_skew_underflow_does_not_panic_or_misfire() {
-        // last_seen > now (clock went backwards or relay returned
+        // baseline > now (clock went backwards or relay returned
         // a future-stamped event). saturating_sub yields 0; 0 < any
         // positive threshold; so primary is treated as alive. Better
         // false-negative (no promotion) than panic.
