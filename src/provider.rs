@@ -2101,10 +2101,9 @@ fn schedule_standby_promotion(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    if let Some((peer_npub, hb)) = peer_heartbeats
-                        .iter()
-                        .find(|(_, hb)| now.saturating_sub(hb.timestamp) <= PEER_PROMOTION_FRESH_SECS)
-                    {
+                    if let Some((peer_npub, hb)) = peer_heartbeats.iter().find(|(_, hb)| {
+                        now.saturating_sub(hb.timestamp) <= PEER_PROMOTION_FRESH_SECS
+                    }) {
                         info!(
                             "Peer standby {} already promoted (fresh heartbeat at {}s ago, threshold {}s); \
                              dropping slot for workload {} without spawning",
