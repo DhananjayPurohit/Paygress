@@ -117,6 +117,15 @@ pub struct SpawnParams {
     /// Per-spawn timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Minimum isolation tier the provider must offer. Stricter
+    /// tiers also match. One of:
+    ///   - "shared-kernel" (Docker / LXC; weakest)
+    ///   - "dedicated-host" (per-VM; no co-tenants)
+    ///   - "attested-research-tier" (SEV-SNP / TDX confidential VM)
+    /// When unset, no filter is applied. The check runs before the
+    /// Cashu token is sent — a tier mismatch fails fast.
+    #[serde(default)]
+    pub isolation_level: Option<String>,
 }
 
 fn default_tier() -> String {
@@ -156,10 +165,33 @@ pub struct BatchParams {
     /// Per-shard timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Minimum isolation tier the provider must offer (same enum
+    /// as `SpawnParams.isolation_level`). Applied to every shard.
+    #[serde(default)]
+    pub isolation_level: Option<String>,
 }
 
 fn default_batch_template() -> String {
     "agent-sandbox".to_string()
+}
+
+/// Resolve the optional MCP `isolation_level` string into the
+/// internal enum. Returns an MCP error if the slug is not one of
+/// the three valid values, so an agent-driven caller learns about
+/// the typo immediately rather than after the spawn round-trip.
+fn parse_iso_param(s: Option<&str>) -> Result<Option<paygress::nostr::IsolationLevel>, McpError> {
+    match s {
+        None => Ok(None),
+        Some(slug) => paygress::nostr::IsolationLevel::from_slug(slug).map(Some).ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "isolation_level: unknown value `{}` (expected: shared-kernel, dedicated-host, attested-research-tier)",
+                    slug
+                ),
+                None,
+            )
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -302,6 +334,7 @@ impl PaygressMcpServer {
             .ssh_pass
             .clone()
             .unwrap_or_else(|| generate_password(16));
+        let iso = parse_iso_param(params.isolation_level.as_deref())?;
 
         let outcome = nostr_spawn_round_trip(
             &params.provider,
@@ -315,7 +348,7 @@ impl PaygressMcpServer {
             None,
             None,
             None,
-            None,
+            iso,
             relays,
             nostr_key,
             params.timeout_secs,
@@ -379,6 +412,10 @@ impl PaygressMcpServer {
             image: default_image(),
             nostr_key: self.nostr_key.clone(),
             relays: self.relays_override.clone(),
+            // The MCP-side `iso` is parsed below and applied per
+            // shard directly to nostr_spawn_round_trip; we don't
+            // need batch::materialize_tokens to know about it.
+            isolation_level: None,
         };
         let tokens = batch::materialize_tokens(&cli_args)
             .await
@@ -387,6 +424,7 @@ impl PaygressMcpServer {
 
         let relays = self.resolve_relays();
         let nostr_key = self.resolve_nostr_key()?;
+        let iso = parse_iso_param(params.isolation_level.as_deref())?;
 
         // Concurrent spawn fan-out (same shape as batch::execute, but
         // collected into a JSON manifest rather than written to disk).
@@ -401,6 +439,7 @@ impl PaygressMcpServer {
             let timeout = params.timeout_secs;
             let ssh_user = "user".to_string();
             let ssh_pass = generate_password(16);
+            let iso_per_shard = iso;
 
             handles.push(tokio::spawn(async move {
                 let outcome = nostr_spawn_round_trip(
@@ -415,7 +454,7 @@ impl PaygressMcpServer {
                     None,
                     None,
                     None,
-                    None,
+                    iso_per_shard,
                     relays,
                     nostr_key,
                     timeout,
