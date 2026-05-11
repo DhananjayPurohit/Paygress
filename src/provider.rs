@@ -913,11 +913,18 @@ impl ProviderService {
     ///      than `STANDBY_HEARTBEAT_SILENCE_SECS`, fires
     ///      `schedule_standby_promotion(slot)`.
     ///
-    /// The race with the existing revocation listener is handled by
-    /// `schedule_standby_promotion` itself: it removes the slot from
-    /// the map atomically inside the spawned task, so first caller
-    /// wins. Watchdog and revocation listener can both fire for the
-    /// same slot; only one promotion runs.
+    /// Two layers of dedup keep at most one promotion per workload:
+    ///
+    ///  - **Intra-process** (watchdog vs revocation listener): both
+    ///    callers funnel through `schedule_standby_promotion`, which
+    ///    `slot.remove`s atomically inside its spawned task — first
+    ///    caller wins, second gets `None` and returns.
+    ///  - **Inter-process** (peer standbys racing for the same
+    ///    workload after a primary hard-crash): the winner publishes
+    ///    a `KIND_STANDBY_PROMOTION_ANNOUNCEMENT` event immediately
+    ///    after spawning; higher-indexed peers query for it during
+    ///    their own promotion task (after the per-index backoff)
+    ///    and drop their slot without spawning if they see one.
     async fn standby_watchdog_loop(&self) -> Result<()> {
         let interval = tokio::time::Duration::from_secs(STANDBY_WATCHDOG_INTERVAL_SECS);
         info!(
@@ -985,8 +992,9 @@ impl ProviderService {
                 let silence_secs = now.saturating_sub(silence_baseline);
                 warn!(
                     "Primary {} silent for {}s on slot workload_id={} (threshold {}s); \
-                     triggering standby promotion (assumes hard crash; revocation \
-                     listener and watchdog dedupe via slot.remove)",
+                     triggering standby promotion (assumes hard crash; deduped \
+                     intra-process via slot.remove and inter-process via the \
+                     promotion-announcement event published post-spawn)",
                     slot.primary_npub,
                     silence_secs,
                     slot.workload_id,
