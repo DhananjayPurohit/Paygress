@@ -59,6 +59,18 @@ pub enum TemplateName {
     /// Checkpointed because the memory + chat-app credentials are
     /// personal and should survive a provider restart.
     OpenClaw,
+    /// ngit CI/CD runner — one-shot container that clones a repo
+    /// (ngit-based or plain git), checks out a commit, parses
+    /// `.ngit/ci.yml`, and runs each step. Result is reported back
+    /// via stdout/exit code today; the follow-up event-publishing
+    /// step (Nostr kind 38401, ngit-ci-status) lands once the
+    /// bridge daemon and event schema are agreed upon.
+    ///
+    /// Stateless and replication=None — CI runs are naturally
+    /// idempotent at the bridge level (re-spawn on a fresh provider
+    /// is the recovery model). Warm-standby would burn money for
+    /// no recovery benefit.
+    NgitRunner,
 }
 
 impl TemplateName {
@@ -72,6 +84,7 @@ impl TemplateName {
             Self::BitcoinNode => "bitcoin-node",
             Self::AgentSandbox => "agent-sandbox",
             Self::OpenClaw => "openclaw",
+            Self::NgitRunner => "ngit-runner",
         }
     }
 
@@ -83,11 +96,12 @@ impl TemplateName {
             "bitcoin-node" => Some(Self::BitcoinNode),
             "agent-sandbox" => Some(Self::AgentSandbox),
             "openclaw" => Some(Self::OpenClaw),
+            "ngit-runner" => Some(Self::NgitRunner),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 6] {
+    pub fn all() -> [Self; 7] {
         [
             Self::NostrRelay,
             Self::InferenceEndpoint,
@@ -95,6 +109,7 @@ impl TemplateName {
             Self::BitcoinNode,
             Self::AgentSandbox,
             Self::OpenClaw,
+            Self::NgitRunner,
         ]
     }
 }
@@ -166,6 +181,7 @@ impl TemplateDefinition {
             TemplateName::BitcoinNode => bitcoin_node(),
             TemplateName::AgentSandbox => agent_sandbox(),
             TemplateName::OpenClaw => openclaw(),
+            TemplateName::NgitRunner => ngit_runner(),
         }
     }
 
@@ -447,6 +463,14 @@ mod tests {
             TemplateDefinition::lookup(TemplateName::AgentSandbox).replication,
             ReplicationMode::None
         );
+        // ngit-runner: a CI run is naturally idempotent at the
+        // bridge level (re-spawn on a fresh provider is the recovery
+        // model). Warm-standby would burn money for no benefit on a
+        // one-shot workload.
+        assert_eq!(
+            TemplateDefinition::lookup(TemplateName::NgitRunner).replication,
+            ReplicationMode::None
+        );
     }
 
     #[test]
@@ -459,6 +483,20 @@ mod tests {
         let def = TemplateDefinition::lookup(TemplateName::AgentSandbox);
         assert_eq!(def.data_path, Some("/workspace"));
         assert_eq!(def.env.get("WORKSPACE"), Some(&"/workspace"));
+    }
+
+    #[test]
+    fn ngit_runner_is_stateless_and_requires_repo_and_commit() {
+        // CI runs are one-shot — no persistence between runs (failed
+        // pipeline retries on a fresh provider). Empty defaults for
+        // NGIT_REPO / NGIT_COMMIT mean "the entrypoint refuses to
+        // start unless the consumer set them" rather than running
+        // against an unintended target.
+        let def = TemplateDefinition::lookup(TemplateName::NgitRunner);
+        assert_eq!(def.data_path, None, "CI runner must be stateless");
+        assert_eq!(def.env.get("NGIT_REPO"), Some(&""));
+        assert_eq!(def.env.get("NGIT_COMMIT"), Some(&""));
+        assert_eq!(def.env.get("NGIT_PIPELINE_PATH"), Some(&".ngit/ci.yml"));
     }
 }
 
@@ -508,6 +546,65 @@ fn openclaw() -> TemplateDefinition {
         min_cpu_millicores: 1000,
         min_memory_mb: 2048,
         min_storage_gb: 5,
+    }
+}
+
+fn ngit_runner() -> TemplateDefinition {
+    let mut env = HashMap::new();
+    // Required per-spawn (consumer overrides via spawn env): the repo
+    // to clone and the commit / ref to check out. Empty defaults
+    // mean "the runner refuses to start and prints a clear error"
+    // rather than running against an unintended target.
+    env.insert("NGIT_REPO", "");
+    env.insert("NGIT_COMMIT", "");
+    // Pipeline file path inside the repo. `.ngit/ci.yml` mirrors the
+    // `.github/workflows/`-style convention so a repo author can
+    // grep for it. Override per-spawn if your repo uses a different
+    // path (e.g. monorepos with multiple pipelines).
+    env.insert("NGIT_PIPELINE_PATH", ".ngit/ci.yml");
+    // Status HTTP server bind. Live log streaming + a final
+    // /status JSON document so the bridge daemon (or a human via
+    // ssh tunnel) can poll while the pipeline runs. The provider
+    // surfaces the host-port mapping via AccessDetails just like
+    // every other HTTP-serving template.
+    env.insert("NGIT_STATUS_PORT", "8080");
+    TemplateDefinition {
+        name: TemplateName::NgitRunner,
+        summary: "ngit CI/CD runner — one-shot pipeline executor for Nostr-based git repos. Clones the repo at the requested commit, parses .ngit/ci.yml, runs each step. Result reporting today is exit code + /status HTTP; the follow-up step ships the kind-38401 Nostr-event publish once the ngit-ci bridge daemon and event schema are agreed upon.",
+        // TODO(ngit-runner-image): publish a paygress-pinned image
+        // (`ghcr.io/dhananjaypurohit/paygress-ngit-runner:<ver>`)
+        // built from `images/ngit-runner/`. Until that image exists,
+        // deploys of this template will fail at docker pull — the
+        // template config is staged ahead of the image so the CLI
+        // surface, schema, and tests can land first.
+        image: "ghcr.io/dhananjaypurohit/paygress-ngit-runner:0.1.0",
+        ports: vec![Port {
+            container_port: 8080,
+            protocol: "http",
+            label: "ngit-runner-status",
+        }],
+        env,
+        compose_path: "templates/ngit-runner/docker-compose.yml",
+        extra_docker_args: &[],
+        // CI runs are one-shot — no persistence between runs. A
+        // failed pipeline retries on a fresh provider with a clean
+        // workspace, which is what the upstream bridge already
+        // assumes (the whole spawn-per-run model is the recovery
+        // story). Stateless ⇒ encryption defaults off ⇒ no LUKS
+        // overhead on the hot path.
+        data_path: None,
+        tier: "basic",
+        // Bridge respawns on a fresh provider per CI run; warm-standby
+        // would burn money for no recovery benefit on a one-shot
+        // workload.
+        replication: ReplicationMode::None,
+        // Sized for a typical compile + test cycle in a small repo
+        // (Node/Python/Go usually fit). Heavyweight builds (large
+        // Rust crates, Docker-in-Docker) should use a higher tier
+        // — operators are free to offer larger SKUs.
+        min_cpu_millicores: 1000,
+        min_memory_mb: 2048,
+        min_storage_gb: 10,
     }
 }
 

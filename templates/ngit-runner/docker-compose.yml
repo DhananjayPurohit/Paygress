@@ -1,0 +1,45 @@
+# ngit-runner — one-shot CI/CD pipeline executor for Nostr-based git repos.
+#
+# Clones the repo at the requested commit, parses .ngit/ci.yml, runs
+# each step in sequence. Result reporting today is exit code + a
+# /status JSON document on port 8080 (live log + final pass/fail).
+# The follow-up step publishes a kind-38401 Nostr event once the
+# ngit-ci bridge daemon and event schema are agreed upon.
+#
+# Smoke test (local — assumes the GHCR image is published):
+#   docker compose -f templates/ngit-runner/docker-compose.yml up \
+#     --abort-on-container-exit \
+#     -e NGIT_REPO=https://github.com/example/repo.git \
+#     -e NGIT_COMMIT=main
+#
+# Expected flow:
+#   1. Entrypoint validates NGIT_REPO + NGIT_COMMIT are non-empty
+#   2. git clone NGIT_REPO /workspace/repo
+#   3. git -C /workspace/repo checkout NGIT_COMMIT
+#   4. Parse NGIT_PIPELINE_PATH (default .ngit/ci.yml) — list of steps
+#   5. For each step: run, stream stdout+stderr to /status,
+#      record exit code. Stop on first non-zero.
+#   6. Exit with overall pass/fail status; /status holds the
+#      structured result for the bridge to poll.
+#
+# This is a one-shot workload — restart: "no" so a failed pipeline
+# does NOT auto-retry from inside the container. Retry-on-fresh-
+# provider is the bridge daemon's job.
+services:
+  ngit-runner:
+    image: ghcr.io/dhananjaypurohit/paygress-ngit-runner:0.1.0
+    container_name: paygress-ngit-runner
+    restart: "no"
+    # Host port is configurable via NGIT_RUNNER_HOST_PORT; defaults
+    # to 8080. The status server serves live log + final result here.
+    ports:
+      - "${NGIT_RUNNER_HOST_PORT:-8080}:8080"
+    environment:
+      # REQUIRED — empty defaults make the entrypoint fail fast with
+      # a clear error rather than running against an unintended repo.
+      NGIT_REPO: "${NGIT_REPO:-}"
+      NGIT_COMMIT: "${NGIT_COMMIT:-}"
+      # Optional — defaults to the conventional path. Override for
+      # monorepos with multiple pipelines.
+      NGIT_PIPELINE_PATH: "${NGIT_PIPELINE_PATH:-.ngit/ci.yml}"
+      NGIT_STATUS_PORT: "8080"
