@@ -1,6 +1,6 @@
 [package]
 name = "paygress-cli"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["Dhananjay Purohit <dhananjaypurohit7@gmail.com>", "Ritik Jain <ritikjain1272@gmail.com>"]
 description = "Pay-per-use compute marketplace using Cashu ecash and Nostr — no accounts, no signups"
