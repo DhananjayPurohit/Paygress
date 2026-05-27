@@ -34,6 +34,7 @@ pub mod kvm;
 pub mod luks;
 pub mod lxd;
 pub mod provider;
+pub mod provider_http; // HTTP+ngx_l402 interface for Proxmox/LXD/KVM providers
 pub mod proxmox;
 
 // Legacy K8s pipeline — feature-gated behind `kubernetes`.

@@ -110,6 +110,19 @@ pub struct ProviderConfig {
     // operators don't need to update their config.
     #[serde(default = "default_cashu_wallet_db_path")]
     pub cashu_wallet_db_path: String,
+
+    /// Bind address for the optional HTTP+ngx_l402 interface.
+    ///
+    /// When set the provider listens for HTTP spawn/topup requests **in
+    /// addition to** the Nostr-DM handler, sharing the same workloads
+    /// map, backend, and Cashu redeemer. This is the binding that the
+    /// `ngx_l402` nginx module proxies to after validating Cashu
+    /// payment (see `nginx/conf.d/paygress-l402.conf`).
+    ///
+    /// Example: `"0.0.0.0:8080"` (the default port nginx targets).
+    /// Leave `null` / omit to disable the HTTP interface (Nostr-DM only).
+    #[serde(default)]
+    pub http_bind_addr: Option<String>,
 }
 
 fn default_cashu_wallet_db_path() -> String {
@@ -154,6 +167,7 @@ impl Default for ProviderConfig {
             ssh_port_start: None,
             ssh_port_end: None,
             cashu_wallet_db_path: default_cashu_wallet_db_path(),
+            http_bind_addr: None,
         }
     }
 }
@@ -269,9 +283,9 @@ pub struct ProviderService {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ProviderStats {
-    total_jobs_completed: u64,
-    uptime_start: u64,
+pub(crate) struct ProviderStats {
+    pub(crate) total_jobs_completed: u64,
+    pub(crate) uptime_start: u64,
 }
 
 impl ProviderService {
@@ -362,6 +376,25 @@ impl ProviderService {
         self.nostr.get_service_public_key()
     }
 
+    /// Build the shared-state struct consumed by the HTTP+ngx_l402
+    /// interface. All fields are Arc-clones of the provider's own
+    /// internal state so both control planes operate on the same live
+    /// data (workloads map, backend, state machine).
+    ///
+    /// Note: the Cashu `redeemer` is intentionally **not** included.
+    /// ngx_l402 redeems the token at the nginx layer; the HTTP backend
+    /// only decodes the token's face value with `extract_token_value()`.
+    pub(crate) fn http_state(&self) -> crate::provider_http::ProviderHttpState {
+        crate::provider_http::ProviderHttpState {
+            config: self.config.clone(),
+            backend: self.backend.clone(),
+            active_workloads: self.active_workloads.clone(),
+            stats: self.stats.clone(),
+            state_machine: self.state_machine.clone(),
+            provider_npub: self.get_npub(),
+        }
+    }
+
     /// Start the provider service (runs forever)
     pub async fn run(&self) -> Result<()> {
         info!("🚀 Starting Paygress Provider Service");
@@ -371,9 +404,26 @@ impl ProviderService {
         // Publish initial offer
         self.publish_offer().await?;
 
+        // Build the HTTP+ngx_l402 future.
+        // When `http_bind_addr` is not set we substitute `pending()` so
+        // the select! branch never fires and the interface stays disabled.
+        let http_fut: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<()>> + Send>,
+        > = if let Some(ref addr) = self.config.http_bind_addr {
+            info!("HTTP+ngx_l402 interface enabled on {}", addr);
+            let state = self.http_state();
+            let addr = addr.clone();
+            Box::pin(async move {
+                crate::provider_http::run_provider_http_interface(state, &addr).await
+            })
+        } else {
+            Box::pin(std::future::pending::<anyhow::Result<()>>())
+        };
+
         // Run heartbeat loop, request listener, cleanup loop,
-        // orchestrator loop (Unit 5 wiring), and standby watchdog
-        // (closes the hard-crash failover gap) concurrently.
+        // orchestrator loop (Unit 5 wiring), standby watchdog
+        // (closes the hard-crash failover gap), and optional
+        // HTTP+ngx_l402 interface concurrently.
         tokio::select! {
             result = self.heartbeat_loop() => {
                 error!("Heartbeat loop exited: {:?}", result);
@@ -393,6 +443,10 @@ impl ProviderService {
             }
             result = self.standby_watchdog_loop() => {
                 error!("Standby watchdog loop exited: {:?}", result);
+                result
+            }
+            result = http_fut => {
+                error!("HTTP+ngx_l402 interface exited: {:?}", result);
                 result
             }
         }
@@ -1847,7 +1901,8 @@ async fn handle_topup_request(
 /// (rather than `sidecar_service`) so the Nostr-DM canonical path
 /// doesn't depend on the legacy K8s pipeline that Unit 7 gates
 /// behind the `kubernetes` Cargo feature.
-fn generate_password() -> String {
+/// `pub(crate)` so the HTTP+ngx_l402 interface can reuse it.
+pub(crate) fn generate_password() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
@@ -1871,11 +1926,12 @@ pub fn parse_pod_npub(pod_npub: &str) -> Option<u32> {
     }
 }
 
-/// Translate a `RedeemError` into the `(error_type, message)` shape the
-/// Nostr error-response uses. The error-type strings are stable so
-/// consumers can reason about them programmatically (retry on
-/// `network`, give up on `already_spent`, etc.).
-fn redeem_error_to_response(err: &RedeemError) -> (&'static str, String) {
+/// Translate a `RedeemError` into the `(error_type, message)` shape used
+/// by both the Nostr error-response and the HTTP JSON response. The
+/// error-type strings are stable so consumers can reason about them
+/// programmatically (retry on `network`, give up on `already_spent`…).
+/// `pub(crate)` so the HTTP+ngx_l402 interface can reuse it.
+pub(crate) fn redeem_error_to_response(err: &RedeemError) -> (&'static str, String) {
     match err {
         RedeemError::InvalidToken(msg) => {
             ("invalid_token", format!("Invalid Cashu token: {}", msg))
