@@ -33,9 +33,11 @@ pub struct BootstrapArgs {
     #[arg(long, default_value = "22")]
     pub port: u16,
 
-    /// Provider display name
+    /// Provider display name.
+    /// Auto-generated from the Nostr key if not provided (e.g. "SwiftGoldenOwl").
+    /// Same key always produces the same name, so bootstrap is idempotent.
     #[arg(long)]
-    pub name: String,
+    pub name: Option<String>,
 
     /// Location description (e.g., "US-East", "Germany")
     #[arg(long)]
@@ -203,7 +205,11 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     let sudo = if is_root { "" } else { "sudo " };
 
     println!("Target: {}", target.cyan());
-    println!("Name:   {}", args.name.yellow());
+    if let Some(ref n) = args.name {
+        println!("Name:   {} (provided)", n.yellow());
+    } else {
+        println!("Name:   {} (will auto-generate from Nostr key)", "TBD".dimmed());
+    }
     if let Some(ref loc) = args.location {
         println!("Location: {}", loc);
     }
@@ -591,6 +597,20 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             nsec
         }
     };
+
+    // Resolve provider name — use explicit --name if given, otherwise derive
+    // a 3-word name from the Nostr public key (deterministic + idempotent).
+    let provider_name: String = match args.name {
+        Some(ref n) => n.clone(),
+        None => {
+            let keys = nostr_sdk::Keys::parse(&nostr_key)
+                .map_err(|e| anyhow::anyhow!("failed to parse nostr key for name derivation: {}", e))?;
+            let pubkey_bytes = keys.public_key().to_bytes();
+            let name = paygress::namegen::derive_provider_name(&pubkey_bytes);
+            println!("  Generated name: {}", name.yellow().bold());
+            name
+        }
+    };
     println!();
 
     // Step 6: Create Configuration
@@ -643,7 +663,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         proxmox_template,
         bridge,
         nostr_key,
-        args.name,
+        provider_name,
         args.location
             .as_ref()
             .map(|l| format!("\"{}\"", l))
@@ -936,7 +956,7 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
     println!("{}", "🎉 BOOTSTRAP COMPLETE!".green().bold());
     println!("{}", "═".repeat(60).green());
     println!();
-    println!("  Provider Name: {}", args.name.yellow());
+    println!("  Provider Name: {}", provider_name.yellow());
     println!("  Server:        {}", args.host.cyan());
 
     if let Some(ref ln) = args.lightning_address {

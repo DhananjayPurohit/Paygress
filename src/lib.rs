@@ -31,6 +31,7 @@
 //   existing K8s users (`--features kubernetes`). Not in the default build.
 
 // Core modules — always compiled.
+pub mod namegen;
 pub mod blossom;
 pub mod blossom_crypto;
 pub mod cashu;
