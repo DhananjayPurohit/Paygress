@@ -59,7 +59,9 @@ use crate::compute::{ComputeBackend, ContainerConfig};
 use crate::durable_workload::{
     DurableWorkload, ReplicationMode, RestartPolicy, WorkloadState, WorkloadStateMachine,
 };
-use crate::provider::{generate_password, parse_pod_npub, ProviderConfig, ProviderStats, WorkloadInfo};
+use crate::provider::{
+    generate_password, parse_pod_npub, ProviderConfig, ProviderStats, WorkloadInfo,
+};
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 
@@ -105,13 +107,15 @@ pub(crate) async fn run_provider_http_interface(
         .route("/pods/topup", post(topup_pod))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await.map_err(|e| {
-        anyhow::anyhow!(
-            "failed to bind provider HTTP+ngx_l402 interface to {}: {}",
-            bind_addr,
-            e
-        )
-    })?;
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to bind provider HTTP+ngx_l402 interface to {}: {}",
+                bind_addr,
+                e
+            )
+        })?;
 
     info!(
         "✅ Provider HTTP+ngx_l402 interface ready — http://{}",

@@ -54,7 +54,19 @@ paygress-cli list
 paygress-cli list --online-only --sort price
 
 # Get details on a specific provider
-paygress-cli list info <PROVIDER_NPUB>
+paygress-cli list info <PROVIDER>
+```
+
+Each provider has a **3-word auto-generated name** (e.g. `SwiftGoldenOwl`) derived
+from its Nostr key, shown in the `list` table.  All `--provider` flags accept either
+the friendly name **or** the raw provider ID (full hex, `npub1…` bech32, or an
+unambiguous 8+ character prefix):
+
+```bash
+# These are equivalent:
+paygress-cli spawn --provider SwiftGoldenOwl ...
+paygress-cli spawn --provider npub1abc...     ...
+paygress-cli spawn --provider 9f3d1e2a        ...   # 8-char prefix
 ```
 
 ### 2. Spawn a workload
@@ -63,7 +75,7 @@ Get a Cashu token from a wallet like [Nutstash](https://nutstash.app/) or [Minib
 
 ```bash
 paygress-cli spawn \
-  --provider <PROVIDER_NPUB> \
+  --provider <PROVIDER> \
   --tier basic \
   --token "cashuA..."
 ```
@@ -81,7 +93,7 @@ ssh -p <PORT> root@<PROVIDER_IP>
 ### 4. Check status
 
 ```bash
-paygress-cli status --pod-id <ID> --provider <NPUB>
+paygress-cli status --pod-id <ID> --provider <PROVIDER>
 ```
 
 ### HTTP Mode
@@ -108,7 +120,6 @@ paygress-cli bootstrap \
   --host <YOUR_SERVER_IP> \
   --user root \
   --password "your-ssh-password" \
-  --name "My Node" \
   --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
   --lightning-address "you@getalby.com"   # optional: auto-sweep earnings to Lightning
 
@@ -117,12 +128,16 @@ paygress-cli bootstrap \
   --host <YOUR_SERVER_IP> \
   --user root \
   --key ~/.ssh/id_rsa \
-  --name "My Node" \
-  --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io"
+  --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
   --lightning-address "you@getalby.com"   # optional: auto-sweep earnings to Lightning
 ```
 
 This will SSH into your server, install LXD (on Ubuntu) or Proxmox (on Debian), compile Paygress, configure a systemd service, and start broadcasting offers to Nostr.
+
+> **Provider name** — bootstrap automatically derives a unique 3-word name from your
+> Nostr key (e.g. `SwiftGoldenOwl`) and displays it on screen.  Consumers can use
+> this name anywhere a provider ID is accepted.  The name is deterministic: running
+> bootstrap again on the same key always produces the same name.
 
 **Requirements:** Linux with systemd, root/sudo access. Public IP recommended (or use WireGuard tunnel below).
 
@@ -134,14 +149,12 @@ paygress-cli provider setup \
   --proxmox-url https://127.0.0.1:8006/api2/json \
   --token-id "root@pam!paygress" \
   --token-secret "<SECRET>" \
-  --name "My Provider" \
   --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
   --lightning-address "you@getalby.com"   # optional: auto-sweep earnings to Lightning
 
 # LXD / KVM / Docker backends (no Proxmox needed):
 paygress-cli provider setup \
   --backend lxd \
-  --name "My LXD Provider" \
   --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
   --lightning-address "you@getalby.com"
 

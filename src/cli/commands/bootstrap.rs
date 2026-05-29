@@ -33,7 +33,6 @@ pub struct BootstrapArgs {
     #[arg(long, default_value = "22")]
     pub port: u16,
 
-
     /// Location description (e.g., "US-East", "Germany")
     #[arg(long)]
     pub location: Option<String>,

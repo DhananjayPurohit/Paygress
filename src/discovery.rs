@@ -123,23 +123,34 @@ impl DiscoveryClient {
         Ok(providers)
     }
 
-    /// Get details of a specific provider (supports exact match or prefix of at least 8 chars)
-    /// Accepts both hex pubkeys and bech32 npub format.
-    pub async fn get_provider(&self, npub: &str) -> Result<Option<ProviderInfo>> {
+    /// Look up a provider by ID or friendly name.
+    ///
+    /// The `input` argument is tried in this order:
+    ///
+    /// 1. **Exact ID match** — full hex pubkey or `npub1…` bech32.
+    /// 2. **ID prefix match** — unambiguous prefix of ≥ 8 hex chars.
+    /// 3. **Name match** — case-insensitive match against the provider's
+    ///    3-word friendly name (e.g. `"SwiftGoldenOwl"`). If two providers
+    ///    share the same name (rare — 2M+ combinations) an error is returned
+    ///    asking the user to use the ID instead.
+    ///
+    /// This means every CLI flag that accepts a `--provider` value works
+    /// with either form interchangeably.
+    pub async fn get_provider(&self, input: &str) -> Result<Option<ProviderInfo>> {
         let providers = self.list_providers(None).await?;
 
-        // Normalize input to hex for comparison (provider npubs are stored as hex)
-        let lookup_hex = match nostr_sdk::PublicKey::parse(npub) {
+        // ── 1. Exact ID match ────────────────────────────────────────────────
+        // Normalize input to hex (handles both raw hex and npub1… bech32).
+        let lookup_hex = match nostr_sdk::PublicKey::parse(input) {
             Ok(pk) => pk.to_hex(),
-            Err(_) => npub.to_string(),
+            Err(_) => input.to_string(),
         };
 
-        // precise match first
         if let Some(p) = providers.iter().find(|p| p.npub == lookup_hex) {
             return Ok(Some(p.clone()));
         }
 
-        // try prefix match if long enough
+        // ── 2. ID prefix match (≥ 8 chars) ──────────────────────────────────
         if lookup_hex.len() >= 8 {
             let matches: Vec<&ProviderInfo> = providers
                 .iter()
@@ -151,7 +162,31 @@ impl DiscoveryClient {
             }
         }
 
-        Ok(None)
+        // ── 3. Friendly name match (case-insensitive) ────────────────────────
+        let input_lower = input.to_lowercase();
+        let name_matches: Vec<&ProviderInfo> = providers
+            .iter()
+            .filter(|p| p.hostname.to_lowercase() == input_lower)
+            .collect();
+
+        match name_matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(name_matches[0].clone())),
+            _ => {
+                // Two providers sharing a name is extremely unlikely (2M+ combos)
+                // but possible if someone bootstrapped with the same Nostr key on
+                // two machines, or in tests. Surface a clear error.
+                let ids: Vec<String> = name_matches
+                    .iter()
+                    .map(|p| format!("  {}", &p.npub[..16]))
+                    .collect();
+                anyhow::bail!(
+                    "multiple providers share the name '{}'; use the provider ID instead:\n{}",
+                    input,
+                    ids.join("\n")
+                )
+            }
+        }
     }
 
     /// Check if a provider is online
@@ -431,7 +466,11 @@ fn format_mints_column(mints: &[String], col: usize) -> String {
         n => {
             let l0 = mint_label(&mints[0]);
             let l1 = mint_label(&mints[1]);
-            let suffix = if n > 2 { format!(" +{}", n - 2) } else { String::new() };
+            let suffix = if n > 2 {
+                format!(" +{}", n - 2)
+            } else {
+                String::new()
+            };
             let combined = format!("{}, {}{}", l0, l1, suffix);
             if combined.len() <= col {
                 combined
@@ -470,11 +509,20 @@ mod tests {
 
     #[test]
     fn mint_label_keeps_mint_subdomain() {
-        assert_eq!(mint_label("https://mint.minibits.cash"), "mint.minibits.cash");
-        assert_eq!(mint_label("https://testnut.cashu.space"), "testnut.cashu.space");
+        assert_eq!(
+            mint_label("https://mint.minibits.cash"),
+            "mint.minibits.cash"
+        );
+        assert_eq!(
+            mint_label("https://testnut.cashu.space"),
+            "testnut.cashu.space"
+        );
         assert_eq!(mint_label("http://localhost:3338"), "localhost:3338");
         // Path is stripped
-        assert_eq!(mint_label("https://mint.example.com/api/v1"), "mint.example.com");
+        assert_eq!(
+            mint_label("https://mint.example.com/api/v1"),
+            "mint.example.com"
+        );
     }
 
     #[test]
@@ -485,8 +533,11 @@ mod tests {
         ];
         let result = format_mints_column(&mints, 36);
         assert!(result.contains("mint.minibits.cash"), "missing first mint");
-        assert!(result.contains("mint.nucash.com"),    "missing second mint");
-        assert!(!result.contains("+"), "unexpected overflow suffix for 2 mints");
+        assert!(result.contains("mint.nucash.com"), "missing second mint");
+        assert!(
+            !result.contains("+"),
+            "unexpected overflow suffix for 2 mints"
+        );
     }
 
     #[test]
@@ -499,7 +550,7 @@ mod tests {
         let result = format_mints_column(&mints, 36);
         assert!(result.contains("mint.a.com"), "missing first mint");
         assert!(result.contains("mint.b.com"), "missing second mint");
-        assert!(result.contains("+1"),          "missing overflow suffix");
+        assert!(result.contains("+1"), "missing overflow suffix");
     }
 
     #[test]

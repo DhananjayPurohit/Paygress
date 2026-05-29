@@ -201,7 +201,6 @@ impl MintRedeemer for CdkRedeemer {
             other => Err(RedeemError::UnsupportedUnit(format!("{:?}", other))),
         }
     }
-
 }
 
 fn map_cdk_error(e: cdk::Error) -> RedeemError {

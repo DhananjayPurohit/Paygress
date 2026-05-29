@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(BASE=\"//wsl.localhost/ubuntu/home/dhananjay/ngx_l402\"; for f in src/lib.rs src/cashu.rs src/payment_detector.rs src/manifest.rs src/cashu_redemption_logger.rs; do echo \"=== $f ===\"; cat \"$BASE/$f\"; done)",
+      "Bash(cargo build *)",
+      "Bash(cd /mnt/wsl/instances/ubuntu/home/dhananjay/paygress)",
+      "Bash(wsl -d ubuntu -- bash -c \"cd /home/dhananjay/paygress && cargo check 2>&1\")",
+      "Bash(wsl -d ubuntu -- bash -c \"source ~/.cargo/env && cd /home/dhananjay/paygress && cargo check 2>&1\")",
+      "Bash(wsl -d ubuntu -- bash -c \"tail -5 /tmp/test_out.txt 2>/dev/null || true\")",
+      "Bash(wsl -d ubuntu -- bash -c \"source ~/.cargo/env && cd /home/dhananjay/paygress && cargo test 2>&1 | grep -E 'test result|FAILED|error'\")",
+      "Bash(wsl -d ubuntu -- bash -c \"source ~/.cargo/env && cd /home/dhananjay/paygress && cargo check 2>&1 | grep -v '^error: could not compile' | grep -v '^note:' | grep -v '^Caused by' | grep -v 'process.*exit' | grep -v '^\\\\s*$' | grep -v '^\\\\s*\\\\^' | grep -v '^\\\\s*|' | grep -v '^\\\\s*=' | grep -v '^\\\\s*\\\\.\\\\.\\\\.' \")",
+      "Bash(cargo check *)",
+      "Read(///wsl.localhost/ubuntu/home/**)",
+      "Read(///wsl.localhost/ubuntu/mnt/**)",
+      "Bash(wslpath -u \"\\\\\\\\\\\\\\\\wsl.localhost\\\\\\\\ubuntu\\\\\\\\home\\\\\\\\dhananjay\\\\\\\\paygress\")",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:dhananjaypurohit.github.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//mnt/c/**)",
+      "Bash(wslpath -u \"\\\\\\\\home\\\\\\\\dhananjay\\\\\\\\paygress\")",
+      "Bash(wsl -e bash -c \"ls /home/dhananjay/paygress/Cargo.toml\")",
+      "Bash(wsl -e bash -c \"python3 /tmp/count_words.py\")",
+      "Bash(wsl -e *)"
+    ]
+  }
+}

@@ -138,7 +138,6 @@ pub struct ProviderConfig {
     /// Format: `user@domain.com`  Example: `"myprovider@getalby.com"`
     #[serde(default)]
     pub lightning_address: Option<String>,
-
 }
 
 fn default_cashu_wallet_db_path() -> String {
@@ -424,18 +423,17 @@ impl ProviderService {
         // Build the HTTP+ngx_l402 future.
         // When `http_bind_addr` is not set we substitute `pending()` so
         // the select! branch never fires and the interface stays disabled.
-        let http_fut: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<()>> + Send>,
-        > = if let Some(ref addr) = self.config.http_bind_addr {
-            info!("HTTP+ngx_l402 interface enabled on {}", addr);
-            let state = self.http_state();
-            let addr = addr.clone();
-            Box::pin(async move {
-                crate::provider_http::run_provider_http_interface(state, &addr).await
-            })
-        } else {
-            Box::pin(std::future::pending::<anyhow::Result<()>>())
-        };
+        let http_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            if let Some(ref addr) = self.config.http_bind_addr {
+                info!("HTTP+ngx_l402 interface enabled on {}", addr);
+                let state = self.http_state();
+                let addr = addr.clone();
+                Box::pin(async move {
+                    crate::provider_http::run_provider_http_interface(state, &addr).await
+                })
+            } else {
+                Box::pin(std::future::pending::<anyhow::Result<()>>())
+            };
 
         // Run heartbeat loop, request listener, cleanup loop,
         // orchestrator loop (Unit 5 wiring), standby watchdog
@@ -1082,7 +1080,6 @@ impl ProviderService {
             }
         }
     }
-
 }
 
 /// Cadence at which the standby watchdog re-queries heartbeats. 30s
