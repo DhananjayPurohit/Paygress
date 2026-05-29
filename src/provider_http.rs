@@ -1,25 +1,33 @@
-// Provider HTTP Interface with ngx_l402 Support
+// Provider HTTP Interface — ngx_l402 Path
 //
-// Exposes HTTP endpoints for the Proxmox / LXD / KVM provider that are
-// compatible with the `ngx_l402` nginx module.
+// Exposes HTTP endpoints for the Proxmox / LXD / KVM provider that sit
+// behind the `ngx_l402` nginx module.
+//
+// This is one of two redemption paths that share the same CDK wallet
+// (`cashu_wallet_db_path`). The other is the Nostr-DM handler in
+// src/provider.rs. ngx_l402 sweeps accumulated ecash from both paths to
+// Lightning on a configurable schedule.
 //
 // Payment flow (single-redemption, no double-spend risk):
 //   Client
 //     → nginx  (ngx_l402 issues 402 if no valid Cashu token; verifies
-//               the token format, checks the amount against
-//               `l402_amount_msat_default`, redeems it at the Cashu mint,
-//               records the token hash in Redis to prevent replay, then
-//               forwards the request with the token still in
-//               `Authorization: Cashu <token>`)
+//               the token format, redeems it at the Cashu mint via NUT-03,
+//               enforces replay protection, stores proofs in the shared
+//               redb wallet, then forwards the request)
 //     → POST paygress:8080/pods/spawn  OR  POST paygress:8080/pods/topup
-//     → this axum backend: decodes the token's face value from the header
-//               (no mint call — ngx_l402 already redeemed it), then
-//               provisions / extends the container via the configured
-//               backend (Proxmox / LXD / KVM).
+//     → this axum backend: reads the token's face value from the header
+//               via `extract_token_value()` (no mint call — ngx_l402
+//               already redeemed it), then provisions / extends the
+//               container via the configured backend (Proxmox / LXD / KVM).
 //
 // The backend MUST NOT call the Cashu mint again — the token is already
-// spent. `extract_token_value()` reads the proof amounts from the decoded
-// token without any network I/O.
+// spent and the proofs are in the shared wallet.
+//
+// Lightning sweep:
+//   ngx_l402 mounts the same redb file used by the Nostr-DM CdkRedeemer
+//   (volume: /var/lib/paygress:/var/lib/nginx). Its melt loop drains all
+//   accumulated proofs — from both this HTTP path and the Nostr-DM path —
+//   to LNURL_ADDRESS at CASHU_REDEMPTION_INTERVAL_SECS.
 //
 // Endpoints:
 //   GET  /health        — liveness probe (no payment)
@@ -27,10 +35,10 @@
 //   POST /pods/spawn    — spawn a new container (ngx_l402 paywall)
 //   POST /pods/topup    — extend an existing lease (ngx_l402 paywall)
 //
-// The nginx config in nginx/conf.d/paygress-l402.conf already targets
-// port 8080 with the correct `l402 on` directives — enabling
-// `http_bind_addr` in the provider config is all that is needed to
-// activate this path.
+// Enable by setting `http_bind_addr` in the provider config. The nginx
+// config in nginx/conf.d/paygress-l402.conf targets port 8080 with the
+// correct `l402 on` directives. Bootstrap auto-generates the Docker
+// Compose setup (Step 8 in src/cli/commands/bootstrap.rs).
 
 use anyhow::Result;
 use axum::{

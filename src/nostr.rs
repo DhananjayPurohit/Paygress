@@ -450,7 +450,6 @@ impl NostrRelaySubscriber {
         self.keys.public_key().to_hex()
     }
 
-    #[allow(dead_code)]
     fn convert_event(&self, event: &nostr_sdk::Event) -> NostrEvent {
         NostrEvent {
             id: event.id.to_hex(),

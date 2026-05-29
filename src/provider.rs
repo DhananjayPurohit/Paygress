@@ -103,11 +103,15 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub ssh_port_end: Option<u16>,
 
-    // Cashu wallet settings (Unit 1: real mint redemption on the
-    // Nostr-DM path). The wallet stores swapped proofs, keysets, and
-    // quotes; one redb file holds state for every mint the provider
-    // accepts. Defaults to a path next to the binary so existing
-    // operators don't need to update their config.
+    // Shared Cashu wallet database (redb file). Stores swapped proofs,
+    // keysets, and quotes for every accepted mint.
+    //
+    // Both redemption paths write here:
+    //   - Nostr-DM path: CdkRedeemer swaps tokens and stores proofs here.
+    //   - HTTP+ngx_l402 path: ngx_l402 mounts this same file
+    //     (`CASHU_DB_PATH` in docker-compose.yml) and redeems tokens into it.
+    //
+    // ngx_l402's melt loop drains both pools to Lightning automatically.
     #[serde(default = "default_cashu_wallet_db_path")]
     pub cashu_wallet_db_path: String,
 
@@ -123,6 +127,18 @@ pub struct ProviderConfig {
     /// Leave `null` / omit to disable the HTTP interface (Nostr-DM only).
     #[serde(default)]
     pub http_bind_addr: Option<String>,
+
+    /// Lightning address where ngx_l402 sweeps accumulated ecash.
+    ///
+    /// Bootstrap writes this as `LNURL_ADDRESS` in `/etc/paygress/.env`.
+    /// ngx_l402's melt loop converts proofs from **both** redemption paths
+    /// (Nostr-DM and HTTP) into Lightning payments sent to this address on
+    /// the `CASHU_REDEMPTION_INTERVAL_SECS` schedule.
+    ///
+    /// Format: `user@domain.com`  Example: `"myprovider@getalby.com"`
+    #[serde(default)]
+    pub lightning_address: Option<String>,
+
 }
 
 fn default_cashu_wallet_db_path() -> String {
@@ -168,6 +184,7 @@ impl Default for ProviderConfig {
             ssh_port_end: None,
             cashu_wallet_db_path: default_cashu_wallet_db_path(),
             http_bind_addr: None,
+            lightning_address: None,
         }
     }
 }
@@ -1065,6 +1082,7 @@ impl ProviderService {
             }
         }
     }
+
 }
 
 /// Cadence at which the standby watchdog re-queries heartbeats. 30s
@@ -1679,6 +1697,7 @@ async fn handle_spawn_request(
     debug!("Access details sent successfully");
 
     info!("Workload {} provisioned for {} seconds", id, duration_secs);
+
     Ok(())
 }
 
@@ -1894,6 +1913,7 @@ async fn handle_topup_request(
         "Topup applied to {}: +{}s (now expires at {})",
         request.pod_npub, extension_secs, new_expires_at
     );
+
     Ok(())
 }
 

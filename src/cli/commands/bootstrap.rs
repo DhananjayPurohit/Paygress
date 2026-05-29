@@ -9,6 +9,7 @@ use colored::Colorize;
 use nostr_sdk::ToBech32;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Args)]
 pub struct BootstrapArgs {
@@ -48,6 +49,12 @@ pub struct BootstrapArgs {
     #[arg(long, default_value = "https://mint.minibits.cash")]
     pub mints: String,
 
+    /// Lightning address for automatic sweep of earned ecash to Lightning.
+    /// Every redeemed Cashu token is automatically melted to this address.
+    /// Format: user@domain.com  (e.g. myprovider@getalby.com)
+    #[arg(long)]
+    pub lightning_address: Option<String>,
+
     /// Skip Proxmox installation (assumes already installed)
     #[arg(long)]
     pub skip_proxmox: bool,
@@ -65,6 +72,100 @@ pub struct BootstrapArgs {
     /// Build it first with: cargo build --release
     #[arg(long)]
     pub local_binary: Option<String>,
+
+    /// How often ngx_l402 sweeps accumulated ecash to Lightning (seconds).
+    /// Default: 3600 (1 hour). Use a smaller value like 60 for testing.
+    #[arg(long, default_value = "3600")]
+    pub sweep_interval_secs: u64,
+
+    /// Minimum wallet balance in sats before ngx_l402 attempts a sweep.
+    /// Default: 100 sats.
+    #[arg(long, default_value = "100")]
+    pub sweep_min_balance_sats: u64,
+
+    /// ngx_l402 ROOT_KEY for L402 macaroon signing (32-byte hex).
+    /// Auto-generated if not provided.
+    #[arg(long)]
+    pub root_key: Option<String>,
+}
+
+/// Validate a Lightning Address by resolving its LNURL-pay well-known URL.
+///
+/// A Lightning Address `user@domain.com` maps to:
+///   GET https://domain.com/.well-known/lnurlp/user
+///
+/// A valid service returns JSON with `"tag": "payRequest"` plus
+/// `minSendable` / `maxSendable` fields. We verify this before deploying
+/// ngx_l402 so the provider gets an early, clear error rather than a
+/// silently broken sweep loop.
+async fn validate_lightning_address(address: &str) -> Result<()> {
+    // Parse user@domain
+    let (user, domain) = address
+        .split_once('@')
+        .with_context(|| format!("'{}' is not a valid Lightning Address — expected user@domain.com", address))?;
+
+    if user.is_empty() || domain.is_empty() {
+        anyhow::bail!(
+            "'{}' is not a valid Lightning Address — user and domain must not be empty",
+            address
+        );
+    }
+
+    let url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client for Lightning Address validation")?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("could not reach {} — check domain and internet connectivity", url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "Lightning Address endpoint returned HTTP {} for {}\n    \
+             Check that '{}' is registered with that provider.",
+            status, url, address
+        );
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .with_context(|| format!("{} did not return valid JSON", url))?;
+
+    match json.get("tag").and_then(|t| t.as_str()) {
+        Some("payRequest") => {}
+        Some(other) => anyhow::bail!(
+            "unexpected LNURL tag '{}' at {} — expected 'payRequest'",
+            other, url
+        ),
+        None => anyhow::bail!(
+            "LNURL response from {} is missing the 'tag' field:\n    {}",
+            url, json
+        ),
+    }
+
+    // Print the send range so the provider can see the address is live
+    if let (Some(min), Some(max)) = (
+        json.get("minSendable").and_then(|v| v.as_u64()),
+        json.get("maxSendable").and_then(|v| v.as_u64()),
+    ) {
+        println!(
+            " {} (sendable: {} – {} msats)",
+            "✓".green(),
+            min,
+            max
+        );
+    } else {
+        println!(" {}", "✓".green());
+    }
+
+    Ok(())
 }
 
 pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
@@ -530,7 +631,9 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
   ],
   "whitelisted_mints": ["{}"],
   "heartbeat_interval_secs": 60,
-  "minimum_duration_seconds": 60
+  "minimum_duration_seconds": 60,
+  "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.redb",
+  "lightning_address": {}
 }}"#,
         backend_type,
         storage,
@@ -542,27 +645,36 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             .as_ref()
             .map(|l| format!("\"{}\"", l))
             .unwrap_or("null".to_string()),
-        args.host, // <--- Added arg
-        args.mints
+        args.host,
+        args.mints,
+        args.lightning_address
+            .as_ref()
+            .map(|a| format!("\"{}\"", a))
+            .unwrap_or("null".to_string()),
     );
 
     if args.dry_run {
         println!("  Would create /etc/paygress/provider-config.json");
+        println!("  Would create /var/lib/paygress/ (wallet db directory)");
     } else {
         let create_config = if is_root {
             format!(
-                "mkdir -p /etc/paygress && cat > /etc/paygress/provider-config.json << 'EOF'\n{}\nEOF",
+                "mkdir -p /etc/paygress && mkdir -p /var/lib/paygress && cat > /etc/paygress/provider-config.json << 'EOF'\n{}\nEOF",
                 config
             )
         } else {
             format!(
-                "{}mkdir -p /etc/paygress && echo '{}' | {}tee /etc/paygress/provider-config.json > /dev/null",
-                sudo, config.replace("'", "'\\''"), sudo
+                "{}mkdir -p /etc/paygress && {}mkdir -p /var/lib/paygress && echo '{}' | {}tee /etc/paygress/provider-config.json > /dev/null",
+                sudo, sudo, config.replace("'", "'\\''"), sudo
             )
         };
         run_ssh_command(&args, &create_config)?;
         println!(
             "  {} Created /etc/paygress/provider-config.json",
+            "✓".green()
+        );
+        println!(
+            "  {} Created /var/lib/paygress/ (wallet db directory)",
             "✓".green()
         );
     }
@@ -605,8 +717,178 @@ WantedBy=multi-user.target
     }
     println!();
 
-    // Step 8: Start Service
-    println!("{}", "Step 8: Starting Provider Service".blue().bold());
+    // Step 8: Deploy ngx_l402 (optional — only when --lightning-address is given)
+    //
+    // ngx_l402 serves two purposes:
+    //   1. HTTP+L402 paywall in front of the axum backend (HTTP path).
+    //   2. Periodic Lightning sweep of ALL accumulated ecash — from both
+    //      the Nostr-DM path and the HTTP path — via the shared redb wallet.
+    //
+    // Without a lightning address there is no meaningful sweep target, so
+    // we skip this step. Ecash from Nostr-DM redemptions will accumulate
+    // in /var/lib/paygress/cashu-wallet.redb and can be swept later by
+    // re-running bootstrap with --lightning-address.
+    println!("{}", "Step 8: Deploying ngx_l402 (Lightning Sweep)".blue().bold());
+    println!("{}", "─".repeat(50));
+
+    if let Some(ref lightning_address) = args.lightning_address {
+        // Validate the Lightning Address before touching the remote machine.
+        // Catches typos and unregistered addresses immediately, rather than
+        // letting ngx_l402 start with a broken sweep target.
+        if args.dry_run {
+            println!("  Would validate Lightning Address: {}", lightning_address.cyan());
+        } else {
+            print!("  Validating Lightning Address {}...", lightning_address.cyan());
+            std::io::stdout().flush()?;
+            validate_lightning_address(lightning_address)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Lightning Address '{}' validation failed — \
+                         fix the address or remove --lightning-address to skip ngx_l402",
+                        lightning_address
+                    )
+                })?;
+        }
+
+        // Derive wallet secret from nostr key (hex-encode 64-byte seed).
+        // ngx_l402's CASHU_WALLET_SECRET must match so it opens the same
+        // CDK wallet that CdkRedeemer writes to.
+        let wallet_secret = {
+            let seed = paygress::cashu::derive_seed_from_nostr_key(&nostr_key);
+            hex::encode(seed)
+        };
+
+        // Deterministic ROOT_KEY for ngx_l402 macaroon signing (32 bytes / 64 hex chars).
+        let root_key = match args.root_key {
+            Some(ref k) => k.clone(),
+            None => {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"paygress/root_key/v1\0");
+                h.update(nostr_key.as_bytes());
+                hex::encode(h.finalize())
+            }
+        };
+
+        let env_file = format!(
+            r#"# Auto-generated by paygress bootstrap
+# ngx_l402 configuration
+
+LNURL_ADDRESS={lightning_address}
+ROOT_KEY={root_key}
+
+# Cashu wallet — shares the same db as the Paygress provider
+CASHU_WALLET_SECRET={wallet_secret}
+CASHU_WHITELISTED_MINTS={mints}
+
+# Lightning sweep settings (both Nostr-DM and HTTP path ecash)
+CASHU_REDEEM_ON_LIGHTNING=true
+CASHU_REDEMPTION_INTERVAL_SECS={sweep_interval}
+CASHU_MELT_MIN_BALANCE_SATS={sweep_min_balance}
+CASHU_MELT_FEE_RESERVE_PERCENT=1
+"#,
+            lightning_address = lightning_address,
+            root_key = root_key,
+            wallet_secret = wallet_secret,
+            mints = args.mints,
+            sweep_interval = args.sweep_interval_secs,
+            sweep_min_balance = args.sweep_min_balance_sats,
+        );
+
+        let docker_compose = r#"services:
+  nginx:
+    image: ghcr.io/dhananjaypurohit/ngx_l402:latest
+    container_name: nginx-l402
+    restart: always
+    ports:
+      - "80:80"
+    env_file:
+      - .env
+    environment:
+      - LN_CLIENT_TYPE=LNURL
+      - CASHU_ECASH_SUPPORT=true
+      - CASHU_DB_PATH=/var/lib/nginx/cashu-wallet.redb
+    volumes:
+      - /var/lib/paygress:/var/lib/nginx
+"#;
+
+        if args.dry_run {
+            println!("  Would install Docker");
+            println!("  Would write /etc/paygress/.env (LNURL_ADDRESS={})", lightning_address);
+            println!("  Would write /etc/paygress/docker-compose.yml");
+            println!("  Would run: docker compose up -d");
+        } else {
+            // Install Docker if not present
+            print!("  Checking Docker... ");
+            std::io::stdout().flush()?;
+            let docker_check = run_ssh_command_output(
+                &args,
+                "which docker >/dev/null 2>&1 && echo 'installed' || echo 'not_installed'",
+            )?;
+            if docker_check.trim() == "not_installed" {
+                println!("{}", "not found — installing".yellow());
+                let install_docker = format!("curl -fsSL https://get.docker.com | {}sh", sudo);
+                run_ssh_command(&args, &install_docker)?;
+                println!("  {} Docker installed", "✓".green());
+            } else {
+                println!("{}", "already installed".green());
+            }
+
+            // Write .env
+            let write_env = if is_root {
+                format!("cat > /etc/paygress/.env << 'ENVEOF'\n{}\nENVEOF", env_file)
+            } else {
+                format!(
+                    "echo '{}' | {}tee /etc/paygress/.env > /dev/null",
+                    env_file.replace("'", "'\\''"),
+                    sudo
+                )
+            };
+            run_ssh_command(&args, &write_env)?;
+            println!("  {} Created /etc/paygress/.env", "✓".green());
+
+            // Write docker-compose.yml
+            let write_compose = if is_root {
+                format!(
+                    "cat > /etc/paygress/docker-compose.yml << 'COMPOSEEOF'\n{}\nCOMPOSEEOF",
+                    docker_compose
+                )
+            } else {
+                format!(
+                    "echo '{}' | {}tee /etc/paygress/docker-compose.yml > /dev/null",
+                    docker_compose.replace("'", "'\\''"),
+                    sudo
+                )
+            };
+            run_ssh_command(&args, &write_compose)?;
+            println!("  {} Created /etc/paygress/docker-compose.yml", "✓".green());
+
+            // Start ngx_l402
+            let start_compose = format!("cd /etc/paygress && {}docker compose up -d", sudo);
+            run_ssh_command(&args, &start_compose)?;
+            println!(
+                "  {} ngx_l402 started — sweeping both Nostr-DM and HTTP ecash to Lightning ⚡",
+                "✓".green()
+            );
+        }
+    } else {
+        println!(
+            "  {} Skipped — no --lightning-address provided.",
+            "–".yellow()
+        );
+        println!("    Ecash from Nostr-DM redemptions will accumulate in the");
+        println!("    shared wallet (/var/lib/paygress/cashu-wallet.redb).");
+        println!("    To enable auto-sweep later, re-run bootstrap with:");
+        println!(
+            "      {} --lightning-address you@getalby.com",
+            "paygress-cli bootstrap".cyan()
+        );
+    }
+    println!();
+
+    // Step 9: Start Service
+    println!("{}", "Step 9: Starting Provider Service".blue().bold());
     println!("{}", "─".repeat(50));
 
     if args.dry_run {
@@ -642,6 +924,14 @@ WantedBy=multi-user.target
     println!("  Provider Name: {}", args.name.yellow());
     println!("  Server:        {}", args.host.cyan());
 
+    if let Some(ref ln) = args.lightning_address {
+        println!("  Lightning:     {} ⚡", ln.cyan());
+        println!("  Sweep every:   {}s (min {} sats)", args.sweep_interval_secs, args.sweep_min_balance_sats);
+        println!("  ngx_l402:      running on port 80 🟢");
+    }
+    println!("  Wallet DB:     /var/lib/paygress/cashu-wallet.redb");
+    println!("  Config:        /etc/paygress/provider-config.json");
+
     if !use_lxd {
         println!("  Proxmox UI:    https://{}:8006", args.host);
         println!();
@@ -651,12 +941,12 @@ WantedBy=multi-user.target
         println!("    3. Start the service: systemctl start paygress-provider");
     } else {
         println!("  Backend:       LXD (Native)");
-        println!("  Status:        Running 🟢");
+        println!("  Provider:      Running 🟢");
     }
 
     println!();
     println!("  Users can discover you with:");
-    println!("    {} market list", "paygress-cli".cyan());
+    println!("    {} list", "paygress-cli".cyan());
     println!();
 
     // Clean up the temporary NOPASSWD sudoers rule added at bootstrap start

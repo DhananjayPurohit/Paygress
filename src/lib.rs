@@ -2,16 +2,33 @@
 //
 // Exports modules for use in binaries.
 //
-// Architecture notes:
-// - **Canonical control plane (default)**: Nostr NIP-17 →
-//   `ProviderService` → `ProxmoxClient` / `LxdBackend`. Always
-//   compiled.
-// - **Legacy K8s + ngx_l402 + HTTP control plane** (gated behind the
-//   `kubernetes` Cargo feature, off by default since Unit 7): nginx
-//   + ngx_l402 → `PodProvisioningService`. Kept compilable so
-//   existing K8s users can opt back in with
-//   `--features kubernetes`, but no longer in the default build
-//   path so engineering capacity flows to the canonical plane.
+// Architecture — two payment paths, one shared wallet, one sweep:
+//
+// Path A — Nostr-DM (default, always compiled):
+//   Client sends Cashu token via encrypted Nostr DM (NIP-17).
+//   `ProviderService` → `CdkRedeemer` swaps the token at the mint via
+//   NUT-03, storing proofs in the shared CDK wallet
+//   (`/var/lib/paygress/cashu-wallet.redb`). Backend is
+//   `ProxmoxClient` / `LxdBackend` / `DockerBackend` / `KvmBackend`.
+//
+// Path B — HTTP + ngx_l402 (always compiled, activated by `http_bind_addr`):
+//   Client hits nginx; ngx_l402 redeems the Cashu token into the same
+//   shared redb wallet, then forwards the authenticated request to the
+//   axum backend in `src/provider_http.rs`. Bootstrap auto-generates
+//   the ngx_l402 Docker Compose config (Step 8 in bootstrap.rs).
+//
+// Lightning sweep (both paths):
+//   ngx_l402 mounts `/var/lib/paygress` as its data volume and runs a
+//   periodic melt loop (`CASHU_REDEMPTION_INTERVAL_SECS`) that converts
+//   ALL accumulated proofs — from both Path A and Path B — into Lightning
+//   payments sent to `LNURL_ADDRESS` (= `lightning_address` in config).
+//   The wallet secret is derived deterministically from the Nostr private
+//   key (`derive_seed_from_nostr_key`), ensuring both sides always open
+//   the same wallet.
+//
+// Legacy K8s pipeline (gated behind `kubernetes` Cargo feature):
+//   nginx + ngx_l402 → `PodProvisioningService`. Kept compilable for
+//   existing K8s users (`--features kubernetes`). Not in the default build.
 
 // Core modules — always compiled.
 pub mod blossom;

@@ -1,17 +1,24 @@
 // Cashu Token Utilities
 //
-// Provides:
-// - `validate_and_redeem` / `MintRedeemer` / `CdkRedeemer`: the canonical
-//   redemption path used by the Nostr-DM provider (`src/provider.rs`).
-//   This actually swaps proofs at the mint via NUT-03, defeating
-//   single- and cross-provider replay.
-// - `extract_token_value`: legacy face-value parser. Still used by the
-//   K8s + ngx_l402 + HTTP path (sidecar_service / pod_provisioning /
-//   interfaces::http_l402). Those callers rely on ngx_l402 to perform
-//   redemption at the nginx layer. Unit 7 of the 12-month plan
-//   feature-gates that whole path behind the `kubernetes` Cargo
-//   feature; once gated out of the default build, this function can be
-//   removed.
+// Two independent redemption paths both write into the shared CDK wallet
+// (`cashu_wallet_db_path`, default `/var/lib/paygress/cashu-wallet.redb`).
+// ngx_l402 periodically sweeps ALL accumulated ecash to Lightning for both.
+//
+// Path A — Nostr-DM (src/provider.rs):
+//   `validate_and_redeem` / `MintRedeemer` / `CdkRedeemer` — swaps the
+//   token at the mint via NUT-03, defeating single- and cross-provider
+//   replay. Proofs land in the shared redb wallet.
+//
+// Path B — HTTP + ngx_l402 (src/provider_http.rs):
+//   ngx_l402 verifies the Cashu token at the nginx layer before forwarding
+//   the request. The backend calls `extract_token_value` to read the
+//   already-redeemed face value without a second mint call. ngx_l402's
+//   wallet points at the same redb file.
+//
+// Lightning sweep (both paths):
+//   ngx_l402 runs a periodic melt loop (CASHU_REDEMPTION_INTERVAL_SECS)
+//   against the shared wallet, converting accumulated proofs from both
+//   paths into Lightning payments to LNURL_ADDRESS.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,8 +35,9 @@ use tokio::sync::Mutex;
 
 const MSAT_PER_SAT: u64 = 1000;
 
-// Legacy database singleton kept so `initialize_cashu` continues to work
-// for callers that haven't migrated to `CdkRedeemer` yet.
+// Singleton CDK wallet database. Used by the HTTP+ngx_l402 path
+// (`initialize_cashu` / `extract_token_value`) and feature-gated behind
+// `kubernetes` for the legacy K8s pipeline.
 static CASHU_DB: OnceLock<Arc<cdk_redb::wallet::WalletRedbDatabase>> = OnceLock::new();
 
 pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
@@ -168,6 +176,8 @@ impl CdkRedeemer {
 
 #[async_trait]
 impl MintRedeemer for CdkRedeemer {
+    /// Swap the encoded token at the mint and return the received amount
+    /// in millisatoshis. Proofs are stored in the per-mint CDK wallet.
     async fn redeem(&self, token_str: &str) -> Result<u64, RedeemError> {
         let token =
             Token::from_str(token_str).map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
@@ -191,6 +201,7 @@ impl MintRedeemer for CdkRedeemer {
             other => Err(RedeemError::UnsupportedUnit(format!("{:?}", other))),
         }
     }
+
 }
 
 fn map_cdk_error(e: cdk::Error) -> RedeemError {
@@ -343,19 +354,17 @@ pub async fn split_token_into_n(
     Ok(tokens)
 }
 
-/// **Legacy face-value parser.** Returns the sum of `proof.amount` from
-/// a decoded token in msats, **without contacting the mint**. This is
-/// vulnerable to single- and cross-provider replay.
+/// Face-value parser for the HTTP+ngx_l402 path.
 ///
-/// Used today by the K8s + ngx_l402 + HTTP path
-/// (`src/sidecar_service.rs`, `src/pod_provisioning.rs`,
-/// `src/interfaces/http_l402.rs`), where ngx_l402 performs Cashu
-/// redemption at the nginx layer before forwarding the request. The
-/// Nostr-DM path no longer calls this — it uses
-/// `validate_and_redeem` instead.
+/// Returns the sum of `proof.amount` from a decoded token in msats,
+/// **without contacting the mint**. This is intentionally safe here
+/// because ngx_l402 has *already* redeemed the token at the nginx layer
+/// (NUT-03 swap + replay guard) before forwarding the request to the
+/// axum backend. Calling the mint a second time would double-spend.
 ///
-/// Will be removed once Unit 7 feature-gates the K8s pipeline behind
-/// the `kubernetes` Cargo feature.
+/// The Nostr-DM path uses `validate_and_redeem` instead (which does
+/// contact the mint), because there is no upstream nginx layer to
+/// pre-redeem for it.
 pub async fn extract_token_value(token_str: &str) -> anyhow::Result<u64> {
     let token = Token::from_str(token_str)
         .map_err(|e| anyhow::anyhow!("Failed to decode Cashu token: {}", e))?;

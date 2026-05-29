@@ -109,7 +109,8 @@ paygress-cli bootstrap \
   --user root \
   --password "your-ssh-password" \
   --name "My Node" \
-  --mints "https://testnut.cashu.space"
+  --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
+  --lightning-address "you@getalby.com"   # optional: auto-sweep earnings to Lightning
 
 # With SSH key (no extra dependencies)
 paygress-cli bootstrap \
@@ -117,7 +118,8 @@ paygress-cli bootstrap \
   --user root \
   --key ~/.ssh/id_rsa \
   --name "My Node" \
-  --mints "https://testnut.cashu.space"
+  --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io"
+  --lightning-address "you@getalby.com"   # optional: auto-sweep earnings to Lightning
 ```
 
 This will SSH into your server, install LXD (on Ubuntu) or Proxmox (on Debian), compile Paygress, configure a systemd service, and start broadcasting offers to Nostr.
@@ -127,20 +129,32 @@ This will SSH into your server, install LXD (on Ubuntu) or Proxmox (on Debian), 
 ### Manual Setup
 
 ```bash
-# 1. Setup (generates config at provider-config.json)
+# 1. Setup (generates config at /etc/paygress/provider-config.json)
 paygress-cli provider setup \
   --proxmox-url https://127.0.0.1:8006/api2/json \
   --token-id "root@pam!paygress" \
   --token-secret "<SECRET>" \
   --name "My Provider" \
-  --mints "https://testnut.cashu.space"
+  --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
+  --lightning-address "you@getalby.com"   # optional: auto-sweep earnings to Lightning
+
+# LXD / KVM / Docker backends (no Proxmox needed):
+paygress-cli provider setup \
+  --backend lxd \
+  --name "My LXD Provider" \
+  --mints "https://mint.minibits.cash/Bitcoin,https://mint.coinos.io" \
+  --lightning-address "you@getalby.com"
 
 # 2. Start
-paygress-cli provider start --config provider-config.json
+paygress-cli provider start --config /etc/paygress/provider-config.json
 
 # 3. Check status
 paygress-cli provider status
 ```
+
+#### `--lightning-address` — Lightning address metadata
+
+Stored in the provider config. On the HTTP+ngx_l402 path, bootstrap sets this as the `LNURL_ADDRESS` env var in `docker-compose.yml` and ngx_l402 handles ecash-to-Lightning sweeping automatically. On the Nostr-DM path, ecash accumulates in the local CDK wallet — sweep it manually with CDK tooling.
 
 ### Provider Management
 

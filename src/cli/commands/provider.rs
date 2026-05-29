@@ -111,6 +111,16 @@ pub struct SetupArgs {
     /// Whitelisted Cashu mints (comma-separated)
     #[arg(long, default_value = "https://mint.minibits.cash")]
     pub mints: String,
+
+    /// Lightning address for automatic sweep of earned ecash.
+    ///
+    /// When set, every Cashu token redeemed is automatically melted to
+    /// this Lightning address (LNURL-pay). Non-fatal if the sweep fails —
+    /// ecash stays in the local wallet.
+    ///
+    /// Format: user@domain.com  (e.g. myprovider@getalby.com)
+    #[arg(long)]
+    pub lightning_address: Option<String>,
 }
 
 /// Scaffold N independent providers on the same host.
@@ -174,6 +184,12 @@ pub struct SetupMultiArgs {
     /// already has their own service-management story.
     #[arg(long)]
     pub no_systemd: bool,
+
+    /// Lightning address for automatic sweep of earned ecash.
+    /// Applied to every scaffolded provider instance.
+    /// Format: user@domain.com
+    #[arg(long)]
+    pub lightning_address: Option<String>,
 }
 
 #[derive(Args)]
@@ -351,6 +367,8 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         ssh_port_start: None,
         ssh_port_end: None,
         cashu_wallet_db_path: "./paygress-cashu-wallet.redb".to_string(),
+        lightning_address: args.lightning_address.clone(),
+        http_bind_addr: None,
     };
 
     // Save configuration
@@ -436,6 +454,11 @@ fn finalize_setup(provider_name: &str) -> Result<()> {
     println!("  {} provider start", "paygress-cli".cyan());
     println!();
     println!("Your provider name: {}", provider_name.yellow());
+    println!();
+    println!(
+        "Tip: add {} to auto-sweep earnings to Lightning.",
+        "--lightning-address user@domain.com".cyan()
+    );
     Ok(())
 }
 
@@ -513,6 +536,8 @@ fn build_multi_config(
         // one wallet's localstore (cdk's per-process write lock
         // would serialize all redemptions otherwise).
         cashu_wallet_db_path: format!("./paygress-{}.redb", provider_name),
+        http_bind_addr: None,
+        lightning_address: args.lightning_address.clone(),
     }
 }
 
@@ -692,9 +717,12 @@ async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
     println!();
 
     // Create and run the provider service
-    let service = ProviderService::new(config).await?;
+    let service = ProviderService::new(config.clone()).await?;
 
     println!("  NPUB: {}", service.get_npub().cyan());
+    if let Some(ref ln) = config.lightning_address {
+        println!("  ⚡ Lightning sweep: {}", ln.cyan());
+    }
     println!();
     println!("{}", "Provider is now live! Press Ctrl+C to stop.".green());
     println!("{}", "━".repeat(50).blue());
@@ -767,6 +795,16 @@ async fn execute_status(_verbose: bool) -> Result<()> {
             for mint in &config.whitelisted_mints {
                 println!("    • {}", mint);
             }
+            println!();
+            println!(
+                "  {} Lightning sweep: {}",
+                "⚡".to_string(),
+                config
+                    .lightning_address
+                    .as_deref()
+                    .unwrap_or("(not configured)")
+                    .cyan()
+            );
             if config.tunnel_enabled {
                 println!();
                 println!("  {} Tunnel:", "🔒".to_string());
@@ -1111,6 +1149,7 @@ mod setup_multi_tests {
             mints: "http://localhost:3338".to_string(),
             public_ip: Some("203.0.113.1".to_string()),
             no_systemd: true,
+            lightning_address: None,
         }
     }
 
