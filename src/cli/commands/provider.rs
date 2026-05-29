@@ -108,8 +108,17 @@ pub struct SetupArgs {
     #[arg(long)]
     pub public_ip: Option<String>,
 
-    /// Whitelisted Cashu mints (comma-separated)
-    #[arg(long, default_value = "https://mint.minibits.cash")]
+    /// Whitelisted Cashu mints (comma-separated). Defaults to
+    /// `testnut.cashu.space` — the testnet mint paygress's
+    /// integration paths exercise (`tests/cashu_redemption.rs`,
+    /// `tests/cli_deploy.rs`). The bundled cdk 0.14 wallet supports
+    /// v2 keyset IDs in code, so mainnet mints (e.g.
+    /// `https://mint.minibits.cash/Bitcoin`) are expected to work
+    /// for receive+swap, but that flow has not been verified
+    /// end-to-end against a live mainnet mint yet. Operators who
+    /// have validated their own mainnet mint can override with
+    /// `--mints https://their.mint/path`.
+    #[arg(long, default_value = "https://testnut.cashu.space")]
     pub mints: String,
 }
 
@@ -160,8 +169,11 @@ pub struct SetupMultiArgs {
 
     /// Whitelisted Cashu mints (comma-separated). Same list applied
     /// to every provider (they're all on the same host so they have
-    /// the same network reachability).
-    #[arg(long, default_value = "http://localhost:3338")]
+    /// the same network reachability). Defaults to `testnut.cashu.space`
+    /// — see the single-provider `SetupArgs::mints` comment for why
+    /// the default is testnet rather than mainnet. Operators with a
+    /// local nutshell mint can pass `--mints http://localhost:3338`.
+    #[arg(long, default_value = "https://testnut.cashu.space")]
     pub mints: String,
 
     /// Public IP address (auto-detected if not provided). Same value
@@ -1108,7 +1120,7 @@ mod setup_multi_tests {
             count,
             backend: paygress::provider::BackendType::Docker,
             name: "test".to_string(),
-            mints: "http://localhost:3338".to_string(),
+            mints: "https://testnut.cashu.space".to_string(),
             public_ip: Some("203.0.113.1".to_string()),
             no_systemd: true,
         }

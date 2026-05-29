@@ -44,8 +44,12 @@ pub struct BootstrapArgs {
     #[arg(long)]
     pub nostr_key: Option<String>,
 
-    /// Whitelisted Cashu mints (comma-separated)
-    #[arg(long, default_value = "https://mint.minibits.cash")]
+    /// Whitelisted Cashu mints (comma-separated). Defaults to the
+    /// `testnut.cashu.space` testnet mint — see
+    /// `cli::commands::provider::SetupArgs::mints` for the rationale
+    /// (mainnet receive flow unverified end-to-end against this cdk
+    /// version).
+    #[arg(long, default_value = "https://testnut.cashu.space")]
     pub mints: String,
 
     /// Skip Proxmox installation (assumes already installed)
