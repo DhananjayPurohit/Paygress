@@ -32,7 +32,7 @@ pub struct TopupArgs {
     #[arg(short = 'k', long)]
     pub token: Option<String>,
 
-    /// Provider npub (Nostr mode) - if omitted, uses --server for HTTP mode
+    /// Provider ID (Nostr mode) - if omitted, uses --server for HTTP mode
     #[arg(long)]
     pub provider: Option<String>,
 

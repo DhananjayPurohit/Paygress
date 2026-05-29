@@ -71,7 +71,7 @@ pub enum ListAction {
 
 #[derive(Args)]
 pub struct InfoArgs {
-    /// Provider npub
+    /// Provider ID
     pub provider: String,
 
     /// Custom Nostr relays (comma-separated)
@@ -137,9 +137,9 @@ async fn execute_nostr_list(args: ListArgs, verbose: bool) -> Result<()> {
     println!("{}", DiscoveryClient::format_provider_table(&providers));
 
     println!();
-    println!("To see details: {} list info <npub>", "paygress-cli".cyan());
+    println!("To see details: {} list info <id>", "paygress-cli".cyan());
     println!(
-        "To spawn:       {} spawn --provider <npub> --token <cashu-token>",
+        "To spawn:       {} spawn --provider <id> --token <cashu-token>",
         "paygress-cli".cyan()
     );
 

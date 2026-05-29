@@ -100,9 +100,12 @@ pub struct BootstrapArgs {
 /// silently broken sweep loop.
 async fn validate_lightning_address(address: &str) -> Result<()> {
     // Parse user@domain
-    let (user, domain) = address
-        .split_once('@')
-        .with_context(|| format!("'{}' is not a valid Lightning Address — expected user@domain.com", address))?;
+    let (user, domain) = address.split_once('@').with_context(|| {
+        format!(
+            "'{}' is not a valid Lightning Address — expected user@domain.com",
+            address
+        )
+    })?;
 
     if user.is_empty() || domain.is_empty() {
         anyhow::bail!(
@@ -118,18 +121,21 @@ async fn validate_lightning_address(address: &str) -> Result<()> {
         .build()
         .context("failed to build HTTP client for Lightning Address validation")?;
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("could not reach {} — check domain and internet connectivity", url))?;
+    let resp = client.get(&url).send().await.with_context(|| {
+        format!(
+            "could not reach {} — check domain and internet connectivity",
+            url
+        )
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!(
             "Lightning Address endpoint returned HTTP {} for {}\n    \
              Check that '{}' is registered with that provider.",
-            status, url, address
+            status,
+            url,
+            address
         );
     }
 
@@ -142,11 +148,13 @@ async fn validate_lightning_address(address: &str) -> Result<()> {
         Some("payRequest") => {}
         Some(other) => anyhow::bail!(
             "unexpected LNURL tag '{}' at {} — expected 'payRequest'",
-            other, url
+            other,
+            url
         ),
         None => anyhow::bail!(
             "LNURL response from {} is missing the 'tag' field:\n    {}",
-            url, json
+            url,
+            json
         ),
     }
 
@@ -155,12 +163,7 @@ async fn validate_lightning_address(address: &str) -> Result<()> {
         json.get("minSendable").and_then(|v| v.as_u64()),
         json.get("maxSendable").and_then(|v| v.as_u64()),
     ) {
-        println!(
-            " {} (sendable: {} – {} msats)",
-            "✓".green(),
-            min,
-            max
-        );
+        println!(" {} (sendable: {} – {} msats)", "✓".green(), min, max);
     } else {
         println!(" {}", "✓".green());
     }
@@ -728,7 +731,10 @@ WantedBy=multi-user.target
     // we skip this step. Ecash from Nostr-DM redemptions will accumulate
     // in /var/lib/paygress/cashu-wallet.redb and can be swept later by
     // re-running bootstrap with --lightning-address.
-    println!("{}", "Step 8: Deploying ngx_l402 (Lightning Sweep)".blue().bold());
+    println!(
+        "{}",
+        "Step 8: Deploying ngx_l402 (Lightning Sweep)".blue().bold()
+    );
     println!("{}", "─".repeat(50));
 
     if let Some(ref lightning_address) = args.lightning_address {
@@ -736,9 +742,15 @@ WantedBy=multi-user.target
         // Catches typos and unregistered addresses immediately, rather than
         // letting ngx_l402 start with a broken sweep target.
         if args.dry_run {
-            println!("  Would validate Lightning Address: {}", lightning_address.cyan());
+            println!(
+                "  Would validate Lightning Address: {}",
+                lightning_address.cyan()
+            );
         } else {
-            print!("  Validating Lightning Address {}...", lightning_address.cyan());
+            print!(
+                "  Validating Lightning Address {}...",
+                lightning_address.cyan()
+            );
             std::io::stdout().flush()?;
             validate_lightning_address(lightning_address)
                 .await
@@ -815,7 +827,10 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
 
         if args.dry_run {
             println!("  Would install Docker");
-            println!("  Would write /etc/paygress/.env (LNURL_ADDRESS={})", lightning_address);
+            println!(
+                "  Would write /etc/paygress/.env (LNURL_ADDRESS={})",
+                lightning_address
+            );
             println!("  Would write /etc/paygress/docker-compose.yml");
             println!("  Would run: docker compose up -d");
         } else {
@@ -926,7 +941,10 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
 
     if let Some(ref ln) = args.lightning_address {
         println!("  Lightning:     {} ⚡", ln.cyan());
-        println!("  Sweep every:   {}s (min {} sats)", args.sweep_interval_secs, args.sweep_min_balance_sats);
+        println!(
+            "  Sweep every:   {}s (min {} sats)",
+            args.sweep_interval_secs, args.sweep_min_balance_sats
+        );
         println!("  ngx_l402:      running on port 80 🟢");
     }
     println!("  Wallet DB:     /var/lib/paygress/cashu-wallet.redb");

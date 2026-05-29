@@ -32,7 +32,7 @@ use paygress::nostr::{AccessDetailsContent, ErrorResponseContent, TemplateAccess
 
 #[derive(Args)]
 pub struct BatchArgs {
-    /// Provider npub. Auto-discovery of the cheapest provider lands
+    /// Provider ID. Auto-discovery of the cheapest provider lands
     /// with the observatory; until then, this flag is required.
     #[arg(long)]
     pub provider: String,

@@ -94,7 +94,7 @@ pub struct ListProvidersParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpawnParams {
-    /// Provider npub to spawn against.
+    /// Provider ID to spawn against.
     pub provider: String,
     /// Cashu token paying for this spawn.
     pub token: String,
@@ -143,7 +143,7 @@ fn default_timeout_secs() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BatchParams {
-    /// Provider npub to spawn against.
+    /// Provider ID to spawn against.
     pub provider: String,
     /// Either a list of N pre-minted Cashu tokens, OR a single token
     /// to split into `shards` shards. Mutually exclusive: set
@@ -196,7 +196,7 @@ fn parse_iso_param(s: Option<&str>) -> Result<Option<paygress::nostr::IsolationL
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusParams {
-    /// Provider npub that owns the workload.
+    /// Provider ID that owns the workload.
     pub provider: String,
     /// Pod identifier from the spawn response (e.g.
     /// "container-1042").
@@ -212,7 +212,7 @@ fn default_status_timeout_secs() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TopupParams {
-    /// Provider npub that owns the workload.
+    /// Provider ID that owns the workload.
     pub provider: String,
     /// Pod identifier from the spawn response.
     pub pod_id: String,

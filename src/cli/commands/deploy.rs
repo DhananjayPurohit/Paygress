@@ -167,7 +167,7 @@ pub struct DeployArgs {
     #[arg(short = 'k', long, value_parser = parse_cashu_token)]
     pub token: String,
 
-    /// Provider npub. If omitted, the CLI auto-selects the
+    /// Provider ID. If omitted, the CLI auto-selects the
     /// lowest-priced provider that advertises this template's
     /// capabilities (auto-selection lands with Unit 12's
     /// observatory; today this flag is required).
@@ -278,9 +278,9 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         // Deploy doesn't yet collect a primary/standby topology
         // (see the warning printed above when replication != none).
         // The full warm-standby flow is `paygress-cli spawn` with
-        // explicit --primary-npub / --workload-id, called once per
+        // explicit --primary-id / --workload-id, called once per
         // provider in the set.
-        primary_npub: None,
+        primary_id: None,
         workload_id: None,
         // `spawn::execute` honors the template's encrypt-by-default
         // policy via `template_default_encrypts_volume(template_slug)`,

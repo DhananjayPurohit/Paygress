@@ -18,7 +18,7 @@ pub struct StatusArgs {
     #[arg(short, long)]
     pub pod_id: String,
 
-    /// Provider npub (Nostr mode)
+    /// Provider ID (Nostr mode)
     #[arg(long)]
     pub provider: Option<String>,
 

@@ -41,7 +41,7 @@ fn nsec_to_bytes(nostr_key: &str) -> Result<[u8; 32]> {
 
 #[derive(Args)]
 pub struct SpawnArgs {
-    /// Provider npub (Nostr mode) - if omitted, uses --server for HTTP mode
+    /// Provider ID (Nostr mode) - if omitted, uses --server for HTTP mode
     #[arg(long)]
     pub provider: Option<String>,
 
@@ -86,23 +86,23 @@ pub struct SpawnArgs {
 
     /// Replication mode: `none` (default), `checkpointed`, or
     /// `warm-standby`. Warm-standby additionally requires `--standby`
-    /// listing the standby providers' npubs.
+    /// listing the standby provider IDs.
     #[arg(long, default_value = "none")]
     pub replication: String,
 
-    /// Comma-separated standby provider npubs (warm-standby only).
+    /// Comma-separated standby provider IDs (warm-standby only).
     /// Ignored when `--replication` is not `warm-standby`.
     #[arg(long)]
     pub standby: Option<String>,
 
-    /// Primary provider's npub (warm-standby only). When you spawn
-    /// AGAINST a standby with `--provider <standby-npub>`, this tells
+    /// Primary provider's ID (warm-standby only). When you spawn
+    /// AGAINST a standby with `--provider <standby-id>`, this tells
     /// the standby who the primary is so it can listen for the right
     /// `LeaseRevocation`. When you spawn AGAINST the primary, set
     /// this to the same value as `--provider` so the primary
     /// recognizes itself.
     #[arg(long)]
-    pub primary_npub: Option<String>,
+    pub primary_id: Option<String>,
 
     /// Consumer-assigned workload identifier (UUID-shaped string,
     /// warm-standby only). The same value MUST be passed when
@@ -358,7 +358,7 @@ pub async fn nostr_spawn_round_trip(
     ssh_pass: String,
     template_slug: Option<String>,
     replication: Option<paygress::durable_workload::ReplicationMode>,
-    primary_npub: Option<String>,
+    primary_id: Option<String>,
     workload_id: Option<String>,
     volume_encryption: Option<paygress::nostr::VolumeEncryption>,
     isolation_level: Option<paygress::nostr::IsolationLevel>,
@@ -408,7 +408,7 @@ pub async fn nostr_spawn_round_trip(
         ssh_password: ssh_pass,
         template_slug,
         replication,
-        primary_npub,
+        primary_npub: primary_id,
         workload_id,
         volume_encryption,
     };
@@ -465,14 +465,14 @@ async fn execute_nostr_spawn(
     );
 
     let replication = parse_replication_arg(&args.replication, args.standby.as_deref())?;
-    // For warm-standby, primary_npub + workload_id are required so
+    // For warm-standby, primary_id + workload_id are required so
     // each receiving provider can self-determine role and so the
     // standbys share one stable id with the primary.
     if let Some(paygress::durable_workload::ReplicationMode::WarmStandby { .. }) =
         replication.as_ref()
     {
-        if args.primary_npub.is_none() {
-            anyhow::bail!("--replication warm-standby requires --primary-npub <primary's npub>");
+        if args.primary_id.is_none() {
+            anyhow::bail!("--replication warm-standby requires --primary-id <primary provider ID>");
         }
         if args.workload_id.is_none() {
             anyhow::bail!(
@@ -543,7 +543,7 @@ async fn execute_nostr_spawn(
         ssh_pass.clone(),
         args.template_slug.clone(),
         replication,
-        args.primary_npub.clone(),
+        args.primary_id.clone(),
         effective_workload_id,
         volume_encryption,
         args.isolation_level,
@@ -617,7 +617,7 @@ async fn execute_nostr_spawn(
             );
             println!();
             println!("The request was sent, but the provider didn't respond in time.");
-            println!("You may check your status later with: paygress-cli status --pod-id <ID> --provider <npub>");
+            println!("You may check your status later with: paygress-cli status --pod-id <ID> --provider <id>");
         }
     }
 
