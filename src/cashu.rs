@@ -252,11 +252,11 @@ pub fn derive_seed_from_nostr_key(nostr_private_key: &str) -> [u8; 64] {
 /// remainder so the totals reconcile exactly.
 ///
 /// Caveats:
-///   - This is `cdk::wallet` 0.9. Modern mints with v2 (66-char)
-///     keyset IDs (e.g. mint.minibits.cash) may fail at receive due
-///     to the same parsing issue we hit on the redeemer side. Tested
-///     today against `testnut.cashu.space`. cdk 0.14 upgrade is
-///     tracked separately.
+///   - Exercised end-to-end against `testnut.cashu.space` only.
+///     The bundled cdk 0.14 wallet supports v2 (66-char) keyset
+///     IDs in code, so mainnet mints (e.g. `mint.minibits.cash`)
+///     are expected to work for receive+split, but that path has
+///     not been verified against a live mainnet mint yet.
 ///   - The wallet's localstore at `db_path` is left in place after
 ///     the split; callers wanting truly ephemeral semantics should
 ///     remove it. The batch coordinator does.

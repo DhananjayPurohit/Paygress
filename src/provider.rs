@@ -174,7 +174,7 @@ impl Default for ProviderConfig {
                 memory_mb: 1024,
                 rate_msats_per_sec: 50,
             }],
-            whitelisted_mints: vec!["https://mint.minibits.cash".to_string()],
+            whitelisted_mints: vec!["https://testnut.cashu.space".to_string()],
             heartbeat_interval_secs: 60,
             minimum_duration_seconds: 60,
             tunnel_enabled: false,
