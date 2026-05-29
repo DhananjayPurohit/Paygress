@@ -223,19 +223,16 @@ impl DiscoveryClient {
 
         let mut output = String::new();
 
-        // Replaced the historically-uniform `LXC/VM` column with
-        // `TIER` (the offer's isolation level) — every provider
-        // today reports `lxc/vm`, so the old column was decorative.
-        // `TIER` is the only column that distinguishes a Docker
-        // provider from a per-VM KVM provider in the listing.
-        writeln!(&mut output, "┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
+        // Column widths:  ID(16) | PROVIDER(18) | LOCATION(10) | UPTIME(8) | CHEAPEST(8) | TIER(10) | MINT(16) | ONLINE(6)
+        // Total inner = 16+18+10+8+8+10+16+6 = 92, separators = 9×3 = 27 → 119 + 2 borders = 121
+        writeln!(&mut output, "┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
         writeln!(
             &mut output,
-            "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^6} │",
-            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "TIER", "ONLINE"
+            "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^16} │ {:^6} │",
+            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "TIER", "MINT", "ONLINE"
         )
         .unwrap();
-        writeln!(&mut output, "├──────────────────────────────────────────────────────────────────────────────────────────────────────┤").unwrap();
+        writeln!(&mut output, "├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤").unwrap();
 
         for p in providers {
             let id = truncate_str(&p.npub, 16);
@@ -248,29 +245,30 @@ impl DiscoveryClient {
                 .map(|r| format!("{}m/s", r))
                 .unwrap_or_else(|| "-".to_string());
             // Compact tier label that fits the 10-char column.
-            // `attested-research-tier` is too long; abbreviate.
             let tier = match p.isolation_level {
                 crate::nostr::IsolationLevel::SharedKernel => "shared",
                 crate::nostr::IsolationLevel::DedicatedHost => "dedicated",
                 crate::nostr::IsolationLevel::AttestedResearchTier => "attested",
             };
+            let mints = format_mints_column(&p.whitelisted_mints, 16);
             let online = if p.is_online { "✓" } else { "✗" };
 
             writeln!(
                 &mut output,
-                "│ {:16} │ {:18} │ {:^10} │ {:>6.1}% │ {:>8} │ {:^10} │ {:^6} │",
+                "│ {:16} │ {:18} │ {:^10} │ {:>6.1}% │ {:>8} │ {:^10} │ {:^16} │ {:^6} │",
                 id,
                 truncate_str(&p.hostname, 18),
                 truncate_str(location, 10),
                 p.uptime_percent,
                 cheapest,
                 tier,
+                mints,
                 online
             )
             .unwrap();
         }
 
-        writeln!(&mut output, "└──────────────────────────────────────────────────────────────────────────────────────────────────────┘").unwrap();
+        writeln!(&mut output, "└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘").unwrap();
 
         output
     }
@@ -395,6 +393,45 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
         s
     } else {
         &s[..max_len - 2]
+    }
+}
+
+/// Compact mint label for the list table.
+///
+/// Strips `https://` / `http://`, strips a leading `mint.` subdomain
+/// (very common convention — "mint.minibits.cash" → "minibits.cash"),
+/// and truncates to `max_len` chars so it fits the column.
+///
+/// Examples:
+///   "https://mint.minibits.cash"   → "minibits.cash"
+///   "https://testnut.cashu.space"  → "testnut.cashu."  (truncated at 14)
+///   "http://localhost:3338"         → "localhost:3338"
+fn mint_label(url: &str, max_len: usize) -> String {
+    let stripped = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let without_mint_prefix = stripped
+        .strip_prefix("mint.")
+        .unwrap_or(stripped);
+    // Drop trailing path (e.g. "/api")
+    let domain = without_mint_prefix.split('/').next().unwrap_or(without_mint_prefix);
+    if domain.len() <= max_len {
+        domain.to_string()
+    } else {
+        format!("{}.", &domain[..max_len - 1])
+    }
+}
+
+/// Formats the list of whitelisted mints for the table column.
+/// Shows the first mint's label; appends "+N" if there are more.
+fn format_mints_column(mints: &[String], max_len: usize) -> String {
+    match mints.len() {
+        0 => "-".to_string(),
+        1 => mint_label(&mints[0], max_len),
+        n => {
+            let label = mint_label(&mints[0], max_len - 3); // room for " +N"
+            format!("{} +{}", label, n - 1)
+        }
     }
 }
 

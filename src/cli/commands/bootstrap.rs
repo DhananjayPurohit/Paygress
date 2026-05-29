@@ -33,11 +33,6 @@ pub struct BootstrapArgs {
     #[arg(long, default_value = "22")]
     pub port: u16,
 
-    /// Provider display name.
-    /// Auto-generated from the Nostr key if not provided (e.g. "SwiftGoldenOwl").
-    /// Same key always produces the same name, so bootstrap is idempotent.
-    #[arg(long)]
-    pub name: Option<String>,
 
     /// Location description (e.g., "US-East", "Germany")
     #[arg(long)]
@@ -205,11 +200,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     let sudo = if is_root { "" } else { "sudo " };
 
     println!("Target: {}", target.cyan());
-    if let Some(ref n) = args.name {
-        println!("Name:   {} (provided)", n.yellow());
-    } else {
-        println!("Name:   {} (will auto-generate from Nostr key)", "TBD".dimmed());
-    }
+    println!("Name:   {} (derived from Nostr key)", "auto".dimmed());
     if let Some(ref loc) = args.location {
         println!("Location: {}", loc);
     }
@@ -598,18 +589,15 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         }
     };
 
-    // Resolve provider name — use explicit --name if given, otherwise derive
-    // a 3-word name from the Nostr public key (deterministic + idempotent).
-    let provider_name: String = match args.name {
-        Some(ref n) => n.clone(),
-        None => {
-            let keys = nostr_sdk::Keys::parse(&nostr_key)
-                .map_err(|e| anyhow::anyhow!("failed to parse nostr key for name derivation: {}", e))?;
-            let pubkey_bytes = keys.public_key().to_bytes();
-            let name = paygress::namegen::derive_provider_name(&pubkey_bytes);
-            println!("  Generated name: {}", name.yellow().bold());
-            name
-        }
+    // Derive provider name from the Nostr public key — always automatic,
+    // deterministic, and idempotent (same key → same name every run).
+    let provider_name: String = {
+        let keys = nostr_sdk::Keys::parse(&nostr_key)
+            .map_err(|e| anyhow::anyhow!("failed to parse nostr key for name derivation: {}", e))?;
+        let pubkey_bytes = keys.public_key().to_bytes();
+        let name = paygress::namegen::derive_provider_name(&pubkey_bytes);
+        println!("  Provider name:  {}", name.yellow().bold());
+        name
     };
     println!();
 
