@@ -223,16 +223,16 @@ impl DiscoveryClient {
 
         let mut output = String::new();
 
-        // Column widths:  ID(16) | PROVIDER(18) | LOCATION(10) | UPTIME(8) | CHEAPEST(8) | TIER(10) | MINT(16) | ONLINE(6)
-        // Total inner = 16+18+10+8+8+10+16+6 = 92, separators = 9×3 = 27 → 119 + 2 borders = 121
-        writeln!(&mut output, "┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
+        // Column widths: ID(16) | PROVIDER(18) | LOCATION(10) | UPTIME(8) | CHEAPEST(8) | TIER(10) | MINTS(36) | ONLINE(6)
+        // Inner = 16+18+10+8+8+10+36+6 = 112, separators = 9×3 = 27 → 139 + 2 borders = 141
+        writeln!(&mut output, "┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
         writeln!(
             &mut output,
-            "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^16} │ {:^6} │",
-            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "TIER", "MINT", "ONLINE"
+            "│ {:^16} │ {:^18} │ {:^10} │ {:^8} │ {:^8} │ {:^10} │ {:^36} │ {:^6} │",
+            "ID", "PROVIDER", "LOCATION", "UPTIME", "CHEAPEST", "TIER", "MINTS", "ONLINE"
         )
         .unwrap();
-        writeln!(&mut output, "├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤").unwrap();
+        writeln!(&mut output, "├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤").unwrap();
 
         for p in providers {
             let id = truncate_str(&p.npub, 16);
@@ -250,12 +250,12 @@ impl DiscoveryClient {
                 crate::nostr::IsolationLevel::DedicatedHost => "dedicated",
                 crate::nostr::IsolationLevel::AttestedResearchTier => "attested",
             };
-            let mints = format_mints_column(&p.whitelisted_mints, 16);
+            let mints = format_mints_column(&p.whitelisted_mints, 36);
             let online = if p.is_online { "✓" } else { "✗" };
 
             writeln!(
                 &mut output,
-                "│ {:16} │ {:18} │ {:^10} │ {:>6.1}% │ {:>8} │ {:^10} │ {:^16} │ {:^6} │",
+                "│ {:16} │ {:18} │ {:^10} │ {:>6.1}% │ {:>8} │ {:^10} │ {:^36} │ {:^6} │",
                 id,
                 truncate_str(&p.hostname, 18),
                 truncate_str(location, 10),
@@ -268,7 +268,7 @@ impl DiscoveryClient {
             .unwrap();
         }
 
-        writeln!(&mut output, "└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘").unwrap();
+        writeln!(&mut output, "└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘").unwrap();
 
         output
     }
@@ -398,40 +398,68 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 
 /// Compact mint label for the list table.
 ///
-/// Strips `https://` / `http://`, strips a leading `mint.` subdomain
-/// (very common convention — "mint.minibits.cash" → "minibits.cash"),
-/// and truncates to `max_len` chars so it fits the column.
+/// Strips the URL scheme (`https://` / `http://`) and any trailing path,
+/// keeping the full hostname as-is (including any `mint.` subdomain).
 ///
 /// Examples:
-///   "https://mint.minibits.cash"   → "minibits.cash"
-///   "https://testnut.cashu.space"  → "testnut.cashu."  (truncated at 14)
-///   "http://localhost:3338"         → "localhost:3338"
-fn mint_label(url: &str, max_len: usize) -> String {
+///   "https://mint.minibits.cash"  → "mint.minibits.cash"
+///   "https://testnut.cashu.space" → "testnut.cashu.space"
+///   "http://localhost:3338"        → "localhost:3338"
+fn mint_label(url: &str) -> String {
     let stripped = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let without_mint_prefix = stripped
-        .strip_prefix("mint.")
-        .unwrap_or(stripped);
     // Drop trailing path (e.g. "/api")
-    let domain = without_mint_prefix.split('/').next().unwrap_or(without_mint_prefix);
-    if domain.len() <= max_len {
-        domain.to_string()
-    } else {
-        format!("{}.", &domain[..max_len - 1])
+    stripped.split('/').next().unwrap_or(stripped).to_string()
+}
+
+/// Formats the list of whitelisted mints for the table column (width `col`).
+///
+/// - 0 mints  →  "-"
+/// - 1 mint   →  "mint.minibits.cash"
+/// - 2 mints  →  "mint.minibits.cash, mint.nucash.com"
+/// - 3+ mints →  "mint.minibits.cash, mint.nucash.com +N"
+///
+/// Each label is truncated only if the combined string would exceed `col`.
+fn format_mints_column(mints: &[String], col: usize) -> String {
+    match mints.len() {
+        0 => "-".to_string(),
+        1 => {
+            let l = mint_label(&mints[0]);
+            truncate_owned(l, col)
+        }
+        n => {
+            let l0 = mint_label(&mints[0]);
+            let l1 = mint_label(&mints[1]);
+            let suffix = if n > 2 { format!(" +{}", n - 2) } else { String::new() };
+            let combined = format!("{}, {}{}", l0, l1, suffix);
+            if combined.len() <= col {
+                combined
+            } else {
+                // Try just two labels without suffix first, then fall back
+                // to first label + suffix
+                let two = format!("{}, {}", l0, l1);
+                if two.len() <= col {
+                    truncate_owned(two, col)
+                } else {
+                    let sfx = if n > 2 {
+                        format!(" +{}", n - 1)
+                    } else {
+                        format!(" +{}", 1)
+                    };
+                    let room = col.saturating_sub(sfx.len());
+                    format!("{}{}", truncate_owned(l0, room), sfx)
+                }
+            }
+        }
     }
 }
 
-/// Formats the list of whitelisted mints for the table column.
-/// Shows the first mint's label; appends "+N" if there are more.
-fn format_mints_column(mints: &[String], max_len: usize) -> String {
-    match mints.len() {
-        0 => "-".to_string(),
-        1 => mint_label(&mints[0], max_len),
-        n => {
-            let label = mint_label(&mints[0], max_len - 3); // room for " +N"
-            format!("{} +{}", label, n - 1)
-        }
+fn truncate_owned(s: String, max: usize) -> String {
+    if s.len() <= max {
+        s
+    } else {
+        format!("{}..", &s[..max.saturating_sub(2)])
     }
 }
 
@@ -439,6 +467,40 @@ fn format_mints_column(mints: &[String], max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::nostr::PodSpec;
+
+    #[test]
+    fn mint_label_keeps_mint_subdomain() {
+        assert_eq!(mint_label("https://mint.minibits.cash"), "mint.minibits.cash");
+        assert_eq!(mint_label("https://testnut.cashu.space"), "testnut.cashu.space");
+        assert_eq!(mint_label("http://localhost:3338"), "localhost:3338");
+        // Path is stripped
+        assert_eq!(mint_label("https://mint.example.com/api/v1"), "mint.example.com");
+    }
+
+    #[test]
+    fn format_mints_column_shows_two() {
+        let mints = vec![
+            "https://mint.minibits.cash".to_string(),
+            "https://mint.nucash.com".to_string(),
+        ];
+        let result = format_mints_column(&mints, 36);
+        assert!(result.contains("mint.minibits.cash"), "missing first mint");
+        assert!(result.contains("mint.nucash.com"),    "missing second mint");
+        assert!(!result.contains("+"), "unexpected overflow suffix for 2 mints");
+    }
+
+    #[test]
+    fn format_mints_column_shows_two_plus_overflow() {
+        let mints = vec![
+            "https://mint.a.com".to_string(),
+            "https://mint.b.com".to_string(),
+            "https://mint.c.com".to_string(),
+        ];
+        let result = format_mints_column(&mints, 36);
+        assert!(result.contains("mint.a.com"), "missing first mint");
+        assert!(result.contains("mint.b.com"), "missing second mint");
+        assert!(result.contains("+1"),          "missing overflow suffix");
+    }
 
     #[test]
     fn test_format_provider_table() {
