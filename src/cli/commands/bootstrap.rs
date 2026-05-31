@@ -617,6 +617,14 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     let storage = if use_lxd { "default" } else { "local-lvm" }; // LXD default pool is usually 'default'
     let bridge = if use_lxd { "lxdbr0" } else { "vmbr0" }; // LXD default bridge is lxdbr0
 
+    // Pre-format mints as a JSON array so "a,b" → ["a", "b"]
+    let mints_json = args
+        .mints
+        .split(',')
+        .map(|m| format!("\"{}\"", m.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let config = format!(
         r#"{{
   "backend_type": "{}",
@@ -639,7 +647,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     {{"id": "basic", "name": "Basic", "description": "1 vCPU, 1GB RAM", "cpu_millicores": 1000, "memory_mb": 1024, "rate_msats_per_sec": 50}},
     {{"id": "standard", "name": "Standard", "description": "2 vCPU, 2GB RAM", "cpu_millicores": 2000, "memory_mb": 2048, "rate_msats_per_sec": 100}}
   ],
-  "whitelisted_mints": ["{}"],
+  "whitelisted_mints": [{}],
   "heartbeat_interval_secs": 60,
   "minimum_duration_seconds": 60,
   "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.redb",
@@ -656,7 +664,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             .map(|l| format!("\"{}\"", l))
             .unwrap_or("null".to_string()),
         args.host,
-        args.mints,
+        mints_json,
         args.lightning_address
             .as_ref()
             .map(|a| format!("\"{}\"", a))
@@ -815,6 +823,52 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
             sweep_min_balance = args.sweep_min_balance_sats,
         );
 
+        // Minimal nginx.conf for Paygress deployment — no gRPC upstream.
+        // The image's baked-in nginx.conf references grpc-content-server:50051
+        // (needed for the ngx_l402 test suite) which doesn't exist in a
+        // standalone Paygress deployment and causes a crash-loop. We mount
+        // this file over the image's config so nginx starts cleanly.
+        let nginx_conf = r#"user  nginx;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+load_module /etc/nginx/modules/libngx_l402_lib.so;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+
+    server {
+        listen 80;
+        listen [::]:80;
+        server_name _;
+
+        location / {
+            root   /usr/share/nginx/html;
+            l402    on;
+            l402_amount_msat_default    10000;
+            l402_macaroon_timeout 0;
+            try_files $uri $uri/index.html =404;
+        }
+
+        location = /metrics {
+            l402_metrics;
+        }
+
+        location = /.well-known/l402-services {
+            l402_manifest;
+        }
+    }
+}
+"#;
+
         let docker_compose = r#"services:
   nginx:
     image: ghcr.io/dhananjaypurohit/ngx_l402:latest
@@ -830,6 +884,7 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
       - CASHU_DB_PATH=/var/lib/nginx/cashu-wallet.redb
     volumes:
       - /var/lib/paygress:/var/lib/nginx
+      - /etc/paygress/nginx.conf:/etc/nginx/nginx.conf:ro
 "#;
 
         if args.dry_run {
@@ -869,6 +924,23 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
             };
             run_ssh_command(&args, &write_env)?;
             println!("  {} Created /etc/paygress/.env", "✓".green());
+
+            // Write nginx.conf (overrides the image's baked-in config which
+            // references grpc-content-server — not present in Paygress deploys)
+            let write_nginx = if is_root {
+                format!(
+                    "cat > /etc/paygress/nginx.conf << 'NGINXEOF'\n{}\nNGINXEOF",
+                    nginx_conf
+                )
+            } else {
+                format!(
+                    "echo '{}' | {}tee /etc/paygress/nginx.conf > /dev/null",
+                    nginx_conf.replace("'", "'\\''"),
+                    sudo
+                )
+            };
+            run_ssh_command(&args, &write_nginx)?;
+            println!("  {} Created /etc/paygress/nginx.conf", "✓".green());
 
             // Write docker-compose.yml
             let write_compose = if is_root {

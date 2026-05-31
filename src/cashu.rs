@@ -93,6 +93,20 @@ pub trait MintRedeemer: Send + Sync {
     async fn redeem(&self, token_str: &str) -> Result<u64, RedeemError>;
 }
 
+/// Extract the mint URL from a Cashu token string without redeeming it.
+///
+/// Used by the consumer CLI to validate the token's mint against the
+/// provider's whitelist **before** sending the token, so a mismatch
+/// fails fast with a clear error instead of a round-trip rejection.
+pub fn token_mint_url(token_str: &str) -> Result<String, RedeemError> {
+    let token =
+        Token::from_str(token_str).map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
+    token
+        .mint_url()
+        .map(|u| u.to_string())
+        .map_err(|e| RedeemError::InvalidToken(format!("token has no mint URL: {}", e)))
+}
+
 /// Parse and validate the token, enforce the per-provider whitelist,
 /// then delegate to the redeemer. The whitelist check happens **before**
 /// any mint contact so a malicious token pointed at an attacker-
@@ -187,10 +201,31 @@ impl MintRedeemer for CdkRedeemer {
         let unit = token.unit().unwrap_or(CurrencyUnit::Sat);
 
         let wallet = self.wallet_for(&mint_url, unit.clone()).await?;
-        let amount = wallet
-            .receive(token_str, ReceiveOptions::default())
-            .await
-            .map_err(map_cdk_error)?;
+
+        // Try redemption with cached keysets first (zero extra latency).
+        // On a keyset-related error (mint rotated its keys), refresh once
+        // from the mint and retry — adds one extra round-trip only when
+        // rotation actually occurred rather than on every call.
+        let amount = match wallet.receive(token_str, ReceiveOptions::default()).await {
+            Ok(a) => a,
+            Err(e) => {
+                let is_keyset_err = matches!(
+                    e,
+                    cdk::Error::UnknownKeySet | cdk::Error::IncorrectMint
+                ) || e.to_string().to_lowercase().contains("keyset");
+
+                if is_keyset_err {
+                    // Refresh keysets from the live mint, then retry once.
+                    let _ = wallet.get_mint_keysets().await;
+                    wallet
+                        .receive(token_str, ReceiveOptions::default())
+                        .await
+                        .map_err(map_cdk_error)?
+                } else {
+                    return Err(map_cdk_error(e));
+                }
+            }
+        };
         let amount_u64: u64 = amount.into();
 
         match unit {
