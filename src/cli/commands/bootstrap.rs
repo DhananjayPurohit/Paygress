@@ -650,7 +650,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
   "whitelisted_mints": [{}],
   "heartbeat_interval_secs": 60,
   "minimum_duration_seconds": 60,
-  "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.redb",
+  "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.sqlite",
   "lightning_address": {}
 }}"#,
         backend_type,
@@ -740,11 +740,11 @@ WantedBy=multi-user.target
     // ngx_l402 serves two purposes:
     //   1. HTTP+L402 paywall in front of the axum backend (HTTP path).
     //   2. Periodic Lightning sweep of ALL accumulated ecash — from both
-    //      the Nostr-DM path and the HTTP path — via the shared redb wallet.
+    //      the Nostr-DM path and the HTTP path — via the shared SQLite wallet.
     //
     // Without a lightning address there is no meaningful sweep target, so
     // we skip this step. Ecash from Nostr-DM redemptions will accumulate
-    // in /var/lib/paygress/cashu-wallet.redb and can be swept later by
+    // in /var/lib/paygress/cashu-wallet.sqlite and can be swept later by
     // re-running bootstrap with --lightning-address.
     println!(
         "{}",
@@ -881,7 +881,7 @@ http {
     environment:
       - LN_CLIENT_TYPE=LNURL
       - CASHU_ECASH_SUPPORT=true
-      - CASHU_DB_PATH=/var/lib/nginx/cashu-wallet.redb
+      - CASHU_DB_PATH=/var/lib/nginx/cashu-wallet.sqlite
     volumes:
       - /var/lib/paygress:/var/lib/nginx
       - /etc/paygress/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -972,7 +972,7 @@ http {
             "–".yellow()
         );
         println!("    Ecash from Nostr-DM redemptions will accumulate in the");
-        println!("    shared wallet (/var/lib/paygress/cashu-wallet.redb).");
+        println!("    shared wallet (/var/lib/paygress/cashu-wallet.sqlite).");
         println!("    To enable auto-sweep later, re-run bootstrap with:");
         println!(
             "      {} --lightning-address you@getalby.com",
@@ -1026,7 +1026,7 @@ http {
         );
         println!("  ngx_l402:      running on port 80 🟢");
     }
-    println!("  Wallet DB:     /var/lib/paygress/cashu-wallet.redb");
+    println!("  Wallet DB:     /var/lib/paygress/cashu-wallet.sqlite");
     println!("  Config:        /etc/paygress/provider-config.json");
 
     if !use_lxd {

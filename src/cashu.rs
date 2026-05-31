@@ -1,24 +1,24 @@
 // Cashu Token Utilities
 //
-// Two independent redemption paths both write into the shared CDK wallet
-// (`cashu_wallet_db_path`, default `/var/lib/paygress/cashu-wallet.redb`).
-// ngx_l402 periodically sweeps ALL accumulated ecash to Lightning for both.
+// Two redemption paths, one shared SQLite wallet, one sweep.
 //
 // Path A — Nostr-DM (src/provider.rs):
 //   `validate_and_redeem` / `MintRedeemer` / `CdkRedeemer` — swaps the
 //   token at the mint via NUT-03, defeating single- and cross-provider
-//   replay. Proofs land in the shared redb wallet.
+//   replay. Proofs land in the shared CDK SQLite wallet
+//   (`cashu_wallet_db_path`, default `/var/lib/paygress/cashu-wallet.sqlite`).
 //
 // Path B — HTTP + ngx_l402 (src/provider_http.rs):
 //   ngx_l402 verifies the Cashu token at the nginx layer before forwarding
 //   the request. The backend calls `extract_token_value` to read the
-//   already-redeemed face value without a second mint call. ngx_l402's
-//   wallet points at the same redb file.
+//   already-redeemed face value without a second mint call. ngx_l402 uses
+//   the SAME SQLite file (`cashu-wallet.sqlite`) via CASHU_WALLET_SECRET,
+//   so both paths write into one shared wallet.
 //
-// Lightning sweep (both paths):
-//   ngx_l402 runs a periodic melt loop (CASHU_REDEMPTION_INTERVAL_SECS)
-//   against the shared wallet, converting accumulated proofs from both
-//   paths into Lightning payments to LNURL_ADDRESS.
+// Lightning sweep:
+//   ngx_l402 sweeps the shared SQLite wallet to Lightning periodically
+//   (CASHU_REDEMPTION_INTERVAL_SECS / LNURL_ADDRESS), draining ecash
+//   accumulated from BOTH Nostr-DM and HTTP-path payments.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,10 +38,10 @@ const MSAT_PER_SAT: u64 = 1000;
 // Singleton CDK wallet database. Used by the HTTP+ngx_l402 path
 // (`initialize_cashu` / `extract_token_value`) and feature-gated behind
 // `kubernetes` for the legacy K8s pipeline.
-static CASHU_DB: OnceLock<Arc<cdk_redb::wallet::WalletRedbDatabase>> = OnceLock::new();
+static CASHU_DB: OnceLock<Arc<cdk_sqlite::WalletSqliteDatabase>> = OnceLock::new();
 
 pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
-    match cdk_redb::wallet::WalletRedbDatabase::new(Path::new(db_path)) {
+    match cdk_sqlite::WalletSqliteDatabase::new(std::path::PathBuf::from(db_path)).await {
         Ok(db) => {
             tracing::debug!("Cashu database initialized at: {}", db_path);
             let _ = CASHU_DB.set(Arc::new(db));
@@ -139,7 +139,7 @@ pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
 /// Production redeemer backed by `cdk::wallet::Wallet`.
 ///
 /// Maintains one wallet per `(mint_url, unit)` pair, lazily created on
-/// first use. All wallets share a single `WalletDatabase` (a redb file)
+/// first use. All wallets share a single `WalletDatabase` (a SQLite file)
 /// so proofs, keysets, and quotes for every mint live in one place.
 ///
 /// The `seed` is used by cdk for deterministic blinding-factor
@@ -334,13 +334,15 @@ pub async fn split_token_into_n(
         );
     }
 
-    let db = cdk_redb::wallet::WalletRedbDatabase::new(db_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to open ephemeral wallet db at {}: {}",
-            db_path.display(),
-            e
-        )
-    })?;
+    let db = cdk_sqlite::WalletSqliteDatabase::new(db_path.to_path_buf())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open ephemeral wallet db at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
     let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
 
     // Random seed — the wallet is ephemeral, so deterministic

@@ -217,7 +217,7 @@ pub async fn materialize_tokens(args: &BatchArgs) -> Result<Vec<String>> {
         // batch invocations on the same machine don't collide.
         let mut db_path = std::env::temp_dir();
         db_path.push(format!(
-            "paygress-batch-split-{}.redb",
+            "paygress-batch-split-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
 
@@ -666,7 +666,7 @@ mod tests {
     async fn materialize_tokens_split_invalid_token_errors_fast() {
         // Bogus token bytes — must fail at Token::from_str BEFORE the
         // wallet attempts a mint round-trip (which would be slow and
-        // potentially leak a redb file). This test pins the
+        // potentially leak a sqlite file). This test pins the
         // "fail-fast on bad input" contract.
         let args = args_with_split("not-a-real-cashu-token", Some(3));
         let err = materialize_tokens(&args).await.unwrap_err();

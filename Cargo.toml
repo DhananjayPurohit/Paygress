@@ -58,8 +58,9 @@ anyhow = "1.0"
 thiserror = "1"
 rand = "0.8"
 
-# Cashu dependencies
-cdk-redb = "0.14"
+# Cashu dependencies — cdk-sqlite matches ngx_l402's backend so both
+# processes share the same wallet database file for Lightning sweep.
+cdk-sqlite = { version = "0.14.1", features = ["wallet"] }
 cdk = { version = "0.14", default-features = false, features = ["wallet"] }
 
 # Nostr dependencies
