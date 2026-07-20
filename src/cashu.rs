@@ -1,24 +1,24 @@
 // Cashu Token Utilities
 //
-// Two independent redemption paths both write into the shared CDK wallet
-// (`cashu_wallet_db_path`, default `/var/lib/paygress/cashu-wallet.redb`).
-// ngx_l402 periodically sweeps ALL accumulated ecash to Lightning for both.
+// Two redemption paths, one shared SQLite wallet, one sweep.
 //
 // Path A — Nostr-DM (src/provider.rs):
 //   `validate_and_redeem` / `MintRedeemer` / `CdkRedeemer` — swaps the
 //   token at the mint via NUT-03, defeating single- and cross-provider
-//   replay. Proofs land in the shared redb wallet.
+//   replay. Proofs land in the shared CDK SQLite wallet
+//   (`cashu_wallet_db_path`, default `/var/lib/paygress/cashu-wallet.sqlite`).
 //
 // Path B — HTTP + ngx_l402 (src/provider_http.rs):
 //   ngx_l402 verifies the Cashu token at the nginx layer before forwarding
 //   the request. The backend calls `extract_token_value` to read the
-//   already-redeemed face value without a second mint call. ngx_l402's
-//   wallet points at the same redb file.
+//   already-redeemed face value without a second mint call. ngx_l402 uses
+//   the SAME SQLite file (`cashu-wallet.sqlite`) via CASHU_WALLET_MNEMONIC,
+//   so both paths write into one shared wallet.
 //
-// Lightning sweep (both paths):
-//   ngx_l402 runs a periodic melt loop (CASHU_REDEMPTION_INTERVAL_SECS)
-//   against the shared wallet, converting accumulated proofs from both
-//   paths into Lightning payments to LNURL_ADDRESS.
+// Lightning sweep:
+//   ngx_l402 sweeps the shared SQLite wallet to Lightning periodically
+//   (CASHU_REDEMPTION_INTERVAL_SECS / LNURL_ADDRESS), draining ecash
+//   accumulated from BOTH Nostr-DM and HTTP-path payments.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,10 +38,10 @@ const MSAT_PER_SAT: u64 = 1000;
 // Singleton CDK wallet database. Used by the HTTP+ngx_l402 path
 // (`initialize_cashu` / `extract_token_value`) and feature-gated behind
 // `kubernetes` for the legacy K8s pipeline.
-static CASHU_DB: OnceLock<Arc<cdk_redb::wallet::WalletRedbDatabase>> = OnceLock::new();
+static CASHU_DB: OnceLock<Arc<cdk_sqlite::WalletSqliteDatabase>> = OnceLock::new();
 
 pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
-    match cdk_redb::wallet::WalletRedbDatabase::new(Path::new(db_path)) {
+    match cdk_sqlite::WalletSqliteDatabase::new(std::path::PathBuf::from(db_path)).await {
         Ok(db) => {
             tracing::debug!("Cashu database initialized at: {}", db_path);
             let _ = CASHU_DB.set(Arc::new(db));
@@ -93,6 +93,19 @@ pub trait MintRedeemer: Send + Sync {
     async fn redeem(&self, token_str: &str) -> Result<u64, RedeemError>;
 }
 
+/// Extract the mint URL from a Cashu token string without redeeming it.
+///
+/// Used by the consumer CLI to validate the token's mint against the
+/// provider's whitelist **before** sending the token, so a mismatch
+/// fails fast with a clear error instead of a round-trip rejection.
+pub fn token_mint_url(token_str: &str) -> Result<String, RedeemError> {
+    let token = Token::from_str(token_str).map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
+    token
+        .mint_url()
+        .map(|u| u.to_string())
+        .map_err(|e| RedeemError::InvalidToken(format!("token has no mint URL: {}", e)))
+}
+
 /// Parse and validate the token, enforce the per-provider whitelist,
 /// then delegate to the redeemer. The whitelist check happens **before**
 /// any mint contact so a malicious token pointed at an attacker-
@@ -125,13 +138,13 @@ pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
 /// Production redeemer backed by `cdk::wallet::Wallet`.
 ///
 /// Maintains one wallet per `(mint_url, unit)` pair, lazily created on
-/// first use. All wallets share a single `WalletDatabase` (a redb file)
+/// first use. All wallets share a single `WalletDatabase` (a SQLite file)
 /// so proofs, keysets, and quotes for every mint live in one place.
 ///
 /// The `seed` is used by cdk for deterministic blinding-factor
-/// derivation. See `derive_seed_from_nostr_key` for the production
-/// derivation; tests can construct `CdkRedeemer` directly with any
-/// 32-byte seed.
+/// derivation. See `resolve_wallet_seed` for the production derivation
+/// (BIP39 / NUT-13 standard); tests can construct `CdkRedeemer` directly
+/// with any 64-byte seed.
 pub struct CdkRedeemer {
     localstore: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync>,
     seed: [u8; 64],
@@ -187,10 +200,30 @@ impl MintRedeemer for CdkRedeemer {
         let unit = token.unit().unwrap_or(CurrencyUnit::Sat);
 
         let wallet = self.wallet_for(&mint_url, unit.clone()).await?;
-        let amount = wallet
-            .receive(token_str, ReceiveOptions::default())
-            .await
-            .map_err(map_cdk_error)?;
+
+        // Try redemption with cached keysets first (zero extra latency).
+        // On a keyset-related error (mint rotated its keys), refresh once
+        // from the mint and retry — adds one extra round-trip only when
+        // rotation actually occurred rather than on every call.
+        let amount = match wallet.receive(token_str, ReceiveOptions::default()).await {
+            Ok(a) => a,
+            Err(e) => {
+                let is_keyset_err =
+                    matches!(e, cdk::Error::UnknownKeySet | cdk::Error::IncorrectMint)
+                        || e.to_string().to_lowercase().contains("keyset");
+
+                if is_keyset_err {
+                    // Refresh keysets from the live mint, then retry once.
+                    let _ = wallet.get_mint_keysets().await;
+                    wallet
+                        .receive(token_str, ReceiveOptions::default())
+                        .await
+                        .map_err(map_cdk_error)?
+                } else {
+                    return Err(map_cdk_error(e));
+                }
+            }
+        };
         let amount_u64: u64 = amount.into();
 
         match unit {
@@ -229,6 +262,10 @@ fn map_cdk_error(e: cdk::Error) -> RedeemError {
 /// cdk's `Wallet::new` requires `[u8; 64]` (BIP-39-style seed length).
 /// We hash twice with distinct domain separators so the two halves
 /// are independent.
+///
+/// DEPRECATED: this is the legacy, non-standard derivation. New wallets use the
+/// Cashu/NUT-13 standard via [`resolve_wallet_seed`] / [`derive_wallet_seed`].
+/// Kept only so an already-deployed legacy wallet remains openable.
 pub fn derive_seed_from_nostr_key(nostr_private_key: &str) -> [u8; 64] {
     use cdk::secp256k1::hashes::{sha256, Hash};
     let h1 =
@@ -239,6 +276,85 @@ pub fn derive_seed_from_nostr_key(nostr_private_key: &str) -> [u8; 64] {
     out[..32].copy_from_slice(&h1.to_byte_array());
     out[32..].copy_from_slice(&h2.to_byte_array());
     out
+}
+
+/// Derive the deterministic 64-byte Cashu wallet seed from a BIP39 mnemonic,
+/// per NUT-13, using an empty passphrase. This is the Cashu standard and is
+/// byte-identical to ngx_l402's `ngx_l402_core::derive_wallet_seed`, so both
+/// processes open the *same* shared wallet from the same mnemonic.
+pub fn derive_wallet_seed(mnemonic: &str) -> Result<[u8; 64], String> {
+    let parsed = bip39::Mnemonic::parse(mnemonic.trim())
+        .map_err(|e| format!("invalid BIP39 mnemonic: {}", e))?;
+    Ok(parsed.to_seed_normalized(""))
+}
+
+/// Derive a *deterministic, standard* BIP39 mnemonic from the provider's Nostr
+/// private key. Domain-separated SHA-256 of the key gives 128 bits of entropy,
+/// which BIP39 turns into a 12-word phrase. This preserves the "wallet follows
+/// the provider's Nostr identity" model while producing a real, restorable
+/// mnemonic. `bootstrap` writes this same phrase into ngx_l402's
+/// `CASHU_WALLET_MNEMONIC` so both sides converge on one wallet.
+pub fn mnemonic_from_nostr_key(nostr_private_key: &str) -> Result<String, String> {
+    use cdk::secp256k1::hashes::{sha256, Hash};
+    let h = sha256::Hash::hash(
+        format!("paygress-cashu-wallet-bip39-v1:{}", nostr_private_key).as_bytes(),
+    );
+    let entropy = &h.to_byte_array()[..16]; // 128 bits -> 12 words
+    bip39::Mnemonic::from_entropy(entropy)
+        .map(|m| m.to_string())
+        .map_err(|e| format!("mnemonic from entropy: {}", e))
+}
+
+/// Resolve the 64-byte wallet seed for the redeemer.
+///
+/// Prefers an explicit `CASHU_WALLET_MNEMONIC` (the canonical Cashu/NUT-13
+/// source, and the value ngx_l402 uses for the shared wallet). Falls back to a
+/// deterministic BIP39 mnemonic derived from the Nostr key so a provider keeps a
+/// stable wallet across restarts even without explicit configuration.
+pub fn resolve_wallet_seed(nostr_private_key: &str) -> Result<[u8; 64], String> {
+    if let Ok(env_mnemonic) = std::env::var("CASHU_WALLET_MNEMONIC") {
+        let m = env_mnemonic.trim();
+        if !m.is_empty() {
+            return derive_wallet_seed(m);
+        }
+    }
+    let mnemonic = mnemonic_from_nostr_key(nostr_private_key)?;
+    derive_wallet_seed(&mnemonic)
+}
+
+#[cfg(test)]
+mod wallet_seed_tests {
+    use super::*;
+
+    // Canonical BIP39 vector (all-zero 128-bit entropy), empty passphrase —
+    // identical to the golden vector pinned in ngx_l402_core, proving both
+    // projects derive the same seed from the same mnemonic.
+    const VECTOR_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const VECTOR_SEED_HEX: &str = "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
+
+    #[test]
+    fn derives_canonical_bip39_seed() {
+        let seed = derive_wallet_seed(VECTOR_MNEMONIC).expect("valid mnemonic");
+        assert_eq!(hex::encode(seed), VECTOR_SEED_HEX);
+    }
+
+    #[test]
+    fn invalid_mnemonic_is_rejected() {
+        assert!(derive_wallet_seed("").is_err());
+        assert!(derive_wallet_seed("not a real mnemonic at all").is_err());
+    }
+
+    #[test]
+    fn nostr_mnemonic_is_deterministic_and_valid() {
+        let a = mnemonic_from_nostr_key("nsec-example-key").unwrap();
+        let b = mnemonic_from_nostr_key("nsec-example-key").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.split_whitespace().count(), 12);
+        // Must round-trip through the standard derivation.
+        assert!(derive_wallet_seed(&a).is_ok());
+        // Different identities -> different wallets.
+        assert_ne!(a, mnemonic_from_nostr_key("other-key").unwrap());
+    }
 }
 
 /// Split one Cashu token into N tokens of approximately equal face
@@ -299,13 +415,15 @@ pub async fn split_token_into_n(
         );
     }
 
-    let db = cdk_redb::wallet::WalletRedbDatabase::new(db_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to open ephemeral wallet db at {}: {}",
-            db_path.display(),
-            e
-        )
-    })?;
+    let db = cdk_sqlite::WalletSqliteDatabase::new(db_path.to_path_buf())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open ephemeral wallet db at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
     let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
 
     // Random seed — the wallet is ephemeral, so deterministic

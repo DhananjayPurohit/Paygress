@@ -400,6 +400,38 @@ pub async fn nostr_spawn_round_trip(
         }
     }
 
+    // ── Mint pre-check ───────────────────────────────────────────────────
+    // Verify the token's mint is in the provider's whitelist BEFORE
+    // sending the token — a mismatch never spends the token and gives
+    // the user an actionable error with the list of accepted mints.
+    if !provider.whitelisted_mints.is_empty() {
+        let token_mint = paygress::cashu::token_mint_url(token)
+            .map_err(|e| anyhow::anyhow!("could not read token: {}", e))?;
+
+        // Normalize: strip trailing slashes before comparing.
+        let token_norm = token_mint.trim_end_matches('/');
+        let accepted = provider
+            .whitelisted_mints
+            .iter()
+            .any(|m| m.trim_end_matches('/').eq_ignore_ascii_case(token_norm));
+
+        if !accepted {
+            let list = provider
+                .whitelisted_mints
+                .iter()
+                .map(|m| format!("  • {}", m))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "token is from mint '{}' which is not accepted by provider '{}'.\n\
+                 Accepted mints:\n{}",
+                token_mint,
+                provider.hostname,
+                list
+            );
+        }
+    }
+
     let request = EncryptedSpawnPodRequest {
         cashu_token: token.to_string(),
         pod_spec_id: Some(tier.to_string()),
@@ -452,17 +484,8 @@ async fn execute_nostr_spawn(
     let relays = parse_relays(args.relays);
     let nostr_key = get_or_create_identity(args.nostr_key)?;
 
-    println!("  Your NPUB: derived from your Nostr identity");
-    println!();
-
-    print!("  Checking provider status... ");
-
-    println!(
-        "  {} user: {}, pass: {}",
-        "SSH Credentials:".bold(),
-        ssh_user.cyan(),
-        ssh_pass.cyan()
-    );
+    print!("  Checking provider {}... ", provider_npub.cyan());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     let replication = parse_replication_arg(&args.replication, args.standby.as_deref())?;
     // For warm-standby, primary_id + workload_id are required so
@@ -568,6 +591,12 @@ async fn execute_nostr_spawn(
             if !access.host_address.is_empty() {
                 println!("  {}   {}", "Host:".bold(), access.host_address.cyan());
             }
+            println!(
+                "  {}   {} / {}",
+                "SSH:".bold(),
+                ssh_user.cyan(),
+                ssh_pass.cyan()
+            );
             println!("  {}   {}", "Expires:".bold(), access.expires_at.yellow());
             println!(
                 "  {}   {} vCPU, {} MB RAM",

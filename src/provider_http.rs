@@ -3,7 +3,7 @@
 // Exposes HTTP endpoints for the Proxmox / LXD / KVM provider that sit
 // behind the `ngx_l402` nginx module.
 //
-// This is one of two redemption paths that share the same CDK wallet
+// This is one of two redemption paths that share the same CDK SQLite wallet
 // (`cashu_wallet_db_path`). The other is the Nostr-DM handler in
 // src/provider.rs. ngx_l402 sweeps accumulated ecash from both paths to
 // Lightning on a configurable schedule.
@@ -13,7 +13,7 @@
 //     → nginx  (ngx_l402 issues 402 if no valid Cashu token; verifies
 //               the token format, redeems it at the Cashu mint via NUT-03,
 //               enforces replay protection, stores proofs in the shared
-//               redb wallet, then forwards the request)
+//               SQLite wallet, then forwards the request)
 //     → POST paygress:8080/pods/spawn  OR  POST paygress:8080/pods/topup
 //     → this axum backend: reads the token's face value from the header
 //               via `extract_token_value()` (no mint call — ngx_l402
@@ -24,9 +24,10 @@
 // spent and the proofs are in the shared wallet.
 //
 // Lightning sweep:
-//   ngx_l402 mounts the same redb file used by the Nostr-DM CdkRedeemer
-//   (volume: /var/lib/paygress:/var/lib/nginx). Its melt loop drains all
-//   accumulated proofs — from both this HTTP path and the Nostr-DM path —
+//   ngx_l402 opens the same SQLite file used by the Nostr-DM CdkRedeemer
+//   (volume: /var/lib/paygress:/var/lib/nginx, CASHU_DB_PATH points to
+//   cashu-wallet.sqlite). Its melt loop drains all accumulated proofs —
+//   from both this HTTP path and the Nostr-DM path —
 //   to LNURL_ADDRESS at CASHU_REDEMPTION_INTERVAL_SECS.
 //
 // Endpoints:

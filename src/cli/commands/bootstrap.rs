@@ -621,6 +621,14 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     let storage = if use_lxd { "default" } else { "local-lvm" }; // LXD default pool is usually 'default'
     let bridge = if use_lxd { "lxdbr0" } else { "vmbr0" }; // LXD default bridge is lxdbr0
 
+    // Pre-format mints as a JSON array so "a,b" → ["a", "b"]
+    let mints_json = args
+        .mints
+        .split(',')
+        .map(|m| format!("\"{}\"", m.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let config = format!(
         r#"{{
   "backend_type": "{}",
@@ -643,10 +651,10 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     {{"id": "basic", "name": "Basic", "description": "1 vCPU, 1GB RAM", "cpu_millicores": 1000, "memory_mb": 1024, "rate_msats_per_sec": 50}},
     {{"id": "standard", "name": "Standard", "description": "2 vCPU, 2GB RAM", "cpu_millicores": 2000, "memory_mb": 2048, "rate_msats_per_sec": 100}}
   ],
-  "whitelisted_mints": ["{}"],
+  "whitelisted_mints": [{}],
   "heartbeat_interval_secs": 60,
   "minimum_duration_seconds": 60,
-  "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.redb",
+  "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.sqlite",
   "lightning_address": {}
 }}"#,
         backend_type,
@@ -660,7 +668,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             .map(|l| format!("\"{}\"", l))
             .unwrap_or("null".to_string()),
         args.host,
-        args.mints,
+        mints_json,
         args.lightning_address
             .as_ref()
             .map(|a| format!("\"{}\"", a))
@@ -736,11 +744,11 @@ WantedBy=multi-user.target
     // ngx_l402 serves two purposes:
     //   1. HTTP+L402 paywall in front of the axum backend (HTTP path).
     //   2. Periodic Lightning sweep of ALL accumulated ecash — from both
-    //      the Nostr-DM path and the HTTP path — via the shared redb wallet.
+    //      the Nostr-DM path and the HTTP path — via the shared SQLite wallet.
     //
     // Without a lightning address there is no meaningful sweep target, so
     // we skip this step. Ecash from Nostr-DM redemptions will accumulate
-    // in /var/lib/paygress/cashu-wallet.redb and can be swept later by
+    // in /var/lib/paygress/cashu-wallet.sqlite and can be swept later by
     // re-running bootstrap with --lightning-address.
     println!(
         "{}",
@@ -774,13 +782,12 @@ WantedBy=multi-user.target
                 })?;
         }
 
-        // Derive wallet secret from nostr key (hex-encode 64-byte seed).
-        // ngx_l402's CASHU_WALLET_SECRET must match so it opens the same
-        // CDK wallet that CdkRedeemer writes to.
-        let wallet_secret = {
-            let seed = paygress::cashu::derive_seed_from_nostr_key(&nostr_key);
-            hex::encode(seed)
-        };
+        // Derive the shared BIP39 wallet mnemonic from the nostr key
+        // (Cashu/NUT-13 standard). ngx_l402 receives the SAME phrase via
+        // CASHU_WALLET_MNEMONIC and derives an identical seed, so both open the
+        // same CDK wallet that CdkRedeemer writes to.
+        let wallet_mnemonic = paygress::cashu::mnemonic_from_nostr_key(&nostr_key)
+            .map_err(|e| anyhow::anyhow!("failed to derive wallet mnemonic: {}", e))?;
 
         // Deterministic ROOT_KEY for ngx_l402 macaroon signing (32 bytes / 64 hex chars).
         let root_key = match args.root_key {
@@ -801,8 +808,8 @@ WantedBy=multi-user.target
 LNURL_ADDRESS={lightning_address}
 ROOT_KEY={root_key}
 
-# Cashu wallet — shares the same db as the Paygress provider
-CASHU_WALLET_SECRET={wallet_secret}
+# Cashu wallet — shares the same db and BIP39 seed as the Paygress provider
+CASHU_WALLET_MNEMONIC="{wallet_mnemonic}"
 CASHU_WHITELISTED_MINTS={mints}
 
 # Lightning sweep settings (both Nostr-DM and HTTP path ecash)
@@ -813,15 +820,61 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
 "#,
             lightning_address = lightning_address,
             root_key = root_key,
-            wallet_secret = wallet_secret,
+            wallet_mnemonic = wallet_mnemonic,
             mints = args.mints,
             sweep_interval = args.sweep_interval_secs,
             sweep_min_balance = args.sweep_min_balance_sats,
         );
 
+        // Minimal nginx.conf for Paygress deployment — no gRPC upstream.
+        // The image's baked-in nginx.conf references grpc-content-server:50051
+        // (needed for the ngx_l402 test suite) which doesn't exist in a
+        // standalone Paygress deployment and causes a crash-loop. We mount
+        // this file over the image's config so nginx starts cleanly.
+        let nginx_conf = r#"user  nginx;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+load_module /etc/nginx/modules/libngx_l402_lib.so;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+
+    server {
+        listen 80;
+        listen [::]:80;
+        server_name _;
+
+        location / {
+            root   /usr/share/nginx/html;
+            l402    on;
+            l402_amount_msat_default    10000;
+            l402_macaroon_timeout 0;
+            try_files $uri $uri/index.html =404;
+        }
+
+        location = /metrics {
+            l402_metrics;
+        }
+
+        location = /.well-known/l402-services {
+            l402_manifest;
+        }
+    }
+}
+"#;
+
         let docker_compose = r#"services:
   nginx:
-    image: ghcr.io/dhananjaypurohit/ngx_l402:latest
+    image: ghcr.io/ngx-l402/ngx-l402:latest
     container_name: nginx-l402
     restart: always
     ports:
@@ -831,9 +884,10 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
     environment:
       - LN_CLIENT_TYPE=LNURL
       - CASHU_ECASH_SUPPORT=true
-      - CASHU_DB_PATH=/var/lib/nginx/cashu-wallet.redb
+      - CASHU_DB_PATH=/var/lib/nginx/cashu-wallet.sqlite
     volumes:
       - /var/lib/paygress:/var/lib/nginx
+      - /etc/paygress/nginx.conf:/etc/nginx/nginx.conf:ro
 "#;
 
         if args.dry_run {
@@ -874,6 +928,23 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
             run_ssh_command(&args, &write_env)?;
             println!("  {} Created /etc/paygress/.env", "✓".green());
 
+            // Write nginx.conf (overrides the image's baked-in config which
+            // references grpc-content-server — not present in Paygress deploys)
+            let write_nginx = if is_root {
+                format!(
+                    "cat > /etc/paygress/nginx.conf << 'NGINXEOF'\n{}\nNGINXEOF",
+                    nginx_conf
+                )
+            } else {
+                format!(
+                    "echo '{}' | {}tee /etc/paygress/nginx.conf > /dev/null",
+                    nginx_conf.replace("'", "'\\''"),
+                    sudo
+                )
+            };
+            run_ssh_command(&args, &write_nginx)?;
+            println!("  {} Created /etc/paygress/nginx.conf", "✓".green());
+
             // Write docker-compose.yml
             let write_compose = if is_root {
                 format!(
@@ -904,7 +975,7 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
             "–".yellow()
         );
         println!("    Ecash from Nostr-DM redemptions will accumulate in the");
-        println!("    shared wallet (/var/lib/paygress/cashu-wallet.redb).");
+        println!("    shared wallet (/var/lib/paygress/cashu-wallet.sqlite).");
         println!("    To enable auto-sweep later, re-run bootstrap with:");
         println!(
             "      {} --lightning-address you@getalby.com",
@@ -958,7 +1029,7 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
         );
         println!("  ngx_l402:      running on port 80 🟢");
     }
-    println!("  Wallet DB:     /var/lib/paygress/cashu-wallet.redb");
+    println!("  Wallet DB:     /var/lib/paygress/cashu-wallet.sqlite");
     println!("  Config:        /etc/paygress/provider-config.json");
 
     if !use_lxd {

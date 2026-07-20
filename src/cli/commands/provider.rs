@@ -25,7 +25,7 @@ pub enum ProviderAction {
     Setup(SetupArgs),
 
     /// Scaffold N independent provider configs on the SAME host —
-    /// fresh nsec, distinct vmid range, distinct cashu wallet redb,
+    /// fresh nsec, distinct vmid range, distinct cashu wallet sqlite,
     /// distinct config file path per provider. Used for end-to-end
     /// warm-standby failover testing on a single VPS, where you want
     /// 3 separate paygress-provider processes (primary + 2 standbys)
@@ -140,7 +140,7 @@ pub struct SetupArgs {
 ///   - /etc/paygress/provider-<name>-<i>.json — full config
 ///   - Fresh `nsec` (independent Nostr identity per provider)
 ///   - vmid range: [1000 + i*1000, 1999 + i*1000) — non-overlapping
-///   - cashu_wallet_db_path: ./paygress-<name>-<i>.redb
+///   - cashu_wallet_db_path: ./paygress-<name>-<i>.sqlite
 ///   - provider_name: "<name>-<i>"
 ///
 /// Plus a systemd template unit (printed, not installed) the
@@ -151,7 +151,7 @@ pub struct SetupArgs {
 /// End-to-end warm-standby failover testing needs 3 distinct
 /// providers. Running 3 separate `paygress-cli provider setup`
 /// invocations each requires hand-editing the resulting JSONs to
-/// give them non-overlapping vmid ranges and redb paths — annoying
+/// give them non-overlapping vmid ranges and sqlite paths — annoying
 /// and error-prone. This subcommand does it in one shot. Designed
 /// for the test loop, but operators running multiple provider
 /// instances on one beefy host (e.g. burst capacity, geo-fencing
@@ -173,7 +173,7 @@ pub struct SetupMultiArgs {
     /// Common prefix for the N providers' display names + filenames.
     /// Each provider gets `"<name>-<i>"` (zero-indexed). Pick
     /// something short — it lands in `provider_name`, the systemd
-    /// instance name, the redb filename, and the config filename.
+    /// instance name, the sqlite filename, and the config filename.
     #[arg(long, default_value = "paygress")]
     pub name: String,
 
@@ -378,7 +378,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         tunnel_interface: None,
         ssh_port_start: None,
         ssh_port_end: None,
-        cashu_wallet_db_path: "./paygress-cashu-wallet.redb".to_string(),
+        cashu_wallet_db_path: "./paygress-cashu-wallet.sqlite".to_string(),
         lightning_address: args.lightning_address.clone(),
         http_bind_addr: None,
     };
@@ -544,10 +544,10 @@ fn build_multi_config(
         tunnel_interface: None,
         ssh_port_start: None,
         ssh_port_end: None,
-        // Each provider gets its own redb so they don't fight over
+        // Each provider gets its own SQLite db so they don't fight over
         // one wallet's localstore (cdk's per-process write lock
         // would serialize all redemptions otherwise).
-        cashu_wallet_db_path: format!("./paygress-{}.redb", provider_name),
+        cashu_wallet_db_path: format!("./paygress-{}.sqlite", provider_name),
         http_bind_addr: None,
         lightning_address: args.lightning_address.clone(),
     }
@@ -1206,7 +1206,7 @@ mod setup_multi_tests {
     }
 
     #[test]
-    fn redb_paths_are_unique_per_instance() {
+    fn sqlite_paths_are_unique_per_instance() {
         let a = args(3);
         let paths: Vec<String> = (0..3)
             .map(|i| {
@@ -1225,7 +1225,7 @@ mod setup_multi_tests {
         assert_eq!(
             paths.len(),
             unique.len(),
-            "redb paths must be unique per instance: {:?}",
+            "sqlite paths must be unique per instance: {:?}",
             paths
         );
     }

@@ -8,14 +8,14 @@
 //   Client sends Cashu token via encrypted Nostr DM (NIP-17).
 //   `ProviderService` → `CdkRedeemer` swaps the token at the mint via
 //   NUT-03, storing proofs in the shared CDK wallet
-//   (`/var/lib/paygress/cashu-wallet.redb`). Backend is
+//   (`/var/lib/paygress/cashu-wallet.sqlite`). Backend is
 //   `ProxmoxClient` / `LxdBackend` / `DockerBackend` / `KvmBackend`.
 //
 // Path B — HTTP + ngx_l402 (always compiled, activated by `http_bind_addr`):
 //   Client hits nginx; ngx_l402 redeems the Cashu token into the same
-//   shared redb wallet, then forwards the authenticated request to the
-//   axum backend in `src/provider_http.rs`. Bootstrap auto-generates
-//   the ngx_l402 Docker Compose config (Step 8 in bootstrap.rs).
+//   shared SQLite wallet (`cashu-wallet.sqlite`), then forwards the
+//   authenticated request to the axum backend in `src/provider_http.rs`.
+//   Bootstrap auto-generates the ngx_l402 Docker Compose config (Step 8).
 //
 // Lightning sweep (both paths):
 //   ngx_l402 mounts `/var/lib/paygress` as its data volume and runs a

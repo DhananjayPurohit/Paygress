@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::cashu::{
-    derive_seed_from_nostr_key, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
+    resolve_wallet_seed, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
 };
 use crate::compute::{ComputeBackend, ContainerConfig, PortMapping};
 use crate::docker::DockerBackend;
@@ -103,15 +103,15 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub ssh_port_end: Option<u16>,
 
-    // Shared Cashu wallet database (redb file). Stores swapped proofs,
-    // keysets, and quotes for every accepted mint.
+    // Shared Cashu wallet database (SQLite, via cdk-sqlite). Stores swapped
+    // proofs, keysets, and quotes for every accepted mint.
     //
     // Both redemption paths write here:
     //   - Nostr-DM path: CdkRedeemer swaps tokens and stores proofs here.
-    //   - HTTP+ngx_l402 path: ngx_l402 mounts this same file
-    //     (`CASHU_DB_PATH` in docker-compose.yml) and redeems tokens into it.
+    //   - HTTP+ngx_l402 path: ngx_l402 opens the same SQLite file
+    //     (`CASHU_DB_PATH` in docker-compose.yml) using the same CDK schema.
     //
-    // ngx_l402's melt loop drains both pools to Lightning automatically.
+    // ngx_l402's melt loop drains both paths' ecash to Lightning automatically.
     #[serde(default = "default_cashu_wallet_db_path")]
     pub cashu_wallet_db_path: String,
 
@@ -141,7 +141,7 @@ pub struct ProviderConfig {
 }
 
 fn default_cashu_wallet_db_path() -> String {
-    "./paygress-cashu-wallet.redb".to_string()
+    "./paygress-cashu-wallet.sqlite".to_string()
 }
 
 impl Default for ProviderConfig {
@@ -347,14 +347,17 @@ impl ProviderService {
         };
         let nostr = NostrRelaySubscriber::new(relay_config).await?;
 
-        // Initialize the Cashu redeemer. Wallet identity is derived
-        // deterministically from the provider's Nostr private key so
-        // the same provider sees a consistent proof history across
-        // restarts. The redb file holds proofs, keysets, and quotes
-        // for every mint this provider accepts.
-        let wallet_db = cdk_redb::wallet::WalletRedbDatabase::new(std::path::Path::new(
+        // Initialize the Cashu redeemer. The 64-byte wallet seed comes from a
+        // BIP39 mnemonic (Cashu/NUT-13 standard): an explicit
+        // CASHU_WALLET_MNEMONIC if set, otherwise a deterministic mnemonic
+        // derived from the provider's Nostr identity so the same provider sees a
+        // consistent proof history across restarts. Uses cdk-sqlite so the same
+        // database file (and same seed) can be shared with ngx_l402, enabling it
+        // to sweep Nostr-DM path ecash to Lightning alongside HTTP-path ecash.
+        let wallet_db = cdk_sqlite::WalletSqliteDatabase::new(std::path::PathBuf::from(
             &config.cashu_wallet_db_path,
         ))
+        .await
         .map_err(|e| {
             anyhow::anyhow!(
                 "failed to open cashu wallet database at {}: {}",
@@ -362,7 +365,8 @@ impl ProviderService {
                 e
             )
         })?;
-        let seed = derive_seed_from_nostr_key(&config.nostr_private_key);
+        let seed = resolve_wallet_seed(&config.nostr_private_key)
+            .map_err(|e| anyhow::anyhow!("failed to derive wallet seed: {}", e))?;
         let redeemer: Arc<dyn MintRedeemer> = Arc::new(CdkRedeemer::new(Arc::new(wallet_db), seed));
 
         let now = std::time::SystemTime::now()

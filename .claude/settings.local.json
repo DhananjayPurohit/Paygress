@@ -21,7 +21,9 @@
       "Bash(wslpath -u \"\\\\\\\\home\\\\\\\\dhananjay\\\\\\\\paygress\")",
       "Bash(wsl -e bash -c \"ls /home/dhananjay/paygress/Cargo.toml\")",
       "Bash(wsl -e bash -c \"python3 /tmp/count_words.py\")",
-      "Bash(wsl -e *)"
+      "Bash(wsl -e *)",
+      "Bash(wsl --exec bash -c \"source ~/.cargo/env && cd /home/dhananjay/paygress && cargo build --release 2>&1 | grep -E '^error|Finished|Compiling paygress'\")",
+      "Bash(wsl --exec bash -c \"cd /home/dhananjay/paygress && grep -rn 'redb' src/ --include='*.rs' | grep -v 'cdk_redb\\\\|WalletRedbDatabase\\\\|target/' | grep -v '^\\\\s*//' | head -20\")"
     ]
   }
 }

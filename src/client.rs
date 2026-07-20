@@ -11,7 +11,12 @@
 // this SDK; this PR adds the surface so external Rust callers
 // (and the in-progress Python wrapper) can use it now.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoveryClient;
@@ -237,6 +242,363 @@ pub fn parse_status_response(content: &str) -> Result<StatusOutcome> {
         return Ok(StatusOutcome::Success(resp));
     }
     Ok(StatusOutcome::Other(content.to_string()))
+}
+
+// ==================== Lease keep-alive (streaming payment) ====================
+//
+// Turns the one-shot `topup` round-trip into a streaming payer: instead
+// of pre-paying a whole lease (and losing it all if provisioning or the
+// provider fails), the consumer buys the lease in small pre-paid
+// intervals that this loop auto-renews before each one lapses.
+//
+//   - Max consumer loss on ANY failure = one interval, not the whole lease.
+//   - Cross-provider failover is trivial: stop paying npub A, start paying B.
+//   - `budget_msats` is the spend cap (guardrail for autonomous agents):
+//     the payer stops before a renewal would push cumulative spend over it.
+//
+// The per-tick decision is a pure function (`decide_tick`) so it's
+// testable without a clock or network; `LeaseKeepAlive::run` is the thin
+// I/O driver around it.
+
+/// Produces a fresh Cashu token worth at least `amount_msats`, drawn from
+/// the consumer's funds. Abstracted so the payer doesn't hard-depend on a
+/// wallet impl: `CdkTokenSource` wires a real cdk wallet; tests stub it.
+#[async_trait]
+pub trait TokenSource: Send + Sync {
+    async fn mint_token(&self, amount_msats: u64, mint_url: &str) -> Result<String>;
+}
+
+/// msats needed to buy `interval_secs` of lease at the provider's rate.
+pub fn renewal_amount_msats(interval_secs: u64, rate_msats_per_sec: u64) -> u64 {
+    interval_secs.saturating_mul(rate_msats_per_sec)
+}
+
+/// Seconds of lease remaining at `now` (0 once expired).
+pub fn seconds_remaining(now: u64, expires_at: u64) -> u64 {
+    expires_at.saturating_sub(now)
+}
+
+/// Renew when remaining lease has fallen to/below `interval * frac`.
+/// Renewing *before* expiry (not at it) absorbs relay + mint latency so
+/// the lease never actually lapses and the provider's reclaim never fires.
+pub fn should_renew(now: u64, expires_at: u64, interval_secs: u64, threshold_frac: f64) -> bool {
+    let threshold = (interval_secs as f64 * threshold_frac).max(0.0) as u64;
+    seconds_remaining(now, expires_at) <= threshold
+}
+
+/// Config for a streaming lease payer.
+#[derive(Debug, Clone)]
+pub struct KeepAliveConfig {
+    /// Provider being paid (npub / hex).
+    pub provider_npub: String,
+    /// Pod id from the spawn's AccessDetails (`container-<vmid>`).
+    pub pod_id: String,
+    /// The chosen spec's price, used to size each interval's token.
+    pub rate_msats_per_sec: u64,
+    /// Mint the renewal tokens are drawn from (must be provider-whitelisted).
+    pub mint_url: String,
+    /// Seconds of lease each renewal buys.
+    pub interval_secs: u64,
+    /// Renew when remaining < interval * this (e.g. 0.4).
+    pub renew_threshold_frac: f64,
+    /// How often to re-check the clock.
+    pub check_period: Duration,
+    /// Total spend cap in msats; `None` = unlimited. The payer stops
+    /// before a renewal would push cumulative spend over this.
+    pub budget_msats: Option<u64>,
+}
+
+/// What the payer should do this tick. Pure output of `decide_tick`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickAction {
+    /// Enough lease left — sleep and re-check.
+    Sleep,
+    /// Time to renew; mint a token worth `amount_msats` and top up.
+    Renew { amount_msats: u64 },
+    /// Renewing would exceed `budget_msats`; stop.
+    StopBudget,
+}
+
+/// Pure per-tick decision. All the payer's logic lives here so it's
+/// testable without I/O.
+pub fn decide_tick(
+    now: u64,
+    expires_at: u64,
+    cfg: &KeepAliveConfig,
+    spent_msats: u64,
+) -> TickAction {
+    if !should_renew(now, expires_at, cfg.interval_secs, cfg.renew_threshold_frac) {
+        return TickAction::Sleep;
+    }
+    let amount = renewal_amount_msats(cfg.interval_secs, cfg.rate_msats_per_sec);
+    match cfg.budget_msats {
+        Some(cap) if spent_msats.saturating_add(amount) > cap => TickAction::StopBudget,
+        _ => TickAction::Renew {
+            amount_msats: amount,
+        },
+    }
+}
+
+/// Why the keep-alive loop ended.
+#[derive(Debug, Clone)]
+pub enum KeepAliveExit {
+    /// Caller flipped the stop flag.
+    Stopped { spent_msats: u64 },
+    /// Hit the spend cap.
+    BudgetExhausted { spent_msats: u64 },
+    /// Provider says the lease is gone (expired / not found / race) — no
+    /// point renewing a lease that no longer exists.
+    LeaseGone { reason: String, spent_msats: u64 },
+    /// Unrecoverable local error (mint failure past retries, etc.).
+    Fatal { reason: String, spent_msats: u64 },
+}
+
+const MAX_CONSECUTIVE_ERRS: u32 = 5;
+
+/// Streaming lease payer. Construct with a `KeepAliveConfig`, a
+/// `TokenSource` over the consumer's funds, and the initial `expires_at`
+/// from the spawn response, then `run`.
+pub struct LeaseKeepAlive<T: TokenSource> {
+    cfg: KeepAliveConfig,
+    token_source: T,
+}
+
+impl<T: TokenSource> LeaseKeepAlive<T> {
+    pub fn new(cfg: KeepAliveConfig, token_source: T) -> Self {
+        Self { cfg, token_source }
+    }
+
+    /// Drive the lease forward, renewing before each interval lapses,
+    /// until `stop` is set, the budget is exhausted, or the lease is gone.
+    /// `initial_expires_at` is the unix-second expiry from the spawn's
+    /// AccessDetails.
+    pub async fn run(
+        &self,
+        client: &PaygressClient,
+        initial_expires_at: u64,
+        stop: Arc<AtomicBool>,
+    ) -> KeepAliveExit {
+        let mut expires_at = initial_expires_at;
+        let mut spent_msats: u64 = 0;
+        let mut consecutive_errs = 0u32;
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return KeepAliveExit::Stopped { spent_msats };
+            }
+            let now = unix_now();
+            match decide_tick(now, expires_at, &self.cfg, spent_msats) {
+                TickAction::Sleep => {
+                    tokio::time::sleep(self.cfg.check_period).await;
+                }
+                TickAction::StopBudget => {
+                    return KeepAliveExit::BudgetExhausted { spent_msats };
+                }
+                TickAction::Renew { amount_msats } => {
+                    // Mint a small token from the consumer's funds.
+                    let token = match self
+                        .token_source
+                        .mint_token(amount_msats, &self.cfg.mint_url)
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            consecutive_errs += 1;
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
+                                return KeepAliveExit::Fatal {
+                                    reason: format!("mint failed {consecutive_errs}x: {e}"),
+                                    spent_msats,
+                                };
+                            }
+                            tokio::time::sleep(self.cfg.check_period).await;
+                            continue;
+                        }
+                    };
+
+                    let req = TopupRequest {
+                        pod_id: self.cfg.pod_id.clone(),
+                        cashu_token: token,
+                    };
+                    match client.topup(&self.cfg.provider_npub, req).await {
+                        Ok(TopupOutcome::Success(resp)) => {
+                            consecutive_errs = 0;
+                            spent_msats = spent_msats.saturating_add(amount_msats);
+                            expires_at = parse_rfc3339_unix(&resp.new_expires_at)
+                                // Provider extended but we couldn't parse the
+                                // timestamp; advance locally so we don't hot-loop.
+                                .unwrap_or_else(|| now.saturating_add(self.cfg.interval_secs));
+                        }
+                        Ok(TopupOutcome::Error(e)) => {
+                            if is_lease_gone(&e.error_type) {
+                                return KeepAliveExit::LeaseGone {
+                                    reason: format!("{}: {}", e.error_type, e.message),
+                                    spent_msats,
+                                };
+                            }
+                            consecutive_errs += 1;
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
+                                return KeepAliveExit::Fatal {
+                                    reason: format!(
+                                        "topup errored {consecutive_errs}x: {}",
+                                        e.error_type
+                                    ),
+                                    spent_msats,
+                                };
+                            }
+                            tokio::time::sleep(self.cfg.check_period).await;
+                        }
+                        Ok(TopupOutcome::Other(_)) | Err(_) => {
+                            consecutive_errs += 1;
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
+                                return KeepAliveExit::Fatal {
+                                    reason: "topup failed past retry limit".to_string(),
+                                    spent_msats,
+                                };
+                            }
+                            tokio::time::sleep(self.cfg.check_period).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_rfc3339_unix(s: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp().max(0) as u64)
+}
+
+/// Terminal provider error types where renewing is pointless. Matches the
+/// `error_type` strings the provider's topup handler emits.
+fn is_lease_gone(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        "lease_expired" | "not_found" | "race_lost" | "not_owner"
+    )
+}
+
+/// `TokenSource` backed by a cdk wallet. Mints a fresh token per interval
+/// with the same prepare_send/confirm dance `cashu::split_token_into_n`
+/// uses. The wallet is bound to one mint + unit at construction; assumes a
+/// `sat`-unit wallet and rounds msats up to the nearest sat so the
+/// provider never sees a short payment.
+pub struct CdkTokenSource {
+    wallet: Arc<cdk::wallet::Wallet>,
+}
+
+impl CdkTokenSource {
+    pub fn new(wallet: Arc<cdk::wallet::Wallet>) -> Self {
+        Self { wallet }
+    }
+}
+
+#[async_trait]
+impl TokenSource for CdkTokenSource {
+    async fn mint_token(&self, amount_msats: u64, _mint_url: &str) -> Result<String> {
+        use cdk::wallet::SendOptions;
+        use cdk::Amount;
+        let sats = amount_msats.div_ceil(1000).max(1);
+        let prepared = self
+            .wallet
+            .prepare_send(Amount::from(sats), SendOptions::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("prepare_send {sats} sat: {e}"))?;
+        let token = prepared
+            .confirm(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("confirm send: {e}"))?;
+        Ok(token.to_string())
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+
+    fn cfg(interval: u64, rate: u64, frac: f64, budget: Option<u64>) -> KeepAliveConfig {
+        KeepAliveConfig {
+            provider_npub: "np".into(),
+            pod_id: "container-1".into(),
+            rate_msats_per_sec: rate,
+            mint_url: "https://mint".into(),
+            interval_secs: interval,
+            renew_threshold_frac: frac,
+            check_period: Duration::from_secs(1),
+            budget_msats: budget,
+        }
+    }
+
+    #[test]
+    fn amount_scales_with_interval_and_rate() {
+        assert_eq!(renewal_amount_msats(60, 50), 3000);
+        assert_eq!(renewal_amount_msats(0, 50), 0);
+    }
+
+    #[test]
+    fn should_renew_only_within_threshold() {
+        // interval 60, frac 0.4 -> threshold 24s.
+        assert!(!should_renew(0, 100, 60, 0.4)); // 100s left
+        assert!(should_renew(80, 100, 60, 0.4)); // 20s left <= 24
+        assert!(should_renew(100, 100, 60, 0.4)); // already expired
+    }
+
+    #[test]
+    fn decide_sleeps_when_plenty_of_time() {
+        assert_eq!(
+            decide_tick(0, 1000, &cfg(60, 50, 0.4, None), 0),
+            TickAction::Sleep
+        );
+    }
+
+    #[test]
+    fn decide_renews_near_expiry() {
+        assert_eq!(
+            decide_tick(980, 1000, &cfg(60, 50, 0.4, None), 0),
+            TickAction::Renew { amount_msats: 3000 }
+        );
+    }
+
+    #[test]
+    fn decide_stops_when_next_renewal_exceeds_budget() {
+        // spent 3000 + next 3000 = 6000 > cap 5000 -> stop.
+        assert_eq!(
+            decide_tick(980, 1000, &cfg(60, 50, 0.4, Some(5000)), 3000),
+            TickAction::StopBudget
+        );
+    }
+
+    #[test]
+    fn decide_allows_renewal_exactly_at_budget() {
+        // spent 2000 + 3000 = 5000 == cap -> allowed (strictly-greater stops).
+        assert_eq!(
+            decide_tick(980, 1000, &cfg(60, 50, 0.4, Some(5000)), 2000),
+            TickAction::Renew { amount_msats: 3000 }
+        );
+    }
+
+    #[test]
+    fn rfc3339_parses_to_unix() {
+        let ts = parse_rfc3339_unix("2026-04-30T00:00:00Z").unwrap();
+        assert!(ts > 1_700_000_000);
+        assert_eq!(parse_rfc3339_unix("not-a-date"), None);
+    }
+
+    #[test]
+    fn lease_gone_matches_provider_error_types() {
+        assert!(is_lease_gone("lease_expired"));
+        assert!(is_lease_gone("race_lost"));
+        assert!(is_lease_gone("not_owner"));
+        assert!(!is_lease_gone("insufficient_payment"));
+    }
 }
 
 #[cfg(test)]

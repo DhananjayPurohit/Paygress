@@ -74,10 +74,12 @@ fn print_banner() {
 
 #[tokio::main]
 async fn main() {
+    // Default to `error` so relay-pool noise stays hidden during normal
+    // consumer use.  Set RUST_LOG=info (or pass --verbose) to see it.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
         )
         .with_writer(std::io::stderr)
         .init();

@@ -900,6 +900,76 @@ pub fn npubs_equal(a: &str, b: &str) -> bool {
     }
 }
 
+/// True iff a provider offer's claimed `provider_npub` was actually
+/// authored by the Nostr key that signed the offer event.
+///
+/// A Kind-38383 provider-offer event is signed by *some* key (the event
+/// author, which nostr-sdk verifies on fetch), but `provider_npub` is a
+/// free-form field in the JSON body. Without this binding any key can
+/// publish an offer impersonating any provider — poisoning discovery
+/// (`discovery.rs`) and the dashboard snapshot, letting an attacker
+/// claim a known anchor npub or last-write-wins over a real provider's
+/// listing. `signer_hex` is `event.pubkey.to_hex()`.
+pub fn offer_authored_by_claimed_provider(signer_hex: &str, offer: &ProviderOfferContent) -> bool {
+    npubs_equal(signer_hex, &offer.provider_npub)
+}
+
+#[cfg(test)]
+mod offer_authenticity_tests {
+    use super::*;
+
+    fn offer_claiming(npub: &str) -> ProviderOfferContent {
+        ProviderOfferContent {
+            provider_npub: npub.to_string(),
+            hostname: "attacker-chosen.example".to_string(),
+            location: None,
+            capabilities: vec![],
+            specs: vec![],
+            whitelisted_mints: vec![],
+            uptime_percent: 100.0,
+            total_jobs_completed: 0,
+            api_endpoint: None,
+            version: SCHEMA_VERSION,
+            isolation_level: IsolationLevel::SharedKernel,
+            stake_proof: None,
+        }
+    }
+
+    #[test]
+    fn genuine_offer_from_its_signer_is_accepted() {
+        let k = Keys::generate();
+        let offer = offer_claiming(&k.public_key().to_hex());
+        assert!(offer_authored_by_claimed_provider(
+            &k.public_key().to_hex(),
+            &offer
+        ));
+    }
+
+    #[test]
+    fn offer_claiming_foreign_npub_is_rejected() {
+        // Attacker signs the event but stuffs the victim's npub into
+        // the body — the exact spoofing path CWE-345 warns about.
+        let victim = Keys::generate();
+        let attacker = Keys::generate();
+        let forged = offer_claiming(&victim.public_key().to_hex());
+        assert!(!offer_authored_by_claimed_provider(
+            &attacker.public_key().to_hex(),
+            &forged
+        ));
+    }
+
+    #[test]
+    fn signer_binding_canonicalizes_hex_and_bech32() {
+        // Body carries the bech32 form; signer is hex. Same key must match.
+        let k = Keys::generate();
+        let offer = offer_claiming(&k.public_key().to_bech32().unwrap());
+        assert!(offer_authored_by_claimed_provider(
+            &k.public_key().to_hex(),
+            &offer
+        ));
+    }
+}
+
 // NEW: Encrypted top-up request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedTopUpPodRequest {
@@ -1454,8 +1524,23 @@ impl NostrRelaySubscriber {
 
         let mut providers = Vec::new();
         for event in events {
+            // Bind the offer to its signer. nostr-sdk verifies the event
+            // signature on fetch, so `event.pubkey` is authenticated;
+            // `provider_npub` in the body is attacker-controllable. Drop
+            // any offer whose claimed provider_npub doesn't match the
+            // signer to defeat offer spoofing (CWE-345).
+            let signer_hex = event.pubkey.to_hex();
             match serde_json::from_str::<ProviderOfferContent>(&event.content) {
-                Ok(offer) => providers.push(offer),
+                Ok(offer) => {
+                    if !offer_authored_by_claimed_provider(&signer_hex, &offer) {
+                        warn!(
+                            "Dropping spoofed provider offer {}: body provider_npub={} does not match event signer {}",
+                            event.id, offer.provider_npub, signer_hex
+                        );
+                        continue;
+                    }
+                    providers.push(offer);
+                }
                 Err(e) => {
                     warn!("Failed to parse provider offer {}: {}", event.id, e);
                 }
