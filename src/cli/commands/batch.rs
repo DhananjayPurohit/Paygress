@@ -53,10 +53,11 @@ pub struct BatchArgs {
     /// token in, and emits N tokens of approximately equal face
     /// value before fanning out spawns.
     ///
-    /// Caveat: uses `cdk` 0.9, which is known to fail at receive
-    /// against modern mints with v2 (66-char) keyset IDs (e.g.
-    /// mint.minibits.cash). Works today against testnut.cashu.space.
-    /// cdk 0.14 upgrade is tracked separately.
+    /// Caveat: exercised end-to-end against `testnut.cashu.space`
+    /// only. The bundled cdk 0.14 wallet supports v2 (66-char)
+    /// keyset IDs in code, so mainnet mints (e.g.
+    /// `mint.minibits.cash`) are expected to work, but that path
+    /// has not been verified against a live mainnet mint yet.
     #[arg(long)]
     pub split_token: Option<String>,
 
