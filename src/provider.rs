@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::cashu::{
-    derive_seed_from_nostr_key, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
+    resolve_wallet_seed, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
 };
 use crate::compute::{ComputeBackend, ContainerConfig, PortMapping};
 use crate::docker::DockerBackend;
@@ -347,12 +347,13 @@ impl ProviderService {
         };
         let nostr = NostrRelaySubscriber::new(relay_config).await?;
 
-        // Initialize the Cashu redeemer. Wallet identity is derived
-        // deterministically from the provider's Nostr private key so
-        // the same provider sees a consistent proof history across
-        // restarts. Uses cdk-sqlite so the same database file can be
-        // shared with ngx_l402, enabling it to sweep Nostr-DM path
-        // ecash to Lightning alongside HTTP-path ecash.
+        // Initialize the Cashu redeemer. The 64-byte wallet seed comes from a
+        // BIP39 mnemonic (Cashu/NUT-13 standard): an explicit
+        // CASHU_WALLET_MNEMONIC if set, otherwise a deterministic mnemonic
+        // derived from the provider's Nostr identity so the same provider sees a
+        // consistent proof history across restarts. Uses cdk-sqlite so the same
+        // database file (and same seed) can be shared with ngx_l402, enabling it
+        // to sweep Nostr-DM path ecash to Lightning alongside HTTP-path ecash.
         let wallet_db = cdk_sqlite::WalletSqliteDatabase::new(std::path::PathBuf::from(
             &config.cashu_wallet_db_path,
         ))
@@ -364,7 +365,8 @@ impl ProviderService {
                 e
             )
         })?;
-        let seed = derive_seed_from_nostr_key(&config.nostr_private_key);
+        let seed = resolve_wallet_seed(&config.nostr_private_key)
+            .map_err(|e| anyhow::anyhow!("failed to derive wallet seed: {}", e))?;
         let redeemer: Arc<dyn MintRedeemer> = Arc::new(CdkRedeemer::new(Arc::new(wallet_db), seed));
 
         let now = std::time::SystemTime::now()

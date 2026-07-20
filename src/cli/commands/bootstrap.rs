@@ -782,13 +782,12 @@ WantedBy=multi-user.target
                 })?;
         }
 
-        // Derive wallet secret from nostr key (hex-encode 64-byte seed).
-        // ngx_l402's CASHU_WALLET_SECRET must match so it opens the same
-        // CDK wallet that CdkRedeemer writes to.
-        let wallet_secret = {
-            let seed = paygress::cashu::derive_seed_from_nostr_key(&nostr_key);
-            hex::encode(seed)
-        };
+        // Derive the shared BIP39 wallet mnemonic from the nostr key
+        // (Cashu/NUT-13 standard). ngx_l402 receives the SAME phrase via
+        // CASHU_WALLET_MNEMONIC and derives an identical seed, so both open the
+        // same CDK wallet that CdkRedeemer writes to.
+        let wallet_mnemonic = paygress::cashu::mnemonic_from_nostr_key(&nostr_key)
+            .map_err(|e| anyhow::anyhow!("failed to derive wallet mnemonic: {}", e))?;
 
         // Deterministic ROOT_KEY for ngx_l402 macaroon signing (32 bytes / 64 hex chars).
         let root_key = match args.root_key {
@@ -809,8 +808,8 @@ WantedBy=multi-user.target
 LNURL_ADDRESS={lightning_address}
 ROOT_KEY={root_key}
 
-# Cashu wallet — shares the same db as the Paygress provider
-CASHU_WALLET_SECRET={wallet_secret}
+# Cashu wallet — shares the same db and BIP39 seed as the Paygress provider
+CASHU_WALLET_MNEMONIC="{wallet_mnemonic}"
 CASHU_WHITELISTED_MINTS={mints}
 
 # Lightning sweep settings (both Nostr-DM and HTTP path ecash)
@@ -821,7 +820,7 @@ CASHU_MELT_FEE_RESERVE_PERCENT=1
 "#,
             lightning_address = lightning_address,
             root_key = root_key,
-            wallet_secret = wallet_secret,
+            wallet_mnemonic = wallet_mnemonic,
             mints = args.mints,
             sweep_interval = args.sweep_interval_secs,
             sweep_min_balance = args.sweep_min_balance_sats,
@@ -875,7 +874,7 @@ http {
 
         let docker_compose = r#"services:
   nginx:
-    image: ghcr.io/dhananjaypurohit/ngx_l402:latest
+    image: ghcr.io/ngx-l402/ngx-l402:latest
     container_name: nginx-l402
     restart: always
     ports:

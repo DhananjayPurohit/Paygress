@@ -62,6 +62,9 @@ rand = "0.8"
 # processes share the same wallet database file for Lightning sweep.
 cdk-sqlite = { version = "0.14.1", features = ["wallet"] }
 cdk = { version = "0.14", default-features = false, features = ["wallet"] }
+# BIP39 mnemonic -> 64-byte seed (Cashu/NUT-13). Must match ngx_l402_core's
+# derivation so the shared wallet opens identically in both processes.
+bip39 = { version = "2.1.0", features = ["unicode-normalization"] }
 
 # Nostr dependencies
 nostr-sdk = { version = "0.43", features = ["nip04", "nip44", "nip59"] }
