@@ -66,7 +66,7 @@ services:
 
   # Nginx Reverse Proxy with L402
   nginx:
-    image: ghcr.io/dhananjaypurohit/ngx_l402:1.2.0
+    image: ghcr.io/ngx-l402/ngx-l402:1.2.7
     container_name: nginx
     restart: always
     ports:
@@ -74,7 +74,7 @@ services:
     environment:
       # L402 Configuration (passed to module via process env)
       - LN_CLIENT_TYPE=${LN_CLIENT_TYPE:-LNURL}
-      - LNURL_ADDRESS=${LNURL_ADDRESS:-https://your-lnurl-server.com}
+      - LNURL_ADDRESS=${LNURL_ADDRESS:-you@your-lnurl-server.com}
       - ROOT_KEY=${l402_root_key:-your-root-key-change-me}
       # LND Options (Defaults to empty to suppress warnings)
       - LND_ADDRESS=${LND_ADDRESS:-}
@@ -83,7 +83,7 @@ services:
       # Cashu Options
       - CASHU_ECASH_SUPPORT=${CASHU_ECASH_SUPPORT:-true}
       - CASHU_DB_PATH=/var/lib/nginx/cashu.db
-      - CASHU_WALLET_SECRET=${CASHU_WALLET_SECRET:-CHANGE-ME-USE-openssl-rand-hex-32}
+      - CASHU_WALLET_MNEMONIC=${CASHU_WALLET_MNEMONIC:-CHANGE-ME-USE-A-BIP39-MNEMONIC}
       - CASHU_WHITELISTED_MINTS=${WHITELISTED_MINTS:-https://testnut.cashu.space}
       - CASHU_REDEEM_ON_LIGHTNING=${CASHU_REDEEM_ON_LIGHTNING:-true}
     volumes:
