@@ -321,14 +321,21 @@ pub enum TickAction {
 
 /// Pure per-tick decision. All the payer's logic lives here so it's
 /// testable without I/O.
-pub fn decide_tick(now: u64, expires_at: u64, cfg: &KeepAliveConfig, spent_msats: u64) -> TickAction {
+pub fn decide_tick(
+    now: u64,
+    expires_at: u64,
+    cfg: &KeepAliveConfig,
+    spent_msats: u64,
+) -> TickAction {
     if !should_renew(now, expires_at, cfg.interval_secs, cfg.renew_threshold_frac) {
         return TickAction::Sleep;
     }
     let amount = renewal_amount_msats(cfg.interval_secs, cfg.rate_msats_per_sec);
     match cfg.budget_msats {
         Some(cap) if spent_msats.saturating_add(amount) > cap => TickAction::StopBudget,
-        _ => TickAction::Renew { amount_msats: amount },
+        _ => TickAction::Renew {
+            amount_msats: amount,
+        },
     }
 }
 
@@ -431,7 +438,10 @@ impl<T: TokenSource> LeaseKeepAlive<T> {
                             consecutive_errs += 1;
                             if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
                                 return KeepAliveExit::Fatal {
-                                    reason: format!("topup errored {consecutive_errs}x: {}", e.error_type),
+                                    reason: format!(
+                                        "topup errored {consecutive_errs}x: {}",
+                                        e.error_type
+                                    ),
                                     spent_msats,
                                 };
                             }
@@ -543,7 +553,10 @@ mod keepalive_tests {
 
     #[test]
     fn decide_sleeps_when_plenty_of_time() {
-        assert_eq!(decide_tick(0, 1000, &cfg(60, 50, 0.4, None), 0), TickAction::Sleep);
+        assert_eq!(
+            decide_tick(0, 1000, &cfg(60, 50, 0.4, None), 0),
+            TickAction::Sleep
+        );
     }
 
     #[test]

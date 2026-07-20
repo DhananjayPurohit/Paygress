@@ -99,8 +99,7 @@ pub trait MintRedeemer: Send + Sync {
 /// provider's whitelist **before** sending the token, so a mismatch
 /// fails fast with a clear error instead of a round-trip rejection.
 pub fn token_mint_url(token_str: &str) -> Result<String, RedeemError> {
-    let token =
-        Token::from_str(token_str).map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
+    let token = Token::from_str(token_str).map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
     token
         .mint_url()
         .map(|u| u.to_string())
@@ -209,10 +208,9 @@ impl MintRedeemer for CdkRedeemer {
         let amount = match wallet.receive(token_str, ReceiveOptions::default()).await {
             Ok(a) => a,
             Err(e) => {
-                let is_keyset_err = matches!(
-                    e,
-                    cdk::Error::UnknownKeySet | cdk::Error::IncorrectMint
-                ) || e.to_string().to_lowercase().contains("keyset");
+                let is_keyset_err =
+                    matches!(e, cdk::Error::UnknownKeySet | cdk::Error::IncorrectMint)
+                        || e.to_string().to_lowercase().contains("keyset");
 
                 if is_keyset_err {
                     // Refresh keysets from the live mint, then retry once.
