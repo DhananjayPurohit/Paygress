@@ -1,10 +1,15 @@
-// Shared identity and relay helpers for Nostr-based commands
+// Helpers shared across the CLI commands: local Nostr identity,
+// relay lists, password generation, spinners, isolation-level parsing.
 
 use anyhow::Result;
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use nostr_sdk::{Keys, ToBech32};
+use paygress::nostr::IsolationLevel;
+use rand::Rng;
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -14,13 +19,17 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 
 pub fn parse_relays(relays: Option<String>) -> Vec<String> {
     match relays {
-        Some(r) => r
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
+        Some(r) => split_csv(&r),
         None => DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// Split a comma-separated flag value, trimming and dropping blanks.
+pub fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
@@ -45,7 +54,6 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
         return Ok(key);
     }
 
-    // Generate new key
     println!(
         "{}",
         "  No identity found. Generating new Nostr identity...".yellow()
@@ -53,11 +61,9 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
     let keys = Keys::generate();
     let nsec = keys.secret_key().to_bech32()?;
 
-    // Save to file
     let mut file = std::fs::File::create(&identity_file)?;
     file.write_all(nsec.as_bytes())?;
 
-    // Set permissions to 600 (owner read/write only) on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -76,4 +82,37 @@ pub fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
     println!();
 
     Ok(nsec)
+}
+
+pub fn generate_password(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+/// clap value-parser for `--isolation-level`, shared by `list`,
+/// `spawn`, and `batch`.
+pub fn parse_isolation_level(s: &str) -> std::result::Result<IsolationLevel, String> {
+    IsolationLevel::from_slug(s).ok_or_else(|| {
+        format!(
+            "unknown isolation level `{}` (expected one of: \
+             shared-kernel, dedicated-host, attested-research-tier)",
+            s
+        )
+    })
+}
+
+/// Start a steady-ticking spinner in the CLI's house style.
+pub fn spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.blue} {msg}")
+            .expect("static spinner template is valid"),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
 }

@@ -1,21 +1,10 @@
-// Deploy command (Unit 9 of the 12-month plan).
-//
-// Opinionated wrapper around `spawn` that hides reliability,
-// persistence, and replication choices behind sane per-template
-// defaults. Freedom-tech operators and AI agents alike can run
+// `paygress-cli deploy` — opinionated wrapper around `spawn` that
+// hides reliability, persistence, and replication choices behind
+// per-template defaults:
 //
 //     paygress deploy nostr-relay --pay <token>
 //
-// without first learning the marketplace's full surface (specs,
-// images, ports, replication modes). Every default is overridable
-// by an explicit flag.
-//
-// Real template definitions (image, ports, sysctl tweaks) land in
-// later units (Unit 8 = nostr-relay flagship, Unit 13 =
-// inference-endpoint, Unit 19 = headless-browser, Unit 21 =
-// bitcoin-node). Until those land, the defaults table here points
-// at placeholder images so the dispatch path is testable end-to-end
-// today.
+// Every default is overridable by an explicit flag.
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
@@ -24,17 +13,14 @@ use std::str::FromStr;
 
 use super::spawn::{self, SpawnArgs};
 
-/// Replication / availability override. Defaults vary per template;
-/// see [`template_defaults`].
+/// Replication / availability override. Defaults vary per template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReplicationMode {
     /// One container, no checkpoint, no failover. Cheapest.
     None,
-    /// Periodic Blossom checkpoints (Unit 6). Restart on the same
-    /// provider after crash.
+    /// Periodic Blossom checkpoints; restart on the same provider.
     Checkpointed,
-    /// Periodic checkpoints PLUS a hot standby on a second provider.
-    /// Single-writer always (Unit 5). Most expensive.
+    /// Checkpoints plus a hot standby on a second provider.
     WarmStandby,
 }
 
@@ -48,49 +34,49 @@ impl ReplicationMode {
     }
 }
 
-/// Templates the marketplace knows about. Each template is a
-/// deliberate intersection of (use-case, image, port profile,
-/// replication default). Adding one is a compatibility-bearing
-/// decision, not a config tweak.
+/// Templates the marketplace knows about. Each is a deliberate
+/// intersection of (use-case, image, port profile, replication
+/// default); adding one is a compatibility-bearing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum Template {
-    /// Nostr relay (strfry / nostr-rs-relay). Freedom-tech anchor.
-    /// Defaults to warm-standby because relay outage = censorship
-    /// surface for users who depend on it.
+    /// Nostr relay (strfry / nostr-rs-relay)
     NostrRelay,
-    /// Inference endpoint (vLLM / Ollama / TGI). Agent-economy
-    /// anchor. Defaults to checkpointed (resumable model state) but
-    /// no warm standby — costs scale linearly with replication and
-    /// most agents accept retry on a fresh provider.
+    /// Inference endpoint (vLLM / Ollama / TGI)
     InferenceEndpoint,
-    /// Headless browser (Playwright / Puppeteer). Stateless by
-    /// design, so replication is `none` by default — a crash means
-    /// "retry from scratch", which is what callers already do.
+    /// Headless browser (Playwright / Puppeteer)
     HeadlessBrowser,
-    /// Bitcoin full node. Long sync, large state — checkpointed
-    /// makes sense; warm-standby is overkill for this Q4 demo.
+    /// Bitcoin full node
     BitcoinNode,
-    /// Generic compute sandbox: Python + Node + git in /workspace.
-    /// For AI agents writing code, CI/test runners, and map-reduce
-    /// shards. Stateless by default — retry on a fresh provider is
-    /// the recovery model.
+    /// Generic compute sandbox: Python + Node + git in /workspace
     AgentSandbox,
-    /// OpenClaw — open-source personal AI assistant Gateway
-    /// (openclaw.ai). Connects outbound to chat apps and tools;
-    /// keeps memory + per-skill credentials in /data/.openclaw.
-    /// Checkpointed so the user's assistant identity survives a
-    /// provider restart.
+    /// OpenClaw personal AI assistant gateway (openclaw.ai)
     #[value(name = "openclaw")]
     OpenClaw,
+}
+
+impl Template {
+    /// Slug the provider uses to resolve image/ports/env from its OWN
+    /// template registry, rather than trusting consumer-supplied bytes.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Template::NostrRelay => "nostr-relay",
+            Template::InferenceEndpoint => "inference-endpoint",
+            Template::HeadlessBrowser => "headless-browser",
+            Template::BitcoinNode => "bitcoin-node",
+            Template::AgentSandbox => "agent-sandbox",
+            Template::OpenClaw => "openclaw",
+        }
+    }
 }
 
 /// Per-template "what should we do unless told otherwise" table.
 pub struct TemplateDefaults {
     pub tier: &'static str,
+    /// Fallback only: the provider normally resolves the real image
+    /// from its registry via the template slug.
     pub image: &'static str,
     pub replication: ReplicationMode,
-    /// Human-readable summary used in `--help`-style output.
     pub summary: &'static str,
 }
 
@@ -98,48 +84,36 @@ pub const fn template_defaults(t: Template) -> TemplateDefaults {
     match t {
         Template::NostrRelay => TemplateDefaults {
             tier: "basic",
-            // TODO(Unit 8): swap to a strfry-bundled image.
             image: "ubuntu:22.04",
             replication: ReplicationMode::WarmStandby,
             summary: "Censorship-resistant Nostr relay; warm-standby across two providers.",
         },
         Template::InferenceEndpoint => TemplateDefaults {
             tier: "basic",
-            // TODO(Unit 13): swap to a vLLM/Ollama image with the
-            // chosen quantized model preloaded.
             image: "ubuntu:22.04",
             replication: ReplicationMode::Checkpointed,
             summary: "OpenAI-compatible inference endpoint; checkpointed.",
         },
         Template::HeadlessBrowser => TemplateDefaults {
             tier: "basic",
-            // TODO(Unit 19): swap to a Playwright-prebuilt image.
             image: "ubuntu:22.04",
             replication: ReplicationMode::None,
             summary: "Disposable headless browser; agent-driven scraping.",
         },
         Template::BitcoinNode => TemplateDefaults {
             tier: "basic",
-            // TODO(Unit 21): swap to a bitcoind image with sane defaults.
             image: "ubuntu:22.04",
             replication: ReplicationMode::Checkpointed,
             summary: "Bitcoin full node; checkpointed (long sync).",
         },
         Template::AgentSandbox => TemplateDefaults {
             tier: "basic",
-            // The provider resolves the real image from its template
-            // registry once `--template-slug` is forwarded; this fallback
-            // only matters when --image is not overridden AND the provider
-            // doesn't recognize the slug (which would be rejected upstream).
             image: "nikolaik/python-nodejs:python3.12-nodejs20",
             replication: ReplicationMode::None,
             summary: "Python + Node + git sandbox for agents, CI, and map-reduce shards.",
         },
         Template::OpenClaw => TemplateDefaults {
             tier: "standard",
-            // The provider resolves the real image from its template
-            // registry; this fallback is only consulted when the
-            // provider doesn't recognize the slug.
             image: "ghcr.io/openclaw/openclaw:latest",
             replication: ReplicationMode::Checkpointed,
             summary: "OpenClaw personal AI assistant Gateway; checkpointed.",
@@ -147,10 +121,7 @@ pub const fn template_defaults(t: Template) -> TemplateDefaults {
     }
 }
 
-/// Reject malformed Cashu tokens before the CLI does ANY network
-/// work. Mirrors the research recommendation in the plan: clap
-/// `value_parser` short-circuits on bad input so consumers get a
-/// fast, clear error rather than a Nostr round-trip timeout.
+/// Reject malformed Cashu tokens at parse time, before any network work.
 fn parse_cashu_token(s: &str) -> Result<String, String> {
     cdk::nuts::Token::from_str(s)
         .map(|_| s.to_string())
@@ -167,10 +138,7 @@ pub struct DeployArgs {
     #[arg(short = 'k', long, value_parser = parse_cashu_token)]
     pub token: String,
 
-    /// Provider ID. If omitted, the CLI auto-selects the
-    /// lowest-priced provider that advertises this template's
-    /// capabilities (auto-selection lands with Unit 12's
-    /// observatory; today this flag is required).
+    /// Provider ID. Required until auto-selection lands.
     #[arg(long)]
     pub provider: Option<String>,
 
@@ -182,8 +150,7 @@ pub struct DeployArgs {
     #[arg(long, value_enum)]
     pub replication: Option<ReplicationMode>,
 
-    /// Override the template's default container image. Useful for
-    /// pinning to a specific tag during incident-response.
+    /// Override the template's default container image.
     #[arg(long)]
     pub image: Option<String>,
 
@@ -212,12 +179,8 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
     println!();
 
     if replication != ReplicationMode::None {
-        // Warm-standby and checkpointed both depend on Unit 5
-        // (Durable Workload state machine) and Unit 6 (Blossom
-        // checkpoints). Until those land, we honor the override
-        // syntactically but the provider currently treats every
-        // workload as `none`. Surface that explicitly so users
-        // aren't surprised.
+        // The provider currently treats every workload as `none`;
+        // surface that rather than silently accepting the override.
         println!(
             "{}",
             "  Note: replication != none is parsed but not yet enforced;".yellow()
@@ -231,37 +194,22 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
 
     if args.provider.is_none() {
         anyhow::bail!(
-            "auto-selection of providers lands with the observatory (Unit 12). \
+            "auto-selection of providers lands with the observatory. \
              Pass --provider <npub> for now."
         );
     }
 
-    // Delegate to the existing spawn flow. Deploy is a thin,
-    // opinionated lens over spawn — not a parallel implementation.
-    // The `template_slug` we pass here is what makes the provider
-    // resolve image/ports/env from its OWN template registry
-    // rather than trusting `--image` bytes.
-    let template_slug = match args.template {
-        Template::NostrRelay => "nostr-relay",
-        Template::InferenceEndpoint => "inference-endpoint",
-        Template::HeadlessBrowser => "headless-browser",
-        Template::BitcoinNode => "bitcoin-node",
-        Template::AgentSandbox => "agent-sandbox",
-        Template::OpenClaw => "openclaw",
-    };
-    // Translate the deploy CLI's replication enum to the spawn CLI's
-    // string form. Deploy doesn't yet collect --standby (each
-    // template's standby topology is not first-class for now); when
-    // the user picks `--replication warm-standby` via deploy, fall
-    // back to `none` on the wire — the deploy command surfaces the
-    // "not yet enforced" warning above. Once the consumer-side
-    // standby coordination flow lands, this maps will route the list.
+    // Deploy is a thin lens over spawn, not a parallel implementation.
+    // Warm-standby degrades to `none` on the wire because deploy does
+    // not collect a standby topology; the full flow is `spawn` with
+    // explicit --primary-id / --workload-id, once per provider.
     let replication_str = match replication {
-        ReplicationMode::None => "none",
-        ReplicationMode::Checkpointed => "checkpointed",
-        ReplicationMode::WarmStandby => "none", // see comment above
+        ReplicationMode::WarmStandby => ReplicationMode::None,
+        other => other,
     }
+    .as_str()
     .to_string();
+
     let spawn_args = SpawnArgs {
         provider: args.provider,
         server: None,
@@ -272,29 +220,15 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         ssh_pass: None,
         nostr_key: args.nostr_key,
         relays: args.relays,
-        template_slug: Some(template_slug.to_string()),
+        template_slug: Some(args.template.slug().to_string()),
         replication: replication_str,
         standby: None,
-        // Deploy doesn't yet collect a primary/standby topology
-        // (see the warning printed above when replication != none).
-        // The full warm-standby flow is `paygress-cli spawn` with
-        // explicit --primary-id / --workload-id, called once per
-        // provider in the set.
         primary_id: None,
         workload_id: None,
-        // `spawn::execute` honors the template's encrypt-by-default
-        // policy via `template_default_encrypts_volume(template_slug)`,
-        // so leaving both flags `false` here means stateful templates
-        // (data_path: Some(_)) get LUKS encryption automatically. To
-        // override at the deploy CLI, expose `--encrypt-volume` /
-        // `--no-encrypt-volume` flags here in a follow-up; today the
-        // overrides live on `paygress-cli spawn`.
+        // Both false means `spawn` applies the template's
+        // encrypt-by-default policy.
         encrypt_volume: false,
         no_encrypt_volume: false,
-        // Deploy doesn't expose --isolation-level today; consumers
-        // who need a stricter tier use `paygress-cli spawn` directly.
-        // The default (None) means deploy accepts any tier the
-        // provider offers — matching today's behavior.
         isolation_level: None,
     };
     spawn::execute(spawn_args, verbose).await

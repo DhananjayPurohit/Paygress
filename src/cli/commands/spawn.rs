@@ -1,42 +1,34 @@
-// Spawn command - Create a new workload with Cashu payment
+// `paygress-cli spawn` — create a workload against a provider.
 //
-// Unified command that works in both modes:
-//   - Nostr mode (default): sends encrypted spawn request to a provider via Nostr
-//   - HTTP mode (--server): calls a Paygress HTTP server directly
+// Nostr mode (default): encrypted spawn request DM to a provider.
+// HTTP mode (--server): direct call to a Paygress HTTP server.
 
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
 
-use super::identity::{get_or_create_identity, parse_relays};
 use crate::api::{PaygressClient, SpawnRequest};
+use crate::util::{
+    generate_password, get_or_create_identity, parse_isolation_level, parse_relays, spinner,
+    split_csv,
+};
 use paygress::discovery::DiscoveryClient;
-use paygress::nostr::{AccessDetailsContent, EncryptedSpawnPodRequest, ErrorResponseContent};
+use paygress::durable_workload::ReplicationMode;
+use paygress::nostr::{
+    AccessDetailsContent, EncryptedSpawnPodRequest, ErrorResponseContent, IsolationLevel,
+    VolumeEncryption,
+};
 
-fn generate_password(len: usize) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..len)
-        .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
-}
-
-/// Decode a Nostr secret key (`nsec1...` bech32 or 64-hex) to its
-/// raw 32-byte form. Used by `--encrypt-volume` to feed the consumer's
-/// nsec into the volume-key KDF.
+/// Decode a Nostr secret key (`nsec1...` bech32 or 64-hex) to its raw
+/// 32-byte form, for the volume-key KDF.
 fn nsec_to_bytes(nostr_key: &str) -> Result<[u8; 32]> {
     use std::str::FromStr;
     let secret = nostr_sdk::SecretKey::from_str(nostr_key)
         .map_err(|e| anyhow::anyhow!("invalid nsec/hex secret key: {}", e))?;
-    Ok(secret
+    secret
         .as_secret_bytes()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("nostr_sdk::SecretKey returned a non-32-byte secret"))?)
+        .map_err(|_| anyhow::anyhow!("nostr_sdk::SecretKey returned a non-32-byte secret"))
 }
 
 #[derive(Args)]
@@ -77,128 +69,71 @@ pub struct SpawnArgs {
     #[arg(long)]
     pub relays: Option<String>,
 
-    /// Template slug (e.g. `nostr-relay`). When set, the provider
-    /// materializes image/ports/env from its OWN template registry
-    /// and ignores `--image`. Normally set by `paygress deploy`,
-    /// not by users directly.
+    /// Template slug; the provider resolves image/ports/env from its
+    /// own registry and ignores --image. Normally set by `deploy`.
     #[arg(long, hide = true)]
     pub template_slug: Option<String>,
 
-    /// Replication mode: `none` (default), `checkpointed`, or
-    /// `warm-standby`. Warm-standby additionally requires `--standby`
-    /// listing the standby provider IDs.
+    /// Replication mode: none, checkpointed, or warm-standby
     #[arg(long, default_value = "none")]
     pub replication: String,
 
-    /// Comma-separated standby provider IDs (warm-standby only).
-    /// Ignored when `--replication` is not `warm-standby`.
+    /// Comma-separated standby provider IDs (warm-standby only)
     #[arg(long)]
     pub standby: Option<String>,
 
-    /// Primary provider's ID (warm-standby only). When you spawn
-    /// AGAINST a standby with `--provider <standby-id>`, this tells
-    /// the standby who the primary is so it can listen for the right
-    /// `LeaseRevocation`. When you spawn AGAINST the primary, set
-    /// this to the same value as `--provider` so the primary
-    /// recognizes itself.
+    /// Primary provider's ID (warm-standby only). Tells each receiving
+    /// provider which one of them is the primary.
     #[arg(long)]
     pub primary_id: Option<String>,
 
-    /// Consumer-assigned workload identifier (UUID-shaped string,
-    /// warm-standby only). The same value MUST be passed when
-    /// spawning against the primary AND each standby — it ties the
-    /// N+1 spawns into one logical workload. The
-    /// `LeaseRevocation` event uses this id, and standbys look up
-    /// their reserved slot by it on receipt.
+    /// Consumer-assigned workload identifier (warm-standby only). The
+    /// same value must be passed when spawning against the primary and
+    /// each standby — it ties the N+1 spawns into one logical workload.
     #[arg(long)]
     pub workload_id: Option<String>,
 
-    /// Force-encrypt the workload's persistent data volume with a
-    /// key derived from your nsec + workload-id. Defends against
-    /// post-eviction disk forensics, lazy host backups, co-tenant
-    /// attacks on shared storage, and cold-disk seizure. Does NOT
-    /// defend against a live host kernel reading process memory or
-    /// extracting the LUKS key from the keyring — that requires a
-    /// confidential VM (`isolation-level=attested-research-tier`).
-    ///
-    /// You usually do not need this flag: encryption defaults ON
-    /// for any template that holds persistent state (`data_path:
-    /// Some(_)`). Use `--no-encrypt-volume` to opt out.
-    ///
-    /// When encryption is on (by flag or by default), the CLI
-    /// derives the key deterministically from your nsec +
-    /// workload-id; if `--workload-id` is not supplied, a UUIDv4
-    /// is generated and printed so you can re-supply it on respawn
-    /// / top-up to recover the same key.
+    /// Encrypt the workload's persistent data volume with a key derived
+    /// from your nsec + workload-id. On by default for templates that
+    /// hold persistent state.
     #[arg(long, conflicts_with = "no_encrypt_volume")]
     pub encrypt_volume: bool,
 
-    /// Opt out of the per-template default for encrypted volumes.
-    /// Use when you've consciously decided the workload's data
-    /// doesn't warrant the LUKS overhead, or when debugging an
-    /// encryption-related provider issue.
+    /// Opt out of the per-template default for encrypted volumes
     #[arg(long, conflicts_with = "encrypt_volume")]
     pub no_encrypt_volume: bool,
 
-    /// Minimum isolation tier the provider must offer.
-    /// `shared-kernel` (containers, weakest), `dedicated-host`
-    /// (per-VM, no co-tenants), or `attested-research-tier`
-    /// (SEV-SNP / TDX confidential VM). Stricter tiers also match.
-    /// The CLI verifies the provider's offer meets this tier
-    /// BEFORE the Cashu token is sent — a tier mismatch fails
-    /// fast and never spends the token.
-    #[arg(long, value_parser = parse_isolation_level_arg)]
-    pub isolation_level: Option<paygress::nostr::IsolationLevel>,
+    /// Minimum isolation tier: shared-kernel, dedicated-host, or
+    /// attested-research-tier. Verified before the token is sent.
+    #[arg(long, value_parser = parse_isolation_level)]
+    pub isolation_level: Option<IsolationLevel>,
 }
 
-/// clap value-parser for the `--isolation-level` flag. Mirrors the
-/// one in `list.rs` (kept local to avoid cross-command coupling).
-fn parse_isolation_level_arg(s: &str) -> Result<paygress::nostr::IsolationLevel, String> {
-    paygress::nostr::IsolationLevel::from_slug(s).ok_or_else(|| {
-        format!(
-            "unknown isolation level `{}` (expected one of: \
-             shared-kernel, dedicated-host, attested-research-tier)",
-            s
-        )
-    })
-}
-
-/// Translate the `--replication` + `--standby` CLI flags into the
-/// wire-format `Option<ReplicationMode>` the spawn request carries.
-/// Returns `Ok(None)` for the default (no replication) so the wire
-/// stays empty and old providers don't see a redundant field. Pure
-/// function — exposed for unit-testing the validation matrix.
+/// Translate the `--replication` + `--standby` flags into the
+/// wire-format `Option<ReplicationMode>`. `Ok(None)` for the default so
+/// the wire stays empty and old providers don't see a redundant field.
 pub fn parse_replication_arg(
     mode: &str,
     standby_csv: Option<&str>,
-) -> anyhow::Result<Option<paygress::durable_workload::ReplicationMode>> {
-    use paygress::durable_workload::ReplicationMode;
+) -> Result<Option<ReplicationMode>> {
     match mode {
-        "none" => {
+        "none" | "checkpointed" => {
             if standby_csv.is_some() {
                 anyhow::bail!(
-                    "--standby is only valid with --replication warm-standby (got --replication none)"
+                    "--standby is only valid with --replication warm-standby (got --replication {})",
+                    mode
                 );
             }
-            Ok(None)
-        }
-        "checkpointed" => {
-            if standby_csv.is_some() {
-                anyhow::bail!(
-                    "--standby is only valid with --replication warm-standby (got --replication checkpointed)"
-                );
-            }
-            Ok(Some(ReplicationMode::Checkpointed))
+            Ok(match mode {
+                "checkpointed" => Some(ReplicationMode::Checkpointed),
+                _ => None,
+            })
         }
         "warm-standby" => {
             let csv = standby_csv.ok_or_else(|| {
                 anyhow::anyhow!("--replication warm-standby requires --standby <npub1,npub2,...>")
             })?;
-            let standby_providers: Vec<String> = csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let standby_providers = split_csv(csv);
             if standby_providers.is_empty() {
                 anyhow::bail!("--standby must list at least one provider npub");
             }
@@ -212,21 +147,17 @@ pub fn parse_replication_arg(
 }
 
 pub async fn execute(mut args: SpawnArgs, verbose: bool) -> Result<()> {
-    // Auto-generate SSH credentials if not provided
     let ssh_user = args.ssh_user.take().unwrap_or_else(|| "user".to_string());
     let ssh_pass = args
         .ssh_pass
         .take()
         .unwrap_or_else(|| generate_password(16));
 
-    // If --provider is given, use Nostr mode
-    if args.provider.is_some() {
-        let provider = args.provider.clone().unwrap();
-        return execute_nostr_spawn(provider, args, ssh_user, ssh_pass, verbose).await;
+    if let Some(provider) = args.provider.take() {
+        return execute_nostr_spawn(provider, args, ssh_user, ssh_pass).await;
     }
 
-    // Otherwise require --server for HTTP mode
-    let server = args.server.clone().ok_or_else(|| {
+    let server = args.server.take().ok_or_else(|| {
         anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required")
     })?;
 
@@ -247,121 +178,107 @@ async fn execute_http_spawn(
         println!("  Image: {}", args.image);
     }
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.blue} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Connecting to Paygress server...");
-    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-
+    let spinner = spinner("Connecting to Paygress server...");
     let client = PaygressClient::new(server);
 
     spinner.set_message("Checking server health...");
     client.health().await?;
 
     spinner.set_message("Spawning pod with Cashu payment...");
-
-    let request = SpawnRequest {
-        pod_spec_id: args.tier,
-        pod_image: args.image,
-        ssh_username: ssh_user,
-        ssh_password: ssh_pass,
-        cashu_token: Some(args.token),
-    };
-
-    let response = client.spawn_pod(request).await?;
+    let response = client
+        .spawn_pod(SpawnRequest {
+            pod_spec_id: args.tier,
+            pod_image: args.image,
+            ssh_username: ssh_user,
+            ssh_password: ssh_pass,
+            cashu_token: Some(args.token),
+        })
+        .await?;
     spinner.finish_and_clear();
 
-    if response.success {
-        println!("{}", "Pod spawned successfully!".green().bold());
-        println!();
-
-        if let Some(pod_id) = &response.pod_id {
-            println!("  {} {}", "Pod ID:".bold(), pod_id);
-        }
-        if let Some(host) = &response.ssh_host {
-            if let Some(port) = response.ssh_port {
-                println!(
-                    "  {} ssh {}@{} -p {}",
-                    "SSH:".bold(),
-                    response.ssh_username.as_deref().unwrap_or("user"),
-                    host,
-                    port
-                );
-            }
-        }
-        if let Some(expires) = &response.expires_at {
-            println!("  {} {}", "Expires:".bold(), expires);
-        }
-        if let Some(duration) = response.duration_seconds {
-            let minutes = duration / 60;
-            let seconds = duration % 60;
-            println!("  {} {}m {}s", "Duration:".bold(), minutes, seconds);
-        }
-
-        println!();
-        println!(
-            "{}",
-            "Tip: Use 'paygress-cli status --pod-id <ID> --server <URL>' to check status".dimmed()
-        );
-        println!(
-            "{}",
-            "Tip: Use 'paygress-cli topup --pod-id <ID> --server <URL> --token <TOKEN>' to extend"
-                .dimmed()
-        );
-    } else {
-        let error_msg = response
-            .error
-            .unwrap_or_else(|| "Unknown error".to_string());
+    if !response.success {
+        let error_msg = response.error.as_deref().unwrap_or("Unknown error");
         return Err(anyhow::anyhow!("Failed to spawn pod: {}", error_msg));
     }
+
+    println!("{}", "Pod spawned successfully!".green().bold());
+    println!();
+
+    if let Some(pod_id) = &response.pod_id {
+        println!("  {} {}", "Pod ID:".bold(), pod_id);
+    }
+    if let (Some(host), Some(port)) = (&response.ssh_host, response.ssh_port) {
+        println!(
+            "  {} ssh {}@{} -p {}",
+            "SSH:".bold(),
+            response.ssh_username.as_deref().unwrap_or("user"),
+            host,
+            port
+        );
+    }
+    if let Some(expires) = &response.expires_at {
+        println!("  {} {}", "Expires:".bold(), expires);
+    }
+    if let Some(duration) = response.duration_seconds {
+        println!(
+            "  {} {}m {}s",
+            "Duration:".bold(),
+            duration / 60,
+            duration % 60
+        );
+    }
+
+    println!();
+    println!(
+        "{}",
+        "Tip: Use 'paygress-cli status --pod-id <ID> --server <URL>' to check status".dimmed()
+    );
+    println!(
+        "{}",
+        "Tip: Use 'paygress-cli topup --pod-id <ID> --server <URL> --token <TOKEN>' to extend"
+            .dimmed()
+    );
 
     Ok(())
 }
 
-/// Typed outcome of a single Nostr spawn round-trip. Lets the
-/// pretty-print wrapper (`execute_nostr_spawn`) and the batch
-/// coordinator share one transport path while differing on what to
-/// do with the result.
+/// Typed outcome of a single Nostr spawn round-trip, so the
+/// pretty-printer, the batch coordinator, and the MCP server can share
+/// one transport path.
 #[derive(Debug, Clone)]
 pub enum NostrSpawnOutcome {
-    /// Provider's heartbeat says it's offline; no spawn attempted,
-    /// no token spent.
+    /// Provider's heartbeat says it's offline; no token spent.
     ProviderOffline,
-    /// Provider responded with provisioned access details.
     Success(AccessDetailsContent),
-    /// Provider responded with a structured error (token already
-    /// spent, unknown template, insufficient payment, etc.).
+    /// Structured provider error (token spent, unknown template, ...).
     ProviderError(ErrorResponseContent),
-    /// Provider responded but the body wasn't either schema. Likely
-    /// a forward-compat shape from a newer provider.
+    /// Provider replied with neither schema — likely a newer provider.
     UnknownResponse(String),
-    /// Provider didn't respond within the timeout window. The token
-    /// MAY have been spent — caller should check via `status`.
+    /// No reply in the timeout window. The token MAY have been spent.
     Timeout,
 }
 
+/// Everything a spawn request carries besides the transport settings.
+#[derive(Debug, Clone, Default)]
+pub struct NostrSpawnParams {
+    pub tier: String,
+    pub token: String,
+    pub image: String,
+    pub ssh_user: String,
+    pub ssh_pass: String,
+    pub template_slug: Option<String>,
+    pub replication: Option<ReplicationMode>,
+    pub primary_id: Option<String>,
+    pub workload_id: Option<String>,
+    pub volume_encryption: Option<VolumeEncryption>,
+    pub isolation_level: Option<IsolationLevel>,
+}
+
 /// Dispatch a single Nostr spawn request and wait for the response.
-/// No I/O on stdout — pure round-trip + structured outcome. Used by
-/// the interactive `spawn` command (via `execute_nostr_spawn`) and
-/// by the batch coordinator (`commands::batch`) which needs a
-/// machine-readable result per shard.
-#[allow(clippy::too_many_arguments)]
+/// No stdout I/O — pure round-trip plus structured outcome.
 pub async fn nostr_spawn_round_trip(
     provider_npub: &str,
-    tier: &str,
-    token: &str,
-    image: String,
-    ssh_user: String,
-    ssh_pass: String,
-    template_slug: Option<String>,
-    replication: Option<paygress::durable_workload::ReplicationMode>,
-    primary_id: Option<String>,
-    workload_id: Option<String>,
-    volume_encryption: Option<paygress::nostr::VolumeEncryption>,
-    isolation_level: Option<paygress::nostr::IsolationLevel>,
+    params: NostrSpawnParams,
     relays: Vec<String>,
     nostr_key: String,
     timeout_secs: u64,
@@ -377,18 +294,13 @@ pub async fn nostr_spawn_round_trip(
         .await?
         .ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
 
-    // Verify the tier exists on this provider so we fail before
-    // spending the token rather than after.
-    if !provider.specs.iter().any(|s| s.id == tier) {
-        anyhow::bail!("Tier '{}' not available on this provider", tier);
+    // Pre-checks below all run before the token is sent, so a mismatch
+    // fails fast and never spends it.
+    if !provider.specs.iter().any(|s| s.id == params.tier) {
+        anyhow::bail!("Tier '{}' not available on this provider", params.tier);
     }
 
-    // Isolation-tier pre-check: if caller demanded a minimum tier,
-    // refuse the spawn (and never spend the token) when the
-    // provider's offer doesn't meet it. The check uses
-    // `IsolationLevel::meets`, so `dedicated-host` matches both
-    // `dedicated-host` and `attested-research-tier` providers.
-    if let Some(min_iso) = isolation_level {
+    if let Some(min_iso) = params.isolation_level {
         if !provider.isolation_level.meets(min_iso) {
             anyhow::bail!(
                 "provider's isolation tier `{}` does not meet requested minimum `{}`; \
@@ -400,15 +312,10 @@ pub async fn nostr_spawn_round_trip(
         }
     }
 
-    // ── Mint pre-check ───────────────────────────────────────────────────
-    // Verify the token's mint is in the provider's whitelist BEFORE
-    // sending the token — a mismatch never spends the token and gives
-    // the user an actionable error with the list of accepted mints.
     if !provider.whitelisted_mints.is_empty() {
-        let token_mint = paygress::cashu::token_mint_url(token)
+        let token_mint = paygress::cashu::token_mint_url(&params.token)
             .map_err(|e| anyhow::anyhow!("could not read token: {}", e))?;
 
-        // Normalize: strip trailing slashes before comparing.
         let token_norm = token_mint.trim_end_matches('/');
         let accepted = provider
             .whitelisted_mints
@@ -433,20 +340,20 @@ pub async fn nostr_spawn_round_trip(
     }
 
     let request = EncryptedSpawnPodRequest {
-        cashu_token: token.to_string(),
-        pod_spec_id: Some(tier.to_string()),
-        pod_image: image,
-        ssh_username: ssh_user,
-        ssh_password: ssh_pass,
-        template_slug,
-        replication,
-        primary_npub: primary_id,
-        workload_id,
-        volume_encryption,
+        cashu_token: params.token,
+        pod_spec_id: Some(params.tier),
+        pod_image: params.image,
+        ssh_username: params.ssh_user,
+        ssh_password: params.ssh_pass,
+        template_slug: params.template_slug,
+        replication: params.replication,
+        primary_npub: params.primary_id,
+        workload_id: params.workload_id,
+        volume_encryption: params.volume_encryption,
     };
     let request_json = serde_json::to_string(&request)?;
 
-    let _event_id = client
+    client
         .nostr()
         .send_encrypted_private_message(&provider.npub, request_json, "nip04")
         .await?;
@@ -470,106 +377,121 @@ pub async fn nostr_spawn_round_trip(
     }
 }
 
+/// Decide whether to encrypt the data volume and, if so, derive the key.
+///
+/// Precedence: `--no-encrypt-volume` < `--encrypt-volume` < the
+/// template's own default. Custom-image spawns (no slug) stay off by
+/// default so existing scripts aren't surprised. Returns the resolved
+/// workload id alongside the key, since encryption mints one when the
+/// caller didn't supply it.
+fn resolve_volume_encryption(
+    encrypt_volume: bool,
+    no_encrypt_volume: bool,
+    template_slug: Option<&str>,
+    workload_id: Option<String>,
+    nostr_key: &str,
+) -> Result<(Option<VolumeEncryption>, Option<String>)> {
+    let template_default = template_slug
+        .and_then(paygress::templates::TemplateName::from_slug)
+        .map(paygress::templates::template_default_encrypts_volume)
+        .unwrap_or(false);
+
+    let should_encrypt = !no_encrypt_volume && (encrypt_volume || template_default);
+    if !should_encrypt {
+        return Ok((None, workload_id));
+    }
+
+    let workload_id = workload_id.unwrap_or_else(|| {
+        let id = uuid::Uuid::new_v4().to_string();
+        println!(
+            "  {} {}",
+            "Generated workload-id (save this for respawn):".bold(),
+            id.cyan()
+        );
+        id
+    });
+
+    let nsec_bytes = nsec_to_bytes(nostr_key)?;
+    let key = paygress::volume_encryption::derive_volume_key(&nsec_bytes, &workload_id);
+    if !encrypt_volume && template_default {
+        println!(
+            "  {} (template default; pass --no-encrypt-volume to skip)",
+            "Encrypting persistent data volume".green()
+        );
+    }
+    Ok((Some(VolumeEncryption::v1(key)), Some(workload_id)))
+}
+
 async fn execute_nostr_spawn(
     provider_npub: String,
     args: SpawnArgs,
     ssh_user: String,
     ssh_pass: String,
-    _verbose: bool,
 ) -> Result<()> {
     println!("{}", "Spawning Workload".blue().bold());
     println!("{}", "-".repeat(50).blue());
     println!();
 
-    let relays = parse_relays(args.relays);
-    let nostr_key = get_or_create_identity(args.nostr_key)?;
+    let SpawnArgs {
+        tier,
+        token,
+        image,
+        nostr_key,
+        relays,
+        template_slug,
+        replication,
+        standby,
+        primary_id,
+        workload_id,
+        encrypt_volume,
+        no_encrypt_volume,
+        isolation_level,
+        ..
+    } = args;
+
+    let relays = parse_relays(relays);
+    let nostr_key = get_or_create_identity(nostr_key)?;
 
     print!("  Checking provider {}... ", provider_npub.cyan());
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    let replication = parse_replication_arg(&args.replication, args.standby.as_deref())?;
-    // For warm-standby, primary_id + workload_id are required so
-    // each receiving provider can self-determine role and so the
-    // standbys share one stable id with the primary.
-    if let Some(paygress::durable_workload::ReplicationMode::WarmStandby { .. }) =
-        replication.as_ref()
-    {
-        if args.primary_id.is_none() {
+    let replication = parse_replication_arg(&replication, standby.as_deref())?;
+    // Warm-standby needs both ids so every receiving provider can
+    // self-determine its role and share one stable workload id.
+    if matches!(replication, Some(ReplicationMode::WarmStandby { .. })) {
+        if primary_id.is_none() {
             anyhow::bail!("--replication warm-standby requires --primary-id <primary provider ID>");
         }
-        if args.workload_id.is_none() {
+        if workload_id.is_none() {
             anyhow::bail!(
                 "--replication warm-standby requires --workload-id <consumer-assigned uuid>"
             );
         }
     }
 
-    // Volume encryption: derive a 32-byte key from (nsec, workload_id)
-    // and ship it inside the encrypted spawn DM. The provider creates
-    // a LUKS-encrypted volume keyed by these bytes.
-    //
-    // Three-way truth table for whether to encrypt:
-    //   --no-encrypt-volume        → false (explicit opt-out)
-    //   --encrypt-volume           → true  (explicit force-on)
-    //   neither + known template   → template_default_encrypts_volume
-    //   neither + unknown template → false (consumer didn't ask)
-    //
-    // The "by default" case reaches in via the template_slug; if the
-    // consumer supplied a slug the CLI knows, we honor that template's
-    // policy. Custom-image spawns (no slug) keep the historical
-    // "off-by-default" behavior so we don't surprise existing scripts.
-    let template_default_encrypt = args
-        .template_slug
-        .as_deref()
-        .and_then(paygress::templates::TemplateName::from_slug)
-        .map(paygress::templates::template_default_encrypts_volume)
-        .unwrap_or(false);
-    let should_encrypt = if args.no_encrypt_volume {
-        false
-    } else if args.encrypt_volume {
-        true
-    } else {
-        template_default_encrypt
-    };
-
-    let mut effective_workload_id = args.workload_id.clone();
-    let volume_encryption = if should_encrypt {
-        if effective_workload_id.is_none() {
-            let id = uuid::Uuid::new_v4().to_string();
-            println!(
-                "  {} {}",
-                "Generated workload-id (save this for respawn):".bold(),
-                id.cyan()
-            );
-            effective_workload_id = Some(id);
-        }
-        let workload_id = effective_workload_id.as_ref().unwrap();
-        let nsec_bytes = nsec_to_bytes(&nostr_key)?;
-        let key = paygress::volume_encryption::derive_volume_key(&nsec_bytes, workload_id);
-        if !args.encrypt_volume && template_default_encrypt {
-            println!(
-                "  {} (template default; pass --no-encrypt-volume to skip)",
-                "Encrypting persistent data volume".green()
-            );
-        }
-        Some(paygress::nostr::VolumeEncryption::v1(key))
-    } else {
-        None
-    };
+    let (volume_encryption, workload_id) = resolve_volume_encryption(
+        encrypt_volume,
+        no_encrypt_volume,
+        template_slug.as_deref(),
+        workload_id,
+        &nostr_key,
+    )?;
 
     let outcome = nostr_spawn_round_trip(
         &provider_npub,
-        &args.tier,
-        &args.token,
-        args.image.clone(),
-        ssh_user.clone(),
-        ssh_pass.clone(),
-        args.template_slug.clone(),
-        replication,
-        args.primary_id.clone(),
-        effective_workload_id,
-        volume_encryption,
-        args.isolation_level,
+        NostrSpawnParams {
+            tier,
+            token,
+            image,
+            ssh_user: ssh_user.clone(),
+            ssh_pass: ssh_pass.clone(),
+            template_slug,
+            replication,
+            primary_id,
+            workload_id,
+            volume_encryption,
+            isolation_level,
+        },
         relays,
         nostr_key,
         120,
@@ -578,7 +500,11 @@ async fn execute_nostr_spawn(
 
     println!();
     println!("{}", "-".repeat(50).blue());
+    print_spawn_outcome(outcome, &ssh_user, &ssh_pass);
+    Ok(())
+}
 
+fn print_spawn_outcome(outcome: NostrSpawnOutcome, ssh_user: &str, ssh_pass: &str) {
     match outcome {
         NostrSpawnOutcome::ProviderOffline => {
             println!("{}", "Provider appears to be offline.".red());
@@ -649,8 +575,6 @@ async fn execute_nostr_spawn(
             println!("You may check your status later with: paygress-cli status --pod-id <ID> --provider <id>");
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

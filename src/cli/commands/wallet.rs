@@ -1,11 +1,10 @@
 // `paygress-cli wallet` — local token utilities.
 //
-// `wallet mint` exists to fund unattended flows (CI runner spawns,
-// scripted demos) against a testnut-style mint whose fake Lightning
-// backend auto-pays quotes. It prints exactly one thing to stdout —
-// the serialized token — so callers can compose it:
+// `wallet mint` funds unattended flows against a testnut-style mint
+// whose fake Lightning backend auto-pays quotes. It prints exactly one
+// thing to stdout — the serialized token — so callers can compose it:
 //
-//   paygress-cli ci runner --token "$(paygress-cli wallet mint \
+//   paygress-cli spawn --token "$(paygress-cli wallet mint \
 //     --mint https://testnut.cashu.space --amount 1000)" ...
 //
 // All progress/diagnostics go to stderr to keep stdout clean.
@@ -46,9 +45,8 @@ pub async fn execute(args: WalletArgs) -> Result<()> {
 }
 
 async fn run_mint(args: MintArgs) -> Result<()> {
-    // Same ephemeral-wallet convention as `batch --split-token`:
-    // unique temp filename so concurrent invocations don't collide,
-    // best-effort removal regardless of outcome.
+    // Unique temp wallet so concurrent invocations don't collide;
+    // removed regardless of outcome.
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
         "paygress-wallet-mint-{}.sqlite",

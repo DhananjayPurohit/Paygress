@@ -1,6 +1,5 @@
-// Provider CLI Commands
-//
-// Commands for machine operators to setup and run a Paygress provider.
+// `paygress-cli provider` — machine-operator commands for setting up
+// and running a Paygress provider.
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -8,8 +7,9 @@ use colored::Colorize;
 use nostr_sdk::ToBech32;
 use std::process::Command;
 
+use crate::util::split_csv;
 use paygress::nostr::PodSpec;
-use paygress::provider::{load_config, save_config, ProviderConfig, ProviderService};
+use paygress::provider::{load_config, save_config, BackendType, ProviderConfig, ProviderService};
 
 const CONFIG_PATH: &str = "/etc/paygress/provider-config.json";
 
@@ -24,12 +24,7 @@ pub enum ProviderAction {
     /// Initial setup - configure Proxmox connection and provider settings
     Setup(SetupArgs),
 
-    /// Scaffold N independent provider configs on the SAME host —
-    /// fresh nsec, distinct vmid range, distinct cashu wallet sqlite,
-    /// distinct config file path per provider. Used for end-to-end
-    /// warm-standby failover testing on a single VPS, where you want
-    /// 3 separate paygress-provider processes (primary + 2 standbys)
-    /// publishing distinct offers to Nostr.
+    /// Scaffold N independent provider configs on the SAME host
     SetupMulti(SetupMultiArgs),
 
     /// Start the provider service (heartbeats + request handler)
@@ -50,16 +45,10 @@ pub enum ProviderAction {
 
 #[derive(Args)]
 pub struct SetupArgs {
-    /// Compute backend the provider will use to run consumer
-    /// workloads. Determines the offer's `isolation_level`:
-    ///   - `proxmox` / `lxd` / `docker` → `shared-kernel`
-    ///   - `kvm`                          → `dedicated-host` (per-VM)
-    /// Default is `proxmox` for backwards compatibility with
-    /// existing setups; new operators on bare-metal Linux usually
-    /// want `--backend kvm` (no Proxmox install needed) or
-    /// `--backend docker` (for the killer-templates path).
+    /// Compute backend: proxmox, lxd, docker (all shared-kernel) or
+    /// kvm (dedicated-host). Determines the offer's isolation_level.
     #[arg(long, default_value = "proxmox", value_parser = parse_backend)]
-    pub backend: paygress::provider::BackendType,
+    pub backend: BackendType,
 
     /// Proxmox API URL (e.g., https://192.168.1.100:8006/api2/json).
     /// Required only when `--backend proxmox`.
@@ -108,55 +97,24 @@ pub struct SetupArgs {
     #[arg(long)]
     pub public_ip: Option<String>,
 
-    /// Whitelisted Cashu mints (comma-separated). Defaults to
-    /// `testnut.cashu.space` — the testnet mint paygress's
-    /// integration paths exercise (`tests/cashu_redemption.rs`,
-    /// `tests/cli_deploy.rs`). The bundled cdk wallet supports
-    /// v2 keyset IDs in code, so mainnet mints (e.g.
-    /// `https://mint.minibits.cash/Bitcoin`) are expected to work
-    /// for receive+swap, but that flow has not been verified
-    /// end-to-end against a live mainnet mint yet. Operators who
-    /// have validated their own mainnet mint can override with
-    /// `--mints https://their.mint/path`.
+    /// Whitelisted Cashu mints (comma-separated). The testnet default
+    /// is the only mint paygress exercises end-to-end; mainnet mints
+    /// are expected to work but are unverified against this cdk build.
     #[arg(long, default_value = "https://testnut.cashu.space")]
     pub mints: String,
 
-    /// Lightning address for automatic sweep of earned ecash.
-    ///
-    /// When set, every Cashu token redeemed is automatically melted to
-    /// this Lightning address (LNURL-pay). Non-fatal if the sweep fails —
-    /// ecash stays in the local wallet.
-    ///
-    /// Format: user@domain.com  (e.g. myprovider@getalby.com)
+    /// Lightning address (user@domain.com) to auto-sweep earned ecash
+    /// to. A failed sweep is non-fatal; the ecash stays in the wallet.
     #[arg(long)]
     pub lightning_address: Option<String>,
 }
 
-/// Scaffold N independent providers on the same host.
-///
-/// What `setup-multi` produces
-/// ---------------------------
-/// Per provider i in 0..count:
-///   - /etc/paygress/provider-<name>-<i>.json — full config
-///   - Fresh `nsec` (independent Nostr identity per provider)
-///   - vmid range: [1000 + i*1000, 1999 + i*1000) — non-overlapping
-///   - cashu_wallet_db_path: ./paygress-<name>-<i>.sqlite
-///   - workload_state_path: ./paygress-<name>-<i>-workloads.json
-///   - provider_name: "<name>-<i>"
-///
-/// Plus a systemd template unit (printed, not installed) the
-/// operator can drop in and enable per-instance.
-///
-/// Why this exists
-/// ---------------
-/// End-to-end warm-standby failover testing needs 3 distinct
-/// providers. Running 3 separate `paygress-cli provider setup`
-/// invocations each requires hand-editing the resulting JSONs to
-/// give them non-overlapping vmid ranges and sqlite paths — annoying
-/// and error-prone. This subcommand does it in one shot. Designed
-/// for the test loop, but operators running multiple provider
-/// instances on one beefy host (e.g. burst capacity, geo-fencing
-/// per provider) can reuse the same scaffolding for production.
+/// Scaffold N independent providers on one host: a config file, a fresh
+/// nsec, a non-overlapping vmid range, and its own wallet sqlite per
+/// instance, plus a systemd template unit (printed, not installed).
+/// Warm-standby failover testing needs several distinct providers, and
+/// keeping their vmid ranges and sqlite paths disjoint by hand is
+/// error-prone.
 #[derive(Args)]
 pub struct SetupMultiArgs {
     /// Number of providers to scaffold. Defaults to 3 (primary + 2
@@ -164,43 +122,29 @@ pub struct SetupMultiArgs {
     #[arg(long, default_value_t = 3)]
     pub count: usize,
 
-    /// Compute backend the providers will use. All N providers share
-    /// the same backend on the same host — they're scheduling against
-    /// the same Docker daemon / KVM /dev/kvm / LXD socket. The vmid
-    /// ranges are partitioned so they don't collide on container ids.
+    /// Compute backend shared by all N providers
     #[arg(long, default_value = "docker", value_parser = parse_backend)]
-    pub backend: paygress::provider::BackendType,
+    pub backend: BackendType,
 
-    /// Common prefix for the N providers' display names + filenames.
-    /// Each provider gets `"<name>-<i>"` (zero-indexed). Pick
-    /// something short — it lands in `provider_name`, the systemd
-    /// instance name, the sqlite filename, and the config filename.
+    /// Common prefix for the N providers' display names + filenames;
+    /// each gets "<name>-<i>". Keep it short.
     #[arg(long, default_value = "paygress")]
     pub name: String,
 
-    /// Whitelisted Cashu mints (comma-separated). Same list applied
-    /// to every provider (they're all on the same host so they have
-    /// the same network reachability). Defaults to `testnut.cashu.space`
-    /// — see the single-provider `SetupArgs::mints` comment for why
-    /// the default is testnet rather than mainnet. Operators with a
-    /// local nutshell mint can pass `--mints http://localhost:3338`.
+    /// Whitelisted Cashu mints (comma-separated), applied to every
+    /// provider
     #[arg(long, default_value = "https://testnut.cashu.space")]
     pub mints: String,
 
-    /// Public IP address (auto-detected if not provided). Same value
-    /// applied to every provider since they share the host.
+    /// Public IP address (auto-detected if not provided)
     #[arg(long)]
     pub public_ip: Option<String>,
 
-    /// Skip the systemd template-unit instructions section. Useful
-    /// when scripting `setup-multi` in CI or when the operator
-    /// already has their own service-management story.
+    /// Skip the systemd template-unit instructions section
     #[arg(long)]
     pub no_systemd: bool,
 
-    /// Lightning address for automatic sweep of earned ecash.
-    /// Applied to every scaffolded provider instance.
-    /// Format: user@domain.com
+    /// Lightning address (user@domain.com) applied to every instance
     #[arg(long)]
     pub lightning_address: Option<String>,
 }
@@ -263,7 +207,6 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
     println!("{}", "━".repeat(50).blue());
     println!();
 
-    // Generate Nostr key if not provided
     let nostr_key = match args.nostr_key {
         Some(key) => {
             println!("  {} Using provided Nostr key", "✓".green());
@@ -281,7 +224,6 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         }
     };
 
-    // Create default specs
     let specs = vec![
         PodSpec {
             id: "basic".to_string(),
@@ -309,33 +251,18 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         },
     ];
 
-    let mints: Vec<String> = args
-        .mints
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mints = split_csv(&args.mints);
 
-    // Determine public IP
     let public_ip = match args.public_ip {
         Some(ip) => ip,
         None => {
             println!("  {} Auto-detecting public IP...", "⚙".yellow());
-            match reqwest::get("https://api.ipify.org").await {
-                Ok(resp) => match resp.text().await {
-                    Ok(ip) => {
-                        println!("  {} Detected: {}", "✓".green(), ip.trim());
-                        ip.trim().to_string()
-                    }
-                    Err(_) => {
-                        println!(
-                            "  {} Could not auto-detect IP, using 127.0.0.1",
-                            "⚠".yellow()
-                        );
-                        "127.0.0.1".to_string()
-                    }
-                },
-                Err(_) => {
+            match detect_public_ip().await {
+                Some(ip) => {
+                    println!("  {} Detected: {}", "✓".green(), ip);
+                    ip
+                }
+                None => {
                     println!(
                         "  {} Could not auto-detect IP, using 127.0.0.1",
                         "⚠".yellow()
@@ -346,10 +273,8 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         }
     };
 
-    // Create configuration. proxmox_* fields are only meaningful
-    // for `backend == Proxmox`; for other backends they're stored
-    // as empty strings (the JSON keeps the same shape so rolling
-    // back to Proxmox just needs `--proxmox-url ...` re-supplied).
+    // proxmox_* fields are only meaningful for `backend == Proxmox`;
+    // other backends store empty strings so the JSON keeps its shape.
     let config = ProviderConfig {
         backend_type: args.backend,
         public_ip,
@@ -385,17 +310,14 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         http_bind_addr: None,
     };
 
-    // Save configuration
     save_config(CONFIG_PATH, &config)?;
     println!("  {} Configuration saved to {}", "✓".green(), CONFIG_PATH);
 
-    // Per-backend startup check. Skip the Proxmox round-trip for
-    // backends that don't talk to Proxmox; for KVM, surface the
-    // /dev/kvm + qemu requirement at setup time so the operator
-    // doesn't discover it at first-spawn.
+    // Surface each backend's requirements at setup time rather than
+    // at first-spawn.
     println!();
     match args.backend {
-        paygress::provider::BackendType::Kvm => {
+        BackendType::Kvm => {
             println!("  {} Verifying KVM availability...", "⚙".yellow());
             match paygress::kvm::KvmBackend::check_kvm_available().await {
                 Ok(version) => println!(
@@ -407,7 +329,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
             }
             return finalize_setup(&args.name);
         }
-        paygress::provider::BackendType::Docker => {
+        BackendType::Docker => {
             println!("  {} Backend = Docker; no Proxmox check.", "⚙".yellow());
             println!(
                 "  {} Ensure `docker` is on PATH and the service user can run it.",
@@ -415,7 +337,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
             );
             return finalize_setup(&args.name);
         }
-        paygress::provider::BackendType::LXD => {
+        BackendType::LXD => {
             println!("  {} Backend = LXD; no Proxmox check.", "⚙".yellow());
             println!(
                 "  {} Ensure `lxc` is on PATH and the service user is in the `lxd` group.",
@@ -423,10 +345,9 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
             );
             return finalize_setup(&args.name);
         }
-        paygress::provider::BackendType::Proxmox => { /* fall through */ }
+        BackendType::Proxmox => {}
     }
 
-    // Proxmox-only path: validate the API connection.
     println!("  {} Testing Proxmox connection...", "⚙".yellow());
 
     match paygress::proxmox::ProxmoxClient::new(
@@ -457,8 +378,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
     finalize_setup(&args.name)
 }
 
-/// Print the post-setup "Setup Complete!" banner. Extracted from
-/// `execute_setup` so per-backend early-returns share one ending.
+/// Post-setup banner, shared by the per-backend early returns.
 fn finalize_setup(provider_name: &str) -> Result<()> {
     println!();
     println!("{}", "━".repeat(50).blue());
@@ -476,15 +396,13 @@ fn finalize_setup(provider_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// clap value-parser for `--backend`. Maps the kebab-case slug
-/// (`proxmox` / `lxd` / `docker` / `kvm`) onto the
-/// `BackendType` enum, with a friendly error listing valid values.
-fn parse_backend(s: &str) -> std::result::Result<paygress::provider::BackendType, String> {
+/// clap value-parser for `--backend`.
+fn parse_backend(s: &str) -> std::result::Result<BackendType, String> {
     match s {
-        "proxmox" => Ok(paygress::provider::BackendType::Proxmox),
-        "lxd" => Ok(paygress::provider::BackendType::LXD),
-        "docker" => Ok(paygress::provider::BackendType::Docker),
-        "kvm" => Ok(paygress::provider::BackendType::Kvm),
+        "proxmox" => Ok(BackendType::Proxmox),
+        "lxd" => Ok(BackendType::LXD),
+        "docker" => Ok(BackendType::Docker),
+        "kvm" => Ok(BackendType::Kvm),
         other => Err(format!(
             "unknown backend `{}` (expected one of: proxmox, lxd, docker, kvm)",
             other
@@ -492,34 +410,36 @@ fn parse_backend(s: &str) -> std::result::Result<paygress::provider::BackendType
     }
 }
 
-/// Per-instance vmid range size. Each scaffolded provider gets
-/// 1000 ids of headroom (1000-1999, 2000-2999, etc.). Plenty for
-/// a test loop; a production multi-tenant host would likely pick a
-/// larger window. Pulled out as a constant so the test below pins
-/// the partition geometry.
+/// Best-effort public IP lookup; `None` when the service is unreachable.
+async fn detect_public_ip() -> Option<String> {
+    let resp = reqwest::get("https://api.ipify.org").await.ok()?;
+    let ip = resp.text().await.ok()?.trim().to_string();
+    (!ip.is_empty()).then_some(ip)
+}
+
+/// Per-instance vmid headroom (1000-1999, 2000-2999, ...). A constant
+/// so the test below can pin the partition geometry.
 const SETUP_MULTI_VMID_RANGE_SIZE: u32 = 1000;
 
-/// Scaffold a fresh `ProviderConfig` for instance `i` of a
-/// `setup-multi` invocation. Pure function — no IO, no clock — so
-/// the partition logic (vmid range, paths, names) is unit-testable.
+/// Build a `ProviderConfig` for instance `i` of a `setup-multi`
+/// invocation. Pure — no IO, no clock — so the partition logic is
+/// unit-testable.
 fn build_multi_config(
     args: &SetupMultiArgs,
     i: usize,
     public_ip: &str,
     nostr_nsec: String,
-    specs: Vec<paygress::nostr::PodSpec>,
+    specs: Vec<PodSpec>,
     mints: Vec<String>,
-) -> paygress::provider::ProviderConfig {
-    use paygress::provider::ProviderConfig;
+) -> ProviderConfig {
     let provider_name = format!("{}-{}", args.name, i);
-    let i32 = i as u32;
-    let vmid_start = 1000 + i32 * SETUP_MULTI_VMID_RANGE_SIZE;
+    let vmid_start = 1000 + i as u32 * SETUP_MULTI_VMID_RANGE_SIZE;
     let vmid_end = vmid_start + SETUP_MULTI_VMID_RANGE_SIZE - 1;
     ProviderConfig {
         backend_type: args.backend,
         public_ip: public_ip.to_string(),
-        // Proxmox-only fields are left empty; setup-multi is for
-        // KVM/Docker/LXD where Proxmox-via-API doesn't apply.
+        // setup-multi targets KVM/Docker/LXD, so Proxmox-via-API
+        // fields stay empty.
         proxmox_url: String::new(),
         proxmox_token_id: String::new(),
         proxmox_token_secret: String::new(),
@@ -546,9 +466,8 @@ fn build_multi_config(
         tunnel_interface: None,
         ssh_port_start: None,
         ssh_port_end: None,
-        // Each provider gets its own SQLite db so they don't fight over
-        // one wallet's localstore (cdk's per-process write lock
-        // would serialize all redemptions otherwise).
+        // Own SQLite db per provider: cdk's per-process write lock
+        // would otherwise serialize all redemptions.
         cashu_wallet_db_path: format!("./paygress-{}.sqlite", provider_name),
         workload_state_path: format!("./paygress-{}-workloads.json", provider_name),
         http_bind_addr: None,
@@ -561,9 +480,6 @@ fn config_path_for(name: &str, i: usize) -> String {
 }
 
 async fn execute_setup_multi(args: SetupMultiArgs, _verbose: bool) -> Result<()> {
-    use nostr_sdk::ToBech32;
-    use paygress::nostr::PodSpec;
-
     println!("{}", "🔧 Paygress Multi-Provider Setup".blue().bold());
     println!("{}", "━".repeat(50).blue());
     println!("  Count:    {}", args.count.to_string().yellow());
@@ -582,20 +498,14 @@ async fn execute_setup_multi(args: SetupMultiArgs, _verbose: bool) -> Result<()>
         );
     }
 
-    // Resolve public IP once and apply to all instances. They share
-    // the host so the IP is the same.
+    // One IP for all instances: they share the host.
     let public_ip = match args.public_ip.clone() {
         Some(ip) => ip,
         None => {
             println!("  {} Auto-detecting public IP...", "⚙".yellow());
-            match reqwest::get("https://api.ipify.org").await {
-                Ok(resp) => resp
-                    .text()
-                    .await
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|_| "127.0.0.1".to_string()),
-                Err(_) => "127.0.0.1".to_string(),
-            }
+            detect_public_ip()
+                .await
+                .unwrap_or_else(|| "127.0.0.1".to_string())
         }
     };
     println!("  {} Public IP: {}", "✓".green(), public_ip);
@@ -618,15 +528,9 @@ async fn execute_setup_multi(args: SetupMultiArgs, _verbose: bool) -> Result<()>
             rate_msats_per_sec: 100,
         },
     ];
-    let mints: Vec<String> = args
-        .mints
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mints = split_csv(&args.mints);
 
     println!();
-    let mut written: Vec<(String, String)> = Vec::new(); // (path, npub)
     for i in 0..args.count {
         let keys = nostr_sdk::Keys::generate();
         let nsec = keys
@@ -650,7 +554,6 @@ async fn execute_setup_multi(args: SetupMultiArgs, _verbose: bool) -> Result<()>
             cfg.vmid_range_end,
         );
         println!("      npub: {}", npub.cyan());
-        written.push((path, npub));
     }
 
     if !args.no_systemd {
@@ -703,26 +606,25 @@ async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
     println!("{}", "🚀 Starting Paygress Provider".blue().bold());
     println!();
 
-    // Load configuration
     let config = load_config(&args.config)?;
 
     println!("  Provider: {}", config.provider_name.yellow());
 
     match config.backend_type {
-        paygress::provider::BackendType::Proxmox => {
+        BackendType::Proxmox => {
             println!("  Backend:  Proxmox");
             println!("  URL:      {}", config.proxmox_url);
             println!("  Node:     {}", config.proxmox_node);
         }
-        paygress::provider::BackendType::LXD => {
+        BackendType::LXD => {
             println!("  Backend:  LXD");
-            println!("  Storage:  {}", config.proxmox_storage); // Used as pool name
+            println!("  Storage:  {}", config.proxmox_storage); // reused as the pool name
         }
-        paygress::provider::BackendType::Docker => {
+        BackendType::Docker => {
             println!("  Backend:  Docker");
             println!("  Note:     templates require Docker; ensure `docker` is on PATH");
         }
-        paygress::provider::BackendType::Kvm => {
+        BackendType::Kvm => {
             println!("  Backend:  KVM/qemu (per-VM isolation, dedicated-host tier)");
             println!(
                 "  Note:     requires /dev/kvm + qemu-system-x86_64; killer templates not served"
@@ -731,7 +633,6 @@ async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
     }
     println!();
 
-    // Create and run the provider service
     let service = ProviderService::new(config.clone()).await?;
 
     println!("  NPUB: {}", service.get_npub().cyan());
@@ -743,7 +644,6 @@ async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
     println!("{}", "━".repeat(50).blue());
     println!();
 
-    // Run the service
     service.run().await?;
 
     Ok(())
@@ -752,29 +652,24 @@ async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
 async fn execute_stop(_verbose: bool) -> Result<()> {
     println!("{}", "Stopping provider service...".yellow());
 
-    // Try systemctl first (for bootstrapped providers)
-    let output = std::process::Command::new("systemctl")
+    // Bootstrapped providers run under systemd.
+    let stopped = Command::new("systemctl")
         .args(["stop", "paygress-provider"])
         .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            println!("{}", "Provider stopped via systemctl.".green());
-            return Ok(());
-        }
-        _ => {}
+    if matches!(&stopped, Ok(o) if o.status.success()) {
+        println!("{}", "Provider stopped via systemctl.".green());
+        return Ok(());
     }
 
-    // Fallback: find and kill the process
-    let output = std::process::Command::new("pgrep")
+    // Otherwise find and kill the process directly.
+    let pgrep = Command::new("pgrep")
         .args(["-f", "paygress-cli provider start"])
         .output();
-
-    if let Ok(o) = output {
+    if let Ok(o) = pgrep {
         if o.status.success() {
             let pids = String::from_utf8_lossy(&o.stdout);
             for pid in pids.trim().lines() {
-                let _ = std::process::Command::new("kill").arg(pid.trim()).output();
+                let _ = Command::new("kill").arg(pid.trim()).output();
             }
             println!("{}", "Provider stopped.".green());
             return Ok(());
@@ -789,7 +684,6 @@ async fn execute_status(_verbose: bool) -> Result<()> {
     println!("{}", "📊 Provider Status".blue().bold());
     println!("{}", "━".repeat(50).blue());
 
-    // Try to load config
     match load_config(CONFIG_PATH) {
         Ok(config) => {
             println!();
@@ -801,19 +695,18 @@ async fn execute_status(_verbose: bool) -> Result<()> {
             println!("  Proxmox URL:    {}", config.proxmox_url);
             println!("  Node:           {}", config.proxmox_node);
             println!();
-            println!("  {} Tiers configured:", "📦".to_string());
+            println!("  📦 Tiers configured:");
             for spec in &config.specs {
                 println!("    • {} - {} msat/sec", spec.name, spec.rate_msats_per_sec);
             }
             println!();
-            println!("  {} Accepted mints:", "💰".to_string());
+            println!("  💰 Accepted mints:");
             for mint in &config.whitelisted_mints {
                 println!("    • {}", mint);
             }
             println!();
             println!(
-                "  {} Lightning sweep: {}",
-                "⚡".to_string(),
+                "  ⚡ Lightning sweep: {}",
                 config
                     .lightning_address
                     .as_deref()
@@ -822,7 +715,7 @@ async fn execute_status(_verbose: bool) -> Result<()> {
             );
             if config.tunnel_enabled {
                 println!();
-                println!("  {} Tunnel:", "🔒".to_string());
+                println!("  🔒 Tunnel:");
                 println!(
                     "    Interface: {}",
                     config.tunnel_interface.as_deref().unwrap_or("wg0")
@@ -831,12 +724,12 @@ async fn execute_status(_verbose: bool) -> Result<()> {
                 if let (Some(ps), Some(pe)) = (config.ssh_port_start, config.ssh_port_end) {
                     println!("    Port range: {}-{}", ps, pe);
                 }
-                // Check if WireGuard interface is up
                 let iface = config.tunnel_interface.as_deref().unwrap_or("wg0");
-                let wg_status = Command::new("wg").args(["show", iface]).output();
-                match wg_status {
-                    Ok(o) if o.status.success() => println!("    Status: {}", "UP".green()),
-                    _ => println!("    Status: {}", "DOWN".red()),
+                let wg_up = Command::new("wg").args(["show", iface]).output();
+                if matches!(&wg_up, Ok(o) if o.status.success()) {
+                    println!("    Status: {}", "UP".green());
+                } else {
+                    println!("    Status: {}", "DOWN".red());
                 }
             }
         }
@@ -868,7 +761,6 @@ async fn execute_config(args: ConfigArgs, _verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Check if the current process is running as root (uid 0).
 fn nix_is_root() -> bool {
     Command::new("id")
         .arg("-u")
@@ -882,13 +774,12 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     println!("{}", "━".repeat(50).blue());
     println!();
 
-    // Determine if we need sudo (non-root user)
     let need_sudo = !nix_is_root();
     let sudo: &[&str] = if need_sudo { &["sudo"] } else { &[] };
 
     let wg_conf_path = format!("/etc/wireguard/{}.conf", args.interface);
 
-    // Check if config already exists (use sudo to read since /etc/wireguard may be 700)
+    // /etc/wireguard is typically 0700, so probe via sudo when not root.
     let exists = if need_sudo {
         Command::new("sudo")
             .args(["test", "-f", &wg_conf_path])
@@ -908,7 +799,7 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         println!("  Delete it first if you want to re-provision.");
         println!();
 
-        // Still try to extract info and update provider config
+        // Still refresh the provider config from what's on disk.
         let config_content = if need_sudo {
             let out = Command::new("sudo").args(["cat", &wg_conf_path]).output()?;
             String::from_utf8_lossy(&out.stdout).to_string()
@@ -921,108 +812,10 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         return Ok(());
     }
 
-    // 1. Ensure WireGuard is installed
-    print!("  Checking WireGuard installation... ");
-    let wg_check = Command::new("which").arg("wg-quick").output();
-    match wg_check {
-        Ok(o) if o.status.success() => {
-            println!("{}", "OK".green());
-        }
-        _ => {
-            println!("{}", "not found, installing...".yellow());
-            let mut cmd_args: Vec<&str> = sudo.to_vec();
-            cmd_args.extend_from_slice(&[
-                "apt-get",
-                "install",
-                "-y",
-                "wireguard",
-                "wireguard-tools",
-            ]);
-            let prog = cmd_args.remove(0);
-            let install = Command::new(prog)
-                .args(&cmd_args)
-                .env("DEBIAN_FRONTEND", "noninteractive")
-                .output();
-            match install {
-                Ok(o) if o.status.success() => {
-                    println!("  {} WireGuard installed", "V".green());
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to install WireGuard. Install manually: sudo apt install wireguard wireguard-tools"
-                    ));
-                }
-            }
-        }
-    }
+    ensure_wireguard_installed(sudo)?;
+    let wg_config = fetch_vpn_config(&args).await?;
+    write_wg_config(&wg_config, &wg_conf_path, need_sudo)?;
 
-    // 2. Download WireGuard config from VPN service
-    print!("  Requesting VPN config from {}... ", args.vpn_url);
-    let client = reqwest::Client::new();
-    let version = env!("CARGO_PKG_VERSION");
-    let response = client
-        .get(&args.vpn_url)
-        .header("Authorization", format!("Cashu {}", args.token))
-        .header("User-Agent", format!("Paygress-CLI/{}", version))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        println!("{}", "FAILED".red());
-        return Err(anyhow::anyhow!(
-            "VPN service returned {}: {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        ));
-    }
-
-    let wg_config = response.text().await?;
-    println!("{}", "OK".green());
-
-    // 3. Validate config
-    if !wg_config.contains("[Interface]") {
-        println!(
-            "  {} Received invalid config (no [Interface] section)",
-            "X".red()
-        );
-        return Err(anyhow::anyhow!(
-            "Invalid WireGuard config received from VPN service"
-        ));
-    }
-    println!("  {} Config validated", "V".green());
-
-    // 4. Save config (use sudo tee to write to /etc/wireguard)
-    if need_sudo {
-        let mut mkdir = Command::new("sudo")
-            .args(["mkdir", "-p", "/etc/wireguard"])
-            .spawn()?;
-        mkdir.wait()?;
-
-        // Write config via sudo tee
-        let mut tee = Command::new("sudo")
-            .args(["tee", &wg_conf_path])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()?;
-        if let Some(ref mut stdin) = tee.stdin {
-            use std::io::Write;
-            stdin.write_all(wg_config.as_bytes())?;
-        }
-        tee.wait()?;
-
-        Command::new("sudo")
-            .args(["chmod", "600", &wg_conf_path])
-            .output()?;
-    } else {
-        std::fs::create_dir_all("/etc/wireguard")?;
-        std::fs::write(&wg_conf_path, &wg_config)?;
-        Command::new("chmod")
-            .args(["600", &wg_conf_path])
-            .output()?;
-    }
-    println!("  {} Saved to {}", "V".green(), wg_conf_path);
-
-    // 5. Parse tunnel details
     let (public_ip, port_start, port_end) = parse_wg_config(&wg_config)
         .ok_or_else(|| anyhow::anyhow!("Could not extract tunnel IP from WireGuard config"))?;
 
@@ -1031,27 +824,8 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         println!("  {} Port range: {}-{}", "V".green(), ps, pe);
     }
 
-    // 6. Start WireGuard interface
-    print!("  Starting WireGuard interface {}... ", args.interface);
-    let mut wg_args: Vec<&str> = sudo.to_vec();
-    wg_args.extend_from_slice(&["wg-quick", "up", &args.interface]);
-    let prog = wg_args.remove(0);
-    let output = Command::new(prog).args(&wg_args).output()?;
+    bring_interface_up(sudo, &args.interface)?;
 
-    if output.status.success() {
-        println!("{}", "UP".green());
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already exists") {
-            println!("{}", "ALREADY UP".yellow());
-        } else {
-            println!("{}", "FAILED".red());
-            println!("  {}", stderr.trim());
-            return Err(anyhow::anyhow!("Failed to start WireGuard interface"));
-        }
-    }
-
-    // 7. Enable on boot
     if need_sudo {
         let _ = Command::new("sudo")
             .args([
@@ -1067,7 +841,6 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     }
     println!("  {} Enabled on boot", "V".green());
 
-    // 8. Update provider config
     update_provider_tunnel_config(&args.interface, &public_ip, port_start, port_end)?;
 
     println!();
@@ -1089,10 +862,121 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Parse WireGuard config to extract public IP and port range.
-/// Returns (public_ip, optional_port_start, optional_port_end)
+fn ensure_wireguard_installed(sudo: &[&str]) -> Result<()> {
+    print!("  Checking WireGuard installation... ");
+    let installed = Command::new("which").arg("wg-quick").output();
+    if matches!(&installed, Ok(o) if o.status.success()) {
+        println!("{}", "OK".green());
+        return Ok(());
+    }
+
+    println!("{}", "not found, installing...".yellow());
+    let mut cmd_args: Vec<&str> = sudo.to_vec();
+    cmd_args.extend_from_slice(&["apt-get", "install", "-y", "wireguard", "wireguard-tools"]);
+    let prog = cmd_args.remove(0);
+    let install = Command::new(prog)
+        .args(&cmd_args)
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .output();
+    if !matches!(&install, Ok(o) if o.status.success()) {
+        anyhow::bail!(
+            "Failed to install WireGuard. Install manually: sudo apt install wireguard wireguard-tools"
+        );
+    }
+    println!("  {} WireGuard installed", "V".green());
+    Ok(())
+}
+
+async fn fetch_vpn_config(args: &TunnelArgs) -> Result<String> {
+    print!("  Requesting VPN config from {}... ", args.vpn_url);
+    let response = reqwest::Client::new()
+        .get(&args.vpn_url)
+        .header("Authorization", format!("Cashu {}", args.token))
+        .header(
+            "User-Agent",
+            format!("Paygress-CLI/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        println!("{}", "FAILED".red());
+        return Err(anyhow::anyhow!(
+            "VPN service returned {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+
+    let wg_config = response.text().await?;
+    println!("{}", "OK".green());
+
+    if !wg_config.contains("[Interface]") {
+        println!(
+            "  {} Received invalid config (no [Interface] section)",
+            "X".red()
+        );
+        anyhow::bail!("Invalid WireGuard config received from VPN service");
+    }
+    println!("  {} Config validated", "V".green());
+    Ok(wg_config)
+}
+
+fn write_wg_config(wg_config: &str, wg_conf_path: &str, need_sudo: bool) -> Result<()> {
+    if need_sudo {
+        Command::new("sudo")
+            .args(["mkdir", "-p", "/etc/wireguard"])
+            .spawn()?
+            .wait()?;
+
+        let mut tee = Command::new("sudo")
+            .args(["tee", wg_conf_path])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        if let Some(ref mut stdin) = tee.stdin {
+            use std::io::Write;
+            stdin.write_all(wg_config.as_bytes())?;
+        }
+        tee.wait()?;
+
+        Command::new("sudo")
+            .args(["chmod", "600", wg_conf_path])
+            .output()?;
+    } else {
+        std::fs::create_dir_all("/etc/wireguard")?;
+        std::fs::write(wg_conf_path, wg_config)?;
+        Command::new("chmod").args(["600", wg_conf_path]).output()?;
+    }
+    println!("  {} Saved to {}", "V".green(), wg_conf_path);
+    Ok(())
+}
+
+fn bring_interface_up(sudo: &[&str], interface: &str) -> Result<()> {
+    print!("  Starting WireGuard interface {}... ", interface);
+    let mut wg_args: Vec<&str> = sudo.to_vec();
+    wg_args.extend_from_slice(&["wg-quick", "up", interface]);
+    let prog = wg_args.remove(0);
+    let output = Command::new(prog).args(&wg_args).output()?;
+
+    if output.status.success() {
+        println!("{}", "UP".green());
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("already exists") {
+        println!("{}", "ALREADY UP".yellow());
+        return Ok(());
+    }
+    println!("{}", "FAILED".red());
+    println!("  {}", stderr.trim());
+    Err(anyhow::anyhow!("Failed to start WireGuard interface"))
+}
+
+/// Extract (public_ip, port_start, port_end) from a WireGuard config.
 fn parse_wg_config(config: &str) -> Option<(String, Option<u16>, Option<u16>)> {
-    // Extract public IP from Endpoint field (e.g., "Endpoint = 1.2.3.4:51820")
+    // "Endpoint = 1.2.3.4:51820"
     let public_ip = config
         .lines()
         .find(|l| l.trim().starts_with("Endpoint"))
@@ -1100,14 +984,13 @@ fn parse_wg_config(config: &str) -> Option<(String, Option<u16>, Option<u16>)> {
         .map(|v| v.trim().split(':').next().unwrap_or("").to_string())
         .filter(|s| !s.is_empty())?;
 
-    // Try to extract port range from comments (e.g., "# Public Ports: 1.2.3.4:11000-11999")
+    // "# Public Ports: 1.2.3.4:11000-11999"
     let (port_start, port_end) = config
         .lines()
         .find(|l| l.contains("Public Ports:") || l.contains("Port Range:"))
         .and_then(|l| {
-            // Extract "11000-11999" from the line
-            let re_part = l.split(':').last()?;
-            let range_str = re_part.trim().split(':').last()?.trim();
+            let re_part = l.split(':').next_back()?;
+            let range_str = re_part.trim().split(':').next_back()?.trim();
             let mut parts = range_str.split('-');
             let start: u16 = parts.next()?.trim().parse().ok()?;
             let end: u16 = parts.next()?.trim().parse().ok()?;
@@ -1118,7 +1001,6 @@ fn parse_wg_config(config: &str) -> Option<(String, Option<u16>, Option<u16>)> {
     Some((public_ip, port_start, port_end))
 }
 
-/// Update provider config with tunnel settings
 fn update_provider_tunnel_config(
     interface: &str,
     public_ip: &str,
@@ -1154,12 +1036,11 @@ fn update_provider_tunnel_config(
 #[cfg(test)]
 mod setup_multi_tests {
     use super::*;
-    use paygress::nostr::PodSpec;
 
     fn args(count: usize) -> SetupMultiArgs {
         SetupMultiArgs {
             count,
-            backend: paygress::provider::BackendType::Docker,
+            backend: BackendType::Docker,
             name: "test".to_string(),
             mints: "https://testnut.cashu.space".to_string(),
             public_ip: Some("203.0.113.1".to_string()),
@@ -1187,8 +1068,6 @@ mod setup_multi_tests {
             );
             ranges.push((cfg.vmid_range_start, cfg.vmid_range_end));
         }
-        // No overlap between any pair: either a is fully below b
-        // or b is fully below a.
         for (i, (a_lo, a_hi)) in ranges.iter().enumerate() {
             for (j, (b_lo, b_hi)) in ranges.iter().enumerate() {
                 if i == j {
@@ -1235,8 +1114,6 @@ mod setup_multi_tests {
 
     #[test]
     fn config_path_is_filesystem_safe() {
-        // No whitespace, no dots in the prefix-name slot. The
-        // name="test" + i=2 should produce a clean path.
         let path = config_path_for("test", 2);
         assert_eq!(path, "/etc/paygress/provider-test-2.json");
     }
