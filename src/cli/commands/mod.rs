@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod bootstrap;
+pub mod ci;
 pub mod deploy;
 pub mod exec;
 pub mod identity;
@@ -12,3 +13,4 @@ pub mod spawn;
 pub mod status;
 pub mod system;
 pub mod topup;
+pub mod wallet;

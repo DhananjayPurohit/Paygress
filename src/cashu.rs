@@ -353,6 +353,90 @@ pub async fn split_token_into_n(
     Ok(tokens)
 }
 
+/// Mint a fresh token worth `amount_sats` from `mint_url`.
+///
+/// Built for CI funding against a testnut-style mint whose fake
+/// Lightning backend auto-pays quotes — the poll loop below settles in
+/// one or two rounds there. Against a real mint the quote stays
+/// `Unpaid` until someone pays the bolt11 invoice out-of-band, so the
+/// timeout fires; that path is deliberately unsupported here (an
+/// unattended CI job has no way to pay an invoice).
+///
+/// Same ephemeral-wallet convention as `split_token_into_n`: throwaway
+/// redb at `db_path`, random seed, nothing persisted worth keeping.
+/// The minted proofs are wrapped directly in a `Token` rather than
+/// round-tripped through `prepare_send` — that would re-swap at the
+/// mint for no benefit and can shave fees off the face value.
+pub async fn mint_fresh_token(
+    mint_url: &str,
+    amount_sats: u64,
+    db_path: &Path,
+) -> Result<String, anyhow::Error> {
+    use cdk::amount::SplitTarget;
+    use cdk::nuts::MintQuoteState;
+    use rand::RngCore;
+
+    if amount_sats == 0 {
+        anyhow::bail!("cannot mint a zero-value token");
+    }
+
+    let db = cdk_redb::wallet::WalletRedbDatabase::new(db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open ephemeral wallet db at {}: {}",
+            db_path.display(),
+            e
+        )
+    })?;
+    let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
+
+    let mut seed = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut seed);
+
+    let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, db, seed, None)
+        .map_err(|e| anyhow::anyhow!("wallet construction failed: {}", e))?;
+
+    let quote = wallet
+        .mint_quote(Amount::from(amount_sats), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("mint quote request to {} failed: {}", mint_url, e))?;
+
+    // Poll until the mint reports the quote paid. 15 × 2s covers a
+    // slow testnut round-trip with margin; a real mint never gets
+    // there (see doc comment).
+    const POLL_ATTEMPTS: u32 = 15;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut paid = false;
+    for _ in 0..POLL_ATTEMPTS {
+        let state = wallet
+            .mint_quote_state(&quote.id)
+            .await
+            .map_err(|e| anyhow::anyhow!("mint quote status check failed: {}", e))?;
+        if state.state == MintQuoteState::Paid {
+            paid = true;
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    if !paid {
+        anyhow::bail!(
+            "mint quote at {} not paid after {}s — is this a testnut-style mint \
+             that auto-pays quotes? Real mints need the invoice paid out-of-band.",
+            mint_url,
+            POLL_ATTEMPTS as u64 * POLL_INTERVAL.as_secs(),
+        );
+    }
+
+    let proofs = wallet
+        .mint(&quote.id, SplitTarget::default(), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("minting proofs failed: {}", e))?;
+
+    let parsed_url = MintUrl::from_str(mint_url)
+        .map_err(|e| anyhow::anyhow!("invalid mint URL {}: {}", mint_url, e))?;
+    let token = Token::new(parsed_url, proofs, None, CurrencyUnit::Sat);
+    Ok(token.to_string())
+}
+
 /// Face-value parser for the HTTP+ngx_l402 path.
 ///
 /// Returns the sum of `proof.amount` from a decoded token in msats,
