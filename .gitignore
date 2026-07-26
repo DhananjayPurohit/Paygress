@@ -13,3 +13,5 @@ data/
 
 # Keep template files
 !*.env.template
+# Claude Code agent worktrees (local only)
+.claude/worktrees/
