@@ -35,6 +35,12 @@ on:
 permissions:
   contents: read
 
+# Superseded pushes cancel: every spawn costs a lease, and an
+# abandoned run's box stays rented until expiry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -68,6 +74,8 @@ jobs:
             --amount "${{ vars.PAYGRESS_CI_SATS }}")
           echo "::add-mask::$TOKEN"
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      # Secrets go through env, not argv: Actions writes the step's
+      # command line to a script on disk and into the process table.
       # PAYGRESS_CI_IMAGE names a prebaked image on the provider
       # (runner + rust toolchain preinstalled — cuts ~3 min of
       # provisioning). Unset, it falls back to a stock image that the
@@ -75,6 +83,8 @@ jobs:
       # itself off when its one job ends, releasing the lease's
       # compute early.
       - name: Rent runner
+        env:
+          GITHUB_TOKEN: ${{ secrets.CI_RUNNER_PAT }}
         run: |
           ./target/debug/paygress-cli ci runner \
             --repo "${{ github.repository }}" \
@@ -83,8 +93,7 @@ jobs:
             --token "$TOKEN" \
             --image "${{ vars.PAYGRESS_CI_IMAGE || 'ubuntu:24.04' }}" \
             --labels "self-hosted,paygress,run-${{ github.run_id }}-${{ matrix.target }}" \
-            --skip-docker \
-            --github-token "${{ secrets.CI_RUNNER_PAT }}"
+            --skip-docker
 
   test:
     name: Test
@@ -92,7 +101,11 @@ jobs:
     runs-on: [self-hosted, paygress, "run-${{ github.run_id }}-test"]
     timeout-minutes: 90
     steps:
+      # persist-credentials: false — the job token would otherwise sit
+      # in .git/config on rented compute for the job's duration.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # No-ops on the prebaked image; installs from scratch on a
       # stock one. The workload runs as root: no sudo.
       - name: Install system dependencies
@@ -105,7 +118,13 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
               sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # save-if: false — restore-only. A cache written from rented
+      # compute is a persistence channel that outlives the "one job,
+      # then gone" runner: poisoned build scripts and proc-macros
+      # would be restored (and executed) by later jobs.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - name: cargo test --all-features
         run: cargo test --all-features
 
@@ -120,6 +139,8 @@ jobs:
     # docs/solutions/patterns/critical-patterns.md for the staging.
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install system dependencies
         run: |
           command -v cc >/dev/null || \
@@ -133,6 +154,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" component add clippy 2>/dev/null || true
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - name: cargo clippy (advisory)
         run: cargo clippy --all-targets --all-features
 
@@ -180,3 +203,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
       - name: cargo clippy (advisory)
         run: cargo clippy --all-targets --all-features
+
+  # The single required check. Without it, a provider outage skips
+  # `test` — and a skipped required check reads as green, i.e. the
+  # tests silently never ran. Skipped counts as failure here; only
+  # the fork/non-fork pair that was supposed to run may be skipped.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [fmt, test, clippy, test-fork, clippy-fork]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require tests to have actually run
+        run: |
+          fmt='${{ needs.fmt.result }}'
+          own='${{ needs.test.result }}'
+          fork='${{ needs.test-fork.result }}'
+          echo "fmt=$fmt test=$own test-fork=$fork"
+          [ "$fmt" = success ] || { echo "::error::rustfmt did not pass"; exit 1; }
+          # Exactly one of the two test paths runs per event.
+          if [ "$own" = success ] || [ "$fork" = success ]; then
+            echo "test suite ran and passed"
+          else
+            echo "::error::no test job succeeded (provider outage or test failure)"
+            exit 1
+          fi

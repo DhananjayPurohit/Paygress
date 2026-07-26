@@ -209,10 +209,24 @@ impl ComputeBackend for LxdBackend {
         Ok(())
     }
 
+    /// Idempotent: `lxc stop` exits non-zero on an already-stopped
+    /// instance, which is a normal state here — CI workloads power
+    /// themselves off when their job ends. Treating that as an error
+    /// would strand the container, since the cleanup path only
+    /// deletes after a successful stop.
     async fn stop_container(&self, id: u32) -> Result<()> {
         let name = format!("paygress-{}", id);
-        self.run_lxc(&["stop", &name])?;
-        Ok(())
+        match self.run_lxc(&["stop", &name]) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("already stopped") || msg.contains("not running") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn delete_container(&self, id: u32) -> Result<()> {

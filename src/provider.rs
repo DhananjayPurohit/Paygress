@@ -907,11 +907,16 @@ impl ProviderService {
                 info!("Cleaning up expired workload: {}", vmid);
 
                 if let Some(_workload) = workloads.remove(&vmid) {
+                    // Delete unconditionally: the workload is already
+                    // out of the map, so a failed stop that skipped
+                    // the delete would leak the container AND its
+                    // vmid forever, with no retry. `delete --force`
+                    // handles running and stopped alike.
                     let stop_result = self.backend.stop_container(vmid).await;
-                    let result = match stop_result {
-                        Ok(_) => self.backend.delete_container(vmid).await,
-                        Err(e) => Err(e),
-                    };
+                    if let Err(e) = &stop_result {
+                        warn!("stop failed for {} ({}), deleting anyway", vmid, e);
+                    }
+                    let result = self.backend.delete_container(vmid).await;
 
                     // Untrack from the state machine regardless of
                     // backend stop/delete success — the lease is over,
