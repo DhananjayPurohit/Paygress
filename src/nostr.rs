@@ -12,62 +12,37 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-// Custom event kinds for Paygress provider discovery.
-//
-// `KIND_PROVIDER_OFFER` (38383) is a NIP-33 parameterized-replaceable
-// event keyed by `(pubkey, kind, d-tag)`. We use a versioned `d` tag
-// (`paygress:offer:v1:<npub>`) so future schema bumps can coexist on
-// the same relay without overwriting v1 events.
-//
-// Heartbeats use TWO kinds (Unit 4 of the 12-month plan):
-// - `KIND_PROVIDER_HEARTBEAT` (38384): NIP-33 addressable. We publish
-//   with a *bucketed* `d` tag
-//   (`paygress:heartbeat:v1:<npub>:<minute-bucket>`) so distinct
-//   minutes coexist on the relay and stored history is queryable for
-//   uptime aggregation. This fixes the original "addressable replaces
-//   each heartbeat" bug where `calculate_uptime` saw only one event.
-// - `KIND_PROVIDER_HEARTBEAT_EPHEMERAL` (20384): NIP-16 ephemeral.
-//   Relays do not store these, so they're cheap for live-presence
-//   subscribers but useless for uptime history. We publish on both.
+/// NIP-33 parameterized-replaceable, `d = paygress:offer:v1:<npub>`.
 pub const KIND_PROVIDER_OFFER: u16 = 38383;
+/// NIP-33 addressable heartbeat. The `d` tag is bucketed per minute
+/// (`paygress:heartbeat:v1:<npub>:<bucket>`) so heartbeats accumulate as
+/// queryable history instead of each one replacing the last.
 pub const KIND_PROVIDER_HEARTBEAT: u16 = 38384;
+/// NIP-16 ephemeral heartbeat. Relays do not store these, so they serve live
+/// presence only; both kinds are published on every beat.
 pub const KIND_PROVIDER_HEARTBEAT_EPHEMERAL: u16 = 20384;
-/// Lease revocation event (Unit 5 wiring). Published by a primary
-/// provider when its workload state machine emits
-/// `PublishLeaseRevocation` — i.e. the local state has left `Live`
-/// for a `WarmStandby` workload. Addressable so a standby that came
-/// online after the publish can still find it on cold start. The
-/// `d` tag is `paygress:revocation:v1:<primary_npub>:<workload_id>`
-/// and each standby is added as a `#p` tag for filterable subscriptions.
+/// Lease revocation, published by a primary whose `WarmStandby` workload has
+/// left `Live`. Addressable (`d = paygress:revocation:v1:<primary>:<workload>`)
+/// so a standby that comes online later still sees it; each standby is added as
+/// a `#p` tag for filterable subscriptions.
 pub const KIND_LEASE_REVOCATION: u16 = 38385;
-
-/// Published by a standby provider IMMEDIATELY after it finishes
-/// promoting a workload to local primary. Other standbys for the
-/// same workload check for one of these events before claiming
-/// their own slot, so only the lowest-indexed standby that wins
-/// the promotion race actually spawns a container — the rest see
-/// the announcement and drop their slot. NIP-33 addressable: the
-/// `d` tag is `paygress:promoted:v1:<workload_id>`, so subsequent
-/// announcements for the same workload (e.g. a re-failover) replace
-/// the previous one rather than accumulating.
+/// Published by a standby right after it promotes itself to primary. Peers
+/// check for one of these before claiming their own slot, so only the winner of
+/// the promotion race spawns a container. Addressable on
+/// `d = paygress:promoted:v1:<workload_id>`.
 pub const KIND_STANDBY_PROMOTION_ANNOUNCEMENT: u16 = 38386;
 
-/// Schema version for offer + heartbeat payloads. Old payloads
-/// without this field deserialize to `1` via `#[serde(default)]`.
+/// Schema version for offer + heartbeat payloads. Old payloads without this
+/// field deserialize to `1` via `#[serde(default)]`.
 pub const SCHEMA_VERSION: u8 = 1;
 
-/// Live-presence query window. Ephemeral heartbeats are not stored
-/// at relays, so any "is this provider alive right now?" query is
-/// implicitly bounded to whatever subscribers were live recently.
-/// Stored heartbeats can be queried over arbitrary windows; this
-/// constant only governs the ephemeral / fast-path lookups.
+/// Window for "is this provider alive right now?" lookups.
 pub const LIVE_HEARTBEAT_WINDOW_SECS: u64 = 300;
 
-/// Heartbeat bucket size for the addressable (stored) kind. One
-/// bucket per minute matches the 60s heartbeat cadence: every
-/// heartbeat lands in its own `(npub, kind, d-tag)` slot, so relays
-/// preserve history for uptime aggregation.
+/// Heartbeat `d`-tag bucket size, matching the 60s heartbeat cadence so every
+/// beat lands in its own `(npub, kind, d-tag)` slot.
 pub const HEARTBEAT_BUCKET_SECS: u64 = 60;
+
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub relays: Vec<String>,
@@ -83,37 +58,28 @@ pub struct NostrEvent {
     pub tags: Vec<Vec<String>>,
     pub content: String,
     pub sig: String,
-    pub message_type: String, // "nip04" or "nip17" to track which method was used
+    /// `nip04`, `nip17`, or `lease_revocation`.
+    pub message_type: String,
 }
 
 #[derive(Clone)]
 pub struct NostrRelaySubscriber {
     client: Client,
     keys: Keys,
-    // config field removed - not used in current implementation
 }
 
 impl NostrRelaySubscriber {
     pub async fn new(config: RelayConfig) -> Result<Self> {
         let keys = match &config.private_key {
-            Some(private_key_hex) if !private_key_hex.is_empty() => {
-                // Parse as nsec format (nostr private key)
-                if private_key_hex.starts_with("nsec1") {
-                    Keys::parse(private_key_hex).context("Invalid nsec private key format")?
-                } else {
-                    // Assume hex format for backward compatibility
-                    Keys::parse(private_key_hex).context("Invalid private key format")?
-                }
+            // `Keys::parse` accepts both nsec and raw hex.
+            Some(private_key) if !private_key.is_empty() => {
+                Keys::parse(private_key).context("Invalid private key format")?
             }
-            _ => {
-                // Generate a new key if none provided
-                Keys::generate()
-            }
+            _ => Keys::generate(),
         };
 
         let client = Client::new(keys.clone());
 
-        // Add relays
         for relay_url in &config.relays {
             info!("Adding relay: {}", relay_url);
             client
@@ -125,7 +91,7 @@ impl NostrRelaySubscriber {
         info!("Connecting to {} relays...", config.relays.len());
         client.connect().await;
 
-        // Wait a moment for connections to establish
+        // `connect()` returns before the sockets are up.
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
         info!("Connected to {} relays", config.relays.len());
@@ -148,22 +114,17 @@ impl NostrRelaySubscriber {
             + Sync
             + 'static,
     {
-        // Subscribe to messages sent TO us (filter by p-tag)
+        // `pubkeys` sets the #p tag, i.e. messages addressed to us.
         let nip04_filter = Filter::new()
             .kind(Kind::EncryptedDirectMessage)
-            .pubkeys(vec![self.keys.public_key()]) // Sets #p tag
+            .pubkeys(vec![self.keys.public_key()])
             .limit(0);
 
         let nip17_filter = Filter::new()
             .kind(Kind::GiftWrap)
-            .pubkeys(vec![self.keys.public_key()]) // Sets #p tag
+            .pubkeys(vec![self.keys.public_key()])
             .limit(0);
 
-        // Lease revocation events (Unit 5 — standby-side promotion).
-        // Public events (no encryption); a primary publishes them
-        // addressed to the standby_providers via #p tags. The standby's
-        // listener filters by its own pubkey to receive only events
-        // addressed to it.
         let revocation_filter = Filter::new()
             .kind(Kind::Custom(KIND_LEASE_REVOCATION))
             .pubkeys(vec![self.keys.public_key()])
@@ -174,7 +135,6 @@ impl NostrRelaySubscriber {
         let _ = self.client.subscribe(revocation_filter, None).await;
         info!("Subscribed to NIP-04 / NIP-17 messages and KIND_LEASE_REVOCATION events addressed to this provider");
 
-        // Handle incoming events
         self.client.handle_notifications(|notification| async {
             if let RelayPoolNotification::Event { relay_url: _, subscription_id: _, event } = notification {
                 match event.kind {
@@ -186,11 +146,9 @@ impl NostrRelaySubscriber {
                             Ok(UnwrappedGift { rumor, sender }) => {
                                 info!("Unwrapped Gift Wrap from sender: {}, rumor kind: {}", sender, rumor.kind);
 
-                                // Check if the rumor is a private direct message
                                 if rumor.kind == Kind::PrivateDirectMessage {
                                     debug!("NIP-17 rumor is PrivateDirectMessage. Content length: {}", rumor.content.len());
 
-                                    // Create a NostrEvent from the unwrapped rumor with NIP-17 flag
                                     let nostr_event = NostrEvent {
                                         id: rumor.id.map(|id| id.to_hex()).unwrap_or_else(|| "unknown".to_string()),
                                         pubkey: rumor.pubkey.to_hex(),
@@ -200,8 +158,8 @@ impl NostrRelaySubscriber {
                                             tag.as_slice().iter().map(|s| s.to_string()).collect()
                                         }).collect(),
                                         content: rumor.content,
-                                        sig: "unsigned".to_string(), // UnsignedEvent doesn't have a signature
-                                        message_type: "nip17".to_string(), // Flag to indicate NIP-17
+                                        sig: "unsigned".to_string(), // rumors are unsigned by construction
+                                        message_type: "nip17".to_string(),
                                     };
 
                                     match handler(nostr_event).await {
@@ -272,10 +230,8 @@ impl NostrRelaySubscriber {
                         }
                     }
                     Kind::Custom(k) if k == KIND_LEASE_REVOCATION => {
-                        // Lease revocation events are public — no
-                        // decryption. Build a NostrEvent with the
-                        // raw content; the handler dispatches by
-                        // kind and parses with parse_revocation_event.
+                        // Public events — no decryption; the handler dispatches
+                        // by kind and parses with parse_revocation_event.
                         info!("Received lease revocation event: {}", event.id);
                         let nostr_event = NostrEvent {
                             id: event.id.to_hex(),
@@ -308,37 +264,8 @@ impl NostrRelaySubscriber {
         Ok(())
     }
 
-    pub async fn publish_offer(&self, offer: OfferEventContent) -> Result<String> {
-        let content = serde_json::to_string(&offer)?;
-        info!("Publishing offer event with content: {}", content);
-
-        let tags = vec![Tag::hashtag("paygress"), Tag::hashtag("offer")];
-
-        info!("Creating event with kind 999 and {} tags", tags.len());
-        let event = EventBuilder::new(Kind::Custom(999), content)
-            .tags(tags)
-            .sign_with_keys(&self.keys)?;
-        let event_id = event.id.to_hex();
-
-        info!("Event created with ID: {}", event_id);
-        info!("Sending offer event to relays: {}", event_id);
-
-        match self.client.send_event(&event).await {
-            Ok(res) => {
-                info!(
-                    "✅ Successfully published offer event: {} and {:?}",
-                    event_id, res
-                );
-                Ok(event_id)
-            }
-            Err(e) => {
-                error!("❌ Failed to send offer event: {}", e);
-                Err(e.into())
-            }
-        }
-    }
-
-    // Generic method to send an encrypted private message (supports both NIP-04 and NIP-17)
+    /// Send an encrypted DM. `message_type` selects NIP-04; anything else
+    /// (including `"nip17"`) uses NIP-17.
     pub async fn send_encrypted_private_message(
         &self,
         receiver_pubkey: &str,
@@ -362,8 +289,7 @@ impl NostrRelaySubscriber {
                 info!("Sent NIP-04 message to {}: {:?}", receiver_pubkey, event_id);
                 Ok(event_id.val.to_hex())
             }
-            "nip17" | _ => {
-                // Default to NIP-17 if not specified or nip17
+            _ => {
                 let event_id = self
                     .client
                     .send_private_msg(receiver_pubkey_parsed, content, [])
@@ -374,7 +300,6 @@ impl NostrRelaySubscriber {
         }
     }
 
-    // Send access details via private encrypted message
     pub async fn send_access_details_private_message(
         &self,
         request_pubkey: &str,
@@ -386,7 +311,6 @@ impl NostrRelaySubscriber {
             .await
     }
 
-    // Send status response via private encrypted message
     pub async fn send_status_response(
         &self,
         request_pubkey: &str,
@@ -398,7 +322,6 @@ impl NostrRelaySubscriber {
             .await
     }
 
-    // Convenience helper to send error response with individual fields
     pub async fn send_error_response(
         &self,
         request_pubkey: &str,
@@ -416,7 +339,6 @@ impl NostrRelaySubscriber {
             .await
     }
 
-    // Send error response via private encrypted message
     pub async fn send_error_response_private_message(
         &self,
         request_pubkey: &str,
@@ -428,7 +350,6 @@ impl NostrRelaySubscriber {
             .await
     }
 
-    // Send top-up response via private encrypted message
     pub async fn send_topup_response_private_message(
         &self,
         request_pubkey: &str,
@@ -440,31 +361,12 @@ impl NostrRelaySubscriber {
             .await
     }
 
-    // Get the underlying Nostr client
     pub fn client(&self) -> &Client {
         &self.client
     }
 
-    // NEW: Get service public key for users
     pub fn get_service_public_key(&self) -> String {
         self.keys.public_key().to_hex()
-    }
-
-    fn convert_event(&self, event: &nostr_sdk::Event) -> NostrEvent {
-        NostrEvent {
-            id: event.id.to_hex(),
-            pubkey: event.pubkey.to_hex(),
-            created_at: event.created_at.as_u64(),
-            kind: event.kind.as_u16() as u32,
-            tags: event
-                .tags
-                .iter()
-                .map(|tag| tag.as_slice().iter().map(|s| s.to_string()).collect())
-                .collect(),
-            content: event.content.clone(),
-            sig: event.sig.to_string(),
-            message_type: "unknown".to_string(),
-        }
     }
 
     /// Wait for a private decrypted message from a specific sender
@@ -482,17 +384,11 @@ impl NostrRelaySubscriber {
         let receiver_keys = self.keys.clone();
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
 
-        // Subscribe to messages sent TO us. Constrain to events
-        // published AFTER subscription start: relays deliver
-        // historical events matching a subscription filter alongside
-        // new ones, so without `since` we'd match old DMs from prior
-        // sessions (e.g. an `AccessDetailsContent` for a different
-        // workload_id from yesterday's test) before the actual
-        // response to the spawn we just sent. The 60s back-off
-        // accommodates clock skew between consumer and relays —
-        // relays MAY reject `since` values too far in the future,
-        // and a small lookback covers the case where the provider
-        // has already responded by the time we subscribe.
+        // `since` is required: relays replay historical events matching a
+        // filter, so without it we'd match a stale DM from a previous session
+        // instead of the response to the request we just sent. The 60s
+        // lookback absorbs consumer/relay clock skew and covers a provider
+        // that already replied before we subscribed.
         let subscribe_since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -505,12 +401,10 @@ impl NostrRelaySubscriber {
 
         let _ = client.subscribe(filter, None).await;
 
-        // Use tokio::select to handle timeout and notification processing
-        let result = tokio::select! {
+        tokio::select! {
             notification_res = client.handle_notifications(|notification| {
                 let tx = tx.clone();
                 let receiver_keys = receiver_keys.clone();
-                let sender_pk = sender_pk.clone();
                 let client = client.clone();
 
                 async move {
@@ -519,7 +413,6 @@ impl NostrRelaySubscriber {
 
                         match event.kind {
                             Kind::GiftWrap => {
-                                // GiftWrap might be NIP-17
                                 if let Ok(UnwrappedGift { rumor, sender }) = client.unwrap_gift_wrap(&event).await {
                                     if sender == sender_pk && rumor.kind == Kind::PrivateDirectMessage {
                                         event_to_send = Some(NostrEvent {
@@ -574,9 +467,7 @@ impl NostrRelaySubscriber {
             _ = tokio::time::sleep(timeout) => {
                 Err(anyhow::anyhow!("Timeout waiting for response from {}", sender_pubkey))
             }
-        };
-
-        result
+        }
     }
 }
 
@@ -600,69 +491,57 @@ pub fn custom_relay_config(relays: Vec<String>, private_key: Option<String>) -> 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodSpec {
-    pub id: String, // Unique identifier for this spec (e.g., "basic", "standard", "premium")
-    pub name: String, // Human-readable name (e.g., "Basic", "Standard", "Premium")
-    pub description: String, // Description of the spec
-    pub cpu_millicores: u64, // CPU in millicores (1000 millicores = 1 CPU core)
-    pub memory_mb: u64, // Memory in MB
-    pub rate_msats_per_sec: u64, // Payment rate for this spec
+    /// Spec identifier, e.g. `basic`, `standard`, `premium`.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub cpu_millicores: u64,
+    pub memory_mb: u64,
+    pub rate_msats_per_sec: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OfferEventContent {
-    pub minimum_duration_seconds: u64,
-    pub whitelisted_mints: Vec<String>,
-    pub pod_specs: Vec<PodSpec>, // Multiple pod specifications offered
-}
-
-/// One workload-port that a template-spawned container exposes to the
-/// consumer. Distinct from `AccessDetailsContent.node_port` (the SSH
-/// forwarding port). Empty for non-template spawns.
+/// One workload port a template-spawned container exposes. Distinct from
+/// `AccessDetailsContent.node_port`, which is the SSH forwarding port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateAccessPort {
-    /// Host port the consumer connects to.
     pub host_port: u16,
-    /// Container-internal port (informational; for the consumer to
-    /// understand what's running).
     pub container_port: u16,
     /// Wire protocol (`tcp`, `http`, `ws`, `bitcoin-rpc`, ...).
     pub protocol: String,
-    /// Human-readable label from the template definition
-    /// (e.g. `relay-ws`, `ollama-http`, `rpc`). Lets clients route
-    /// traffic by role rather than guessing port-by-port.
+    /// Role label from the template definition (`relay-ws`, `rpc`, ...) so
+    /// clients can route by role rather than guessing port-by-port.
     pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessDetailsContent {
-    pub pod_npub: String,             // Pod's NPUB identifier
-    pub node_port: u16,               // SSH port for direct access
-    pub expires_at: String,           // Pod expiration time
-    pub cpu_millicores: u64,          // CPU allocation in millicores
-    pub memory_mb: u64,               // Memory allocation in MB
-    pub pod_spec_name: String,        // Human-readable spec name
-    pub pod_spec_description: String, // Spec description
-    pub instructions: Vec<String>,    // SSH connection instructions
+    pub pod_npub: String,
+    /// SSH port for direct access.
+    pub node_port: u16,
+    pub expires_at: String,
+    pub cpu_millicores: u64,
+    pub memory_mb: u64,
+    pub pod_spec_name: String,
+    pub pod_spec_description: String,
+    pub instructions: Vec<String>,
 
-    /// Host address the consumer connects to. Same string that
-    /// appears in the SSH instruction; promoted to a structured
-    /// field so programmatic clients don't have to scrape the
-    /// instruction strings.
+    /// Host address the consumer connects to, so programmatic clients don't
+    /// have to scrape `instructions`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host_address: String,
 
-    /// Workload-specific ports published by a template spawn.
-    /// Empty for non-template (legacy) spawns. Old clients without
-    /// this field continue to deserialize cleanly.
+    /// Empty for non-template spawns; old clients without the field still
+    /// deserialize cleanly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub template_ports: Vec<TemplateAccessPort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponseContent {
-    pub error_type: String, // Type of error (e.g., "insufficient_payment", "invalid_spec", "image_not_found")
-    pub message: String,    // Human-readable error message
-    pub details: Option<String>, // Additional error details
+    /// e.g. `insufficient_payment`, `invalid_spec`, `image_not_found`.
+    pub error_type: String,
+    pub message: String,
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,114 +553,67 @@ pub struct TopUpResponseContent {
     pub message: String,
 }
 
-// NEW: Encrypted request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedSpawnPodRequest {
     pub cashu_token: String,
-    pub pod_spec_id: Option<String>, // Optional: Which pod spec to use (defaults to first available)
-    pub pod_image: String,           // Required: Container image to use for the pod
+    /// Defaults to the provider's first spec when absent.
+    pub pod_spec_id: Option<String>,
+    pub pod_image: String,
     pub ssh_username: String,
     pub ssh_password: String,
 
-    /// Optional template slug. When set, the provider materializes
-    /// the workload's image / ports / env from its OWN local
-    /// template registry (`paygress::templates`) rather than
-    /// trusting consumer-supplied bytes — so a consumer cannot
-    /// smuggle an arbitrary image past the provider's vetted
-    /// list. `pod_image` is ignored when `template_slug` resolves.
-    /// Old clients that don't set this field continue to work
-    /// (`#[serde(default)]`).
+    /// When set, the provider materializes image / ports / env from its own
+    /// local template registry rather than trusting consumer-supplied bytes,
+    /// so a consumer cannot smuggle an arbitrary image past the vetted list.
+    /// `pod_image` is ignored when this resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_slug: Option<String>,
 
-    /// Replication mode requested by the consumer (Unit 5 wiring
-    /// completion). Old clients that don't set this field default to
-    /// `ReplicationMode::None` — same shape as before, no behavior
-    /// change for unspecified spawns.
-    ///
-    /// `WarmStandby { standby_providers }` is the load-bearing
-    /// variant: the consumer sends the SAME spawn request to every
-    /// provider in the standby set; each provider determines its own
-    /// role (primary if it is not in the standby list, standby
-    /// otherwise) and the orchestrator coordinates failover via the
-    /// `LeaseRevocation` event published by #34's wiring.
+    /// For `WarmStandby`, the consumer sends the *same* request to every
+    /// provider in the set; each self-determines its role from
+    /// `primary_npub` / `standby_providers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication: Option<crate::durable_workload::ReplicationMode>,
 
-    /// Primary provider's npub. Required when `replication` is
-    /// `WarmStandby`; ignored otherwise. Lets each receiving
-    /// provider self-determine its role: if `self.npub == primary_npub`
-    /// it acts as the primary (spawns + heartbeats); otherwise (and
-    /// only if it is in `standby_providers`) it acts as a standby
-    /// (reserves a slot, listens for revocations, promotes on signal).
+    /// Required when `replication` is `WarmStandby`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_npub: Option<String>,
 
-    /// Consumer-assigned workload identifier (UUID-shaped string).
-    /// Required when `replication` is `WarmStandby` so the primary
-    /// and N standbys share one stable id across providers — the
-    /// `LeaseRevocation` event uses this id, and the standby looks
-    /// up its reserved slot by it on receipt. Single-provider spawns
-    /// can leave this unset; the provider derives a vmid-based id
-    /// internally.
+    /// Consumer-assigned identifier shared by the primary and all standbys, so
+    /// a `LeaseRevocation` names one workload across providers. Unset for
+    /// single-provider spawns, where the provider derives a vmid-based id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_id: Option<String>,
 
-    /// Optional encryption key for the workload's persistent data
-    /// volume. When set, the provider creates a LUKS-encrypted
-    /// volume (instead of a plain one) for `template.data_path` and
-    /// destroys the volume header on tenancy end so post-eviction
-    /// disk forensics reveal only ciphertext.
+    /// When set, the provider gives `template.data_path` a LUKS-encrypted
+    /// volume and destroys the header at tenancy end, so post-eviction disk
+    /// forensics reveal only ciphertext. This protects against cold-disk
+    /// access, not against a live host reading process memory or the kernel
+    /// keyring — that needs a confidential VM (`attested-research-tier`).
     ///
-    /// Threat model: protects against post-eviction snooping, lazy
-    /// host-operator backups, co-tenant attacks on shared storage,
-    /// and cold-disk forensics if the host is seized. Does NOT
-    /// protect against a live host with `CAP_SYS_PTRACE` reading
-    /// /proc/<pid>/mem or extracting the LUKS key from the kernel
-    /// keyring while the workload runs — that requires hardware
-    /// confidential VMs (SEV-SNP / TDX), which the
-    /// `attested-research-tier` `IsolationLevel` is reserved for.
-    ///
-    /// The key travels inside this Nostr DM, which is itself
-    /// NIP-04 / NIP-17 encrypted to the provider's pubkey, so it is
-    /// never visible on relays or in transit. The provider holds it
-    /// only in memory while the workload runs.
-    ///
-    /// Old clients that don't set this field get plain volumes —
-    /// same shape as before, no behavior change for unspecified
-    /// spawns.
+    /// The key rides inside the NIP-04/NIP-17-encrypted DM, so it is never
+    /// visible on relays, and the provider holds it only in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_encryption: Option<VolumeEncryption>,
 }
 
 /// Wire-format request to encrypt the workload's data volume.
 ///
-/// The `key_b64` is a 32-byte symmetric key, base64-encoded
-/// (URL-safe, no padding). Provider feeds it to `cryptsetup
-/// luksFormat` as a passphrase (raw bytes, no hashing on top).
-///
-/// `algorithm` is a forward-compat tag so a future schema bump can
-/// introduce e.g. `xchacha20-poly1305` or hardware-attested keying
-/// without breaking existing requests. v1 supports `luks2-aes-xts`
-/// only; providers reject unknown algorithms with a structured
-/// `UnsupportedVolumeEncryption` error so old providers seeing a
-/// future-algorithm request fail loud rather than silently fall
-/// back to plain volumes.
+/// `algorithm` is a forward-compat tag: v1 accepts `luks2-aes-xts` only, and
+/// providers reject unknown algorithms loudly rather than silently falling back
+/// to a plain volume.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeEncryption {
-    /// Schema version. v1 = LUKS2 + AES-XTS-Plain64, key supplied
-    /// directly. Bump for new key-derivation flows (e.g. attested
-    /// key release from a TPM / TEE).
+    /// v1 = LUKS2 + AES-XTS-Plain64 with the key supplied directly. Bump for
+    /// new key-derivation flows (e.g. attested key release from a TPM/TEE).
     #[serde(default = "volume_encryption_default_version")]
     pub version: u8,
 
-    /// Algorithm tag. v1 only accepts `luks2-aes-xts`.
     pub algorithm: String,
 
-    /// 32-byte key, base64 (URL-safe, unpadded). Consumer derives
-    /// from a stable secret + workload_id so the same key recurs
-    /// on respawn / standby promotion (the standby decrypts the
-    /// checkpoint with it).
+    /// 32-byte key, base64 URL-safe unpadded, fed to `cryptsetup luksFormat`
+    /// as a raw passphrase. The consumer derives it from a stable secret plus
+    /// the workload id so the same key recurs on respawn or standby promotion.
     pub key_b64: String,
 }
 
@@ -790,12 +622,9 @@ fn volume_encryption_default_version() -> u8 {
 }
 
 impl VolumeEncryption {
-    /// Algorithm tag for the v1 wire format. Spelled out so callers
-    /// don't need to know the LUKS internals.
     pub const ALGORITHM_V1: &'static str = "luks2-aes-xts";
     pub const VERSION_V1: u8 = 1;
 
-    /// Build a v1 VolumeEncryption from a raw 32-byte key.
     pub fn v1(key: [u8; 32]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         Self {
@@ -805,9 +634,6 @@ impl VolumeEncryption {
         }
     }
 
-    /// Decode the base64 key back to raw bytes. Errors if the
-    /// payload is malformed or the wrong length for the declared
-    /// algorithm.
     pub fn decoded_key(&self) -> Result<[u8; 32], anyhow::Error> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let bytes = URL_SAFE_NO_PAD
@@ -825,15 +651,9 @@ impl VolumeEncryption {
     }
 }
 
-/// Pure helper for self-role detection on a `WarmStandby` spawn
-/// request. Returns the role this provider should take. Surfaced so
-/// the role-routing logic in `provider::handle_spawn_request` is
-/// unit-testable without spinning up a state machine.
-///
-/// Convention:
-///   - if `self_npub == primary_npub` → Primary
-///   - else if `self_npub` is in `standby_providers` → Standby (with index)
-///   - else → NotAddressed (provider should reject the request)
+/// Role this provider takes on a `WarmStandby` spawn request:
+/// `Primary` if it is the named primary, `Standby` if it appears in
+/// `standby_providers`, `NotAddressed` (reject the request) otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarmStandbyRole {
     Primary,
@@ -846,19 +666,6 @@ pub fn warm_standby_role(
     primary_npub: &str,
     standby_providers: &[String],
 ) -> WarmStandbyRole {
-    // Normalize both sides via PublicKey::parse, which accepts both
-    // bech32 (`npub1...`) and 64-hex inputs and yields a canonical
-    // bytes representation. The provider service stores its own npub
-    // as hex (`get_service_public_key` calls `.to_hex()`); the
-    // consumer-facing CLI ships bech32 in `EncryptedSpawnPodRequest.
-    // primary_npub` and `standby_providers`. Comparing the strings
-    // directly always returned `NotAddressed`, breaking warm-standby
-    // for any consumer using the bech32 form (which is everyone).
-    //
-    // Falling back to direct string comparison when parsing fails
-    // (e.g. an empty or malformed primary_npub) preserves existing
-    // semantics for that error path — the `NotAddressed` outcome is
-    // still correct.
     if npubs_equal(self_npub, primary_npub) {
         return WarmStandbyRole::Primary;
     }
@@ -873,43 +680,31 @@ pub fn warm_standby_role(
     WarmStandbyRole::NotAddressed
 }
 
-/// True iff two npub strings refer to the same Nostr public key.
-/// Accepts bech32 (`npub1...`) and 64-hex on either side and treats
-/// them as equal when they canonicalize to the same key. Falls back
-/// to direct string equality when both sides fail to parse — that
-/// keeps unit tests that use placeholder strings like
-/// `"npub1primary"` working, and cannot create false positives in
-/// production (where every input is a real key in one of the two
-/// canonical forms).
+/// True iff two npub strings name the same key. Providers store their own npub
+/// as hex while the consumer CLI ships bech32, so both sides must be
+/// canonicalized before comparison — direct string comparison silently broke
+/// warm-standby for every bech32 consumer.
+///
+/// Falls back to string equality only when *neither* side parses, which keeps
+/// placeholder npubs in unit tests working without risking false positives on
+/// real keys.
 pub fn npubs_equal(a: &str, b: &str) -> bool {
-    let pa = nostr_sdk::PublicKey::parse(a);
-    let pb = nostr_sdk::PublicKey::parse(b);
-    match (pa, pb) {
+    match (
+        nostr_sdk::PublicKey::parse(a),
+        nostr_sdk::PublicKey::parse(b),
+    ) {
         (Ok(ka), Ok(kb)) => ka == kb,
-        // One side parses, the other doesn't: not the same key.
-        // Without this case, comparing a real bech32 npub against a
-        // typoed/placeholder string would fall through to the
-        // direct-string branch and silently treat them as unequal —
-        // which is the right outcome, but the explicit branch makes
-        // the intent obvious.
         (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
-        // Neither parses: fall back to direct equality. Used by
-        // unit tests with placeholder npubs; in production both
-        // sides will always parse.
         (Err(_), Err(_)) => a == b,
     }
 }
 
-/// True iff a provider offer's claimed `provider_npub` was actually
-/// authored by the Nostr key that signed the offer event.
+/// True iff an offer's claimed `provider_npub` matches the key that signed the
+/// event (`signer_hex` is `event.pubkey.to_hex()`).
 ///
-/// A Kind-38383 provider-offer event is signed by *some* key (the event
-/// author, which nostr-sdk verifies on fetch), but `provider_npub` is a
-/// free-form field in the JSON body. Without this binding any key can
-/// publish an offer impersonating any provider — poisoning discovery
-/// (`discovery.rs`) and the dashboard snapshot, letting an attacker
-/// claim a known anchor npub or last-write-wins over a real provider's
-/// listing. `signer_hex` is `event.pubkey.to_hex()`.
+/// nostr-sdk verifies the event signature on fetch, but `provider_npub` is a
+/// free-form body field. Without this binding any key could publish an offer
+/// impersonating any provider and last-write-wins over the real listing.
 pub fn offer_authored_by_claimed_provider(signer_hex: &str, offer: &ProviderOfferContent) -> bool {
     npubs_equal(signer_hex, &offer.provider_npub)
 }
@@ -947,8 +742,6 @@ mod offer_authenticity_tests {
 
     #[test]
     fn offer_claiming_foreign_npub_is_rejected() {
-        // Attacker signs the event but stuffs the victim's npub into
-        // the body — the exact spoofing path CWE-345 warns about.
         let victim = Keys::generate();
         let attacker = Keys::generate();
         let forged = offer_claiming(&victim.public_key().to_hex());
@@ -960,7 +753,6 @@ mod offer_authenticity_tests {
 
     #[test]
     fn signer_binding_canonicalizes_hex_and_bech32() {
-        // Body carries the bech32 form; signer is hex. Same key must match.
         let k = Keys::generate();
         let offer = offer_claiming(&k.public_key().to_bech32().unwrap());
         assert!(offer_authored_by_claimed_provider(
@@ -970,66 +762,37 @@ mod offer_authenticity_tests {
     }
 }
 
-// NEW: Encrypted top-up request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedTopUpPodRequest {
-    pub pod_npub: String, // Pod's NPUB identifier
+    pub pod_npub: String,
     pub cashu_token: String,
 }
 
-// NEW: Helper function to send private message provisioning request
-pub async fn send_provisioning_request_private_message(
-    client: &Client,
-    service_pubkey: &str,
-    request: EncryptedSpawnPodRequest,
-) -> Result<String> {
-    let request_json = serde_json::to_string(&request)?;
-
-    // Send as private message
-    let service_pubkey_parsed = nostr_sdk::PublicKey::parse(service_pubkey)?;
-    let event_id = client
-        .send_private_msg(service_pubkey_parsed, request_json, [])
-        .await?;
-
-    Ok(event_id.val.to_hex())
-}
-
-// NEW: Helper function to parse private message content
-/// Unified request type for private messages
+/// Unified request type for private messages. `Spawn` is boxed because it
+/// dwarfs the other variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PrivateRequest {
-    Spawn(EncryptedSpawnPodRequest),
+    Spawn(Box<EncryptedSpawnPodRequest>),
     TopUp(EncryptedTopUpPodRequest),
     Status(StatusRequestContent),
 }
 
 pub fn parse_private_message_content(content: &str) -> Result<PrivateRequest> {
-    match serde_json::from_str::<PrivateRequest>(content) {
-        Ok(request) => Ok(request),
-        Err(e) => {
-            // Provide detailed error information, but truncate content to avoid huge log strings
-            let truncated_content = if content.len() > 100 {
-                format!("{}...", &content[..100])
-            } else {
-                content.to_string()
-            };
-            Err(anyhow::anyhow!(
-                "JSON parsing failed: {}. Content: '{}'",
-                e,
-                truncated_content
-            ))
-        }
-    }
+    serde_json::from_str::<PrivateRequest>(content).map_err(|e| {
+        // Truncate by chars, not bytes: `content` is attacker-supplied and
+        // slicing it at byte 100 would panic mid-codepoint.
+        let truncated = if content.chars().count() > 100 {
+            format!("{}...", content.chars().take(100).collect::<String>())
+        } else {
+            content.to_string()
+        };
+        anyhow::anyhow!("JSON parsing failed: {}. Content: '{}'", e, truncated)
+    })
 }
 
-/// Parse a `NostrEvent` as a `LeaseRevocationContent` if its `kind`
-/// matches `KIND_LEASE_REVOCATION` and the body deserializes
-/// cleanly. Returns `None` for any non-revocation event so the
-/// caller can fall through to other dispatch arms without re-parsing.
-///
-/// Pure function — exposed so the standby-side dispatcher can be
-/// unit-tested without spinning up the relay pool.
+/// Parse a `NostrEvent` as a `LeaseRevocationContent`, or `None` if it is not a
+/// revocation, so callers can fall through to other dispatch arms.
 pub fn parse_revocation_event(event: &NostrEvent) -> Option<LeaseRevocationContent> {
     if event.kind != KIND_LEASE_REVOCATION as u32 {
         return None;
@@ -1037,40 +800,31 @@ pub fn parse_revocation_event(event: &NostrEvent) -> Option<LeaseRevocationConte
     serde_json::from_str::<LeaseRevocationContent>(&event.content).ok()
 }
 
-// ==================== Provider Discovery Structures ====================
-
-/// Capacity information for a provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapacityInfo {
-    pub cpu_available: u64,        // Available CPU in millicores
-    pub memory_mb_available: u64,  // Available memory in MB
-    pub storage_gb_available: u64, // Available storage in GB
+    /// Millicores.
+    pub cpu_available: u64,
+    pub memory_mb_available: u64,
+    pub storage_gb_available: u64,
 }
 
-/// Provider isolation level (Unit 4 surfaces this on offers from
-/// Q1; Unit 22 will populate it with the real research-tier
-/// implementation). `#[serde(default)]` so v0 offers parse cleanly.
+/// Isolation level a provider promises. `#[serde(default)]` on the fields that
+/// carry it so v0 offers parse cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum IsolationLevel {
     /// Default LXC / shared-kernel container.
     #[default]
     SharedKernel,
-    /// Whole-host dedicated to a single workload (no co-tenants).
+    /// Whole host dedicated to a single workload (no co-tenants).
     DedicatedHost,
-    /// Attested AMD SEV-SNP / Intel TDX research tier (year-2 R9).
+    /// Attested AMD SEV-SNP / Intel TDX.
     AttestedResearchTier,
 }
 
 impl IsolationLevel {
-    /// Numeric strength ordering used for "minimum acceptable tier"
-    /// comparisons. Higher = more isolated. NOT a Deserialize hint
-    /// (the wire format is the kebab-case slug); just a helper for
-    /// the consumer's `--isolation-level` filter to decide whether
-    /// a provider's offer meets the consumer's threshold.
-    ///
-    /// SharedKernel = 0, DedicatedHost = 1, AttestedResearchTier = 2.
-    /// `meets(min)` returns true iff `self >= min` in this ordering.
+    /// Strength ordering for "minimum acceptable tier" comparisons; higher is
+    /// more isolated. Not part of the wire format, which is the slug.
     pub fn rank(self) -> u8 {
         match self {
             Self::SharedKernel => 0,
@@ -1079,8 +833,6 @@ impl IsolationLevel {
         }
     }
 
-    /// True iff this offer's isolation tier is at least as strong
-    /// as `min`. Used by the consumer's offer filter.
     pub fn meets(self, min: IsolationLevel) -> bool {
         self.rank() >= min.rank()
     }
@@ -1095,8 +847,6 @@ impl IsolationLevel {
         }
     }
 
-    /// Inverse of `from_slug` — for displaying a provider's tier
-    /// to the consumer.
     pub fn slug(self) -> &'static str {
         match self {
             Self::SharedKernel => "shared-kernel",
@@ -1110,43 +860,34 @@ fn default_schema_version() -> u8 {
     SCHEMA_VERSION
 }
 
-/// Provider offer content published to Nostr (Kind 38383).
-///
-/// Parameterized-replaceable event addressed by
-/// `(pubkey, 38383, d="paygress:offer:v1:<npub>")`.
+/// Body of a `KIND_PROVIDER_OFFER` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOfferContent {
     pub provider_npub: String,
     pub hostname: String,
     pub location: Option<String>,
-    pub capabilities: Vec<String>, // ["lxc", "vm"]
+    /// e.g. `["lxc", "vm"]`.
+    pub capabilities: Vec<String>,
     pub specs: Vec<PodSpec>,
     pub whitelisted_mints: Vec<String>,
     pub uptime_percent: f32,
     pub total_jobs_completed: u64,
     pub api_endpoint: Option<String>,
 
-    /// Schema version. v0 offers (no field on the wire) deserialize
-    /// to `1` via the default. Bump on any breaking change.
+    /// v0 offers (no field on the wire) deserialize to `1`.
     #[serde(default = "default_schema_version")]
     pub version: u8,
 
-    /// Isolation level the provider promises (Unit 4 / Unit 22).
     #[serde(default)]
     pub isolation_level: IsolationLevel,
 
-    /// Optional fidelity-bond stake. Offers carrying a verifiable
-    /// stake proof are eligible for the `staked` discovery tier.
+    /// Fidelity-bond stake. Offers with a verifiable proof are eligible for
+    /// the `staked` discovery tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stake_proof: Option<crate::stake::StakeProof>,
 }
 
-/// Heartbeat content published to Nostr.
-///
-/// Dual-published on two kinds (see Unit 4):
-/// - `KIND_PROVIDER_HEARTBEAT` (38384, addressable, with bucketed
-///   `d` tag) for stored uptime history.
-/// - `KIND_PROVIDER_HEARTBEAT_EPHEMERAL` (20384) for live presence.
+/// Body of both heartbeat kinds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatContent {
     pub provider_npub: String,
@@ -1154,71 +895,46 @@ pub struct HeartbeatContent {
     pub active_workloads: u32,
     pub available_capacity: CapacityInfo,
 
-    /// Schema version. See `ProviderOfferContent::version`.
     #[serde(default = "default_schema_version")]
     pub version: u8,
 }
 
-/// Lease revocation content (Unit 5 wiring).
-///
-/// Emitted by a primary provider whose workload state machine has
-/// transitioned the workload out of `Live` (typically because the
-/// primary observed its own heartbeats failing to reach quorum at
-/// relays — split-brain self-eviction). Standby providers listed in
-/// `standby_providers` can promote on observing this event without
-/// fear of two writers, because the primary has *already* left Live
-/// before publishing.
+/// Body of a `KIND_LEASE_REVOCATION` event, emitted by a primary whose workload
+/// has left `Live` (typically split-brain self-eviction after its heartbeats
+/// stopped reaching quorum). A standby can promote on seeing this without
+/// risking two writers, because the primary has already stood down.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseRevocationContent {
-    /// Consumer-assigned workload identifier (the same UUID-shaped
-    /// string the consumer sent in the spawn request as
-    /// `workload_id`). Standbys key their slot table by this id and
-    /// use it to look up the matching reservation when a revocation
-    /// arrives. v0 events used a u32 (the primary's local vmid) —
-    /// the change to String is a wire-format bump, but no v0
-    /// revocations were ever published in production (#34/#41
-    /// shipped the listener, not the publisher's own consumers).
+    /// The consumer-assigned `workload_id` from the spawn request; standbys key
+    /// their slot table by it.
     pub workload_id: String,
     pub primary_provider_npub: String,
     pub standby_providers: Vec<String>,
     pub reason: String,
     pub revoked_at: u64,
 
-    /// Optional Blossom URI of the latest checkpoint (Unit 6). When
-    /// set, the standby restores from this state rather than spawning
-    /// a fresh container.
+    /// Blossom URI of the latest checkpoint. When set, the standby restores
+    /// from it rather than spawning a fresh container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_uri: Option<String>,
 
-    /// Schema version. v0 (no field on the wire) deserializes to 1.
     #[serde(default = "default_schema_version")]
     pub version: u8,
 }
 
-/// Published by a standby provider IMMEDIATELY after it finishes
-/// promoting a workload to local primary. Distinguishable from a
-/// regular periodic heartbeat because the heartbeat says "this
-/// provider is online" whereas this event says "this provider has
-/// just claimed this workload's primary role". Higher-indexed
-/// peers query for these events at promotion-time and drop their
-/// slot if they see one from a peer for the same workload_id.
+/// Body of a `KIND_STANDBY_PROMOTION_ANNOUNCEMENT` event. Unlike a heartbeat
+/// ("this provider is online"), it asserts "this provider has claimed this
+/// workload's primary role"; peers query for it before claiming their own slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandbyPromotionAnnouncementContent {
-    /// Consumer-assigned workload identifier (the same UUID-shaped
-    /// string used by `LeaseRevocationContent.workload_id` and the
-    /// spawn request's `workload_id`).
     pub workload_id: String,
-    /// The npub of the standby provider that has just promoted to
-    /// primary. Peers compare this against their own npub to
-    /// confirm the claim is from a peer (not themselves).
     pub new_primary_npub: String,
-    /// Unix-second timestamp at which the promotion completed.
     pub promoted_at: u64,
     #[serde(default = "default_schema_version")]
     pub version: u8,
 }
 
-/// Provider info as seen by discovery clients
+/// Provider info as seen by discovery clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfo {
     pub npub: String,
@@ -1229,33 +945,23 @@ pub struct ProviderInfo {
     pub whitelisted_mints: Vec<String>,
     pub uptime_percent: f32,
     pub total_jobs_completed: u64,
-    pub last_seen: u64, // Timestamp of last heartbeat
+    /// Timestamp of the last heartbeat.
+    pub last_seen: u64,
     pub is_online: bool,
-    /// Isolation tier the provider promises (mirrored from
-    /// `ProviderOfferContent.isolation_level`). Consumers filtering
-    /// by `--isolation-level` match on this. Defaults to
-    /// `SharedKernel` for v0 offers (no field on the wire).
     pub isolation_level: IsolationLevel,
 }
 
-/// Filter for querying providers
 #[derive(Debug, Clone, Default)]
 pub struct ProviderFilter {
     pub capability: Option<String>,
     pub min_uptime: Option<f32>,
     pub min_memory_mb: Option<u64>,
     pub min_cpu: Option<u64>,
-    /// Minimum acceptable isolation tier. `Some(DedicatedHost)`
-    /// matches `DedicatedHost` and `AttestedResearchTier` providers
-    /// (anything stricter is also acceptable). `None` = no filter.
+    /// Minimum acceptable tier; stricter tiers also match. `None` = no filter.
     pub isolation_level: Option<IsolationLevel>,
 }
 
 impl NostrRelaySubscriber {
-    /// Publish a provider offer event (Kind 38383 — parameterized
-    /// replaceable). The `d` tag is versioned
-    /// (`paygress:offer:v1:<npub>`) so future schema bumps coexist
-    /// with v1 events on the same relay.
     pub async fn publish_provider_offer(&self, offer: ProviderOfferContent) -> Result<String> {
         let content = serde_json::to_string(&offer)?;
         info!("Publishing provider offer for {}", offer.hostname);
@@ -1285,18 +991,9 @@ impl NostrRelaySubscriber {
         }
     }
 
-    /// Publish a heartbeat event on BOTH the addressable (stored,
-    /// kind 38384) and ephemeral (kind 20384) kinds. Returns the
-    /// addressable event id and the set of relay URLs that
-    /// successfully accepted the *stored* heartbeat — the orchestrator
-    /// loop (Unit 5 wiring) consumes these as `HeartbeatObservation`s
-    /// to drive the workload state machine.
-    ///
-    /// The addressable form uses a per-minute bucketed `d` tag
-    /// (`paygress:heartbeat:v1:<npub>:<bucket>`) so each minute's
-    /// heartbeat lands in its own `(pubkey, kind, d-tag)` slot.
-    /// Without bucketing, every heartbeat replaces the previous one
-    /// at the relay and `calculate_uptime` sees zero history.
+    /// Publish a heartbeat on both the stored and ephemeral kinds. Returns the
+    /// stored event's id and the relays that accepted it; the orchestrator loop
+    /// turns those into `HeartbeatObservation`s to drive the state machine.
     pub async fn publish_heartbeat(
         &self,
         heartbeat: HeartbeatContent,
@@ -1311,8 +1008,6 @@ impl NostrRelaySubscriber {
         let provider_pk = nostr_sdk::PublicKey::parse(&heartbeat.provider_npub)?;
         let v_tag = heartbeat.version.to_string();
 
-        // 1. Stored, addressable: relays keep this for history-based
-        //    queries (calculate_uptime).
         let stored_tags = vec![
             Tag::hashtag("paygress-heartbeat"),
             Tag::public_key(provider_pk),
@@ -1325,8 +1020,6 @@ impl NostrRelaySubscriber {
                 .sign_with_keys(&self.keys)?;
         let stored_id = stored_event.id.to_hex();
 
-        // 2. Ephemeral: relays don't store, but live subscribers see
-        //    it immediately. Cheap and good for dashboards.
         let ephemeral_tags = vec![
             Tag::hashtag("paygress-heartbeat"),
             Tag::public_key(provider_pk),
@@ -1358,14 +1051,6 @@ impl NostrRelaySubscriber {
         Ok((stored_id, accepting_relays))
     }
 
-    /// Publish a `LeaseRevocationContent` event (Unit 5 wiring).
-    ///
-    /// Addressable kind 38385, keyed by
-    /// `(pubkey, kind, d="paygress:revocation:v1:<primary_npub>:<workload_id>")`
-    /// so a standby coming online after the publish still observes
-    /// the latest revocation for that workload. Each standby is
-    /// added as a `#p` tag so subscribers filtering by their own
-    /// pubkey see only revocations addressed to them.
     pub async fn publish_lease_revocation(
         &self,
         revocation: LeaseRevocationContent,
@@ -1376,14 +1061,13 @@ impl NostrRelaySubscriber {
             revocation.version, revocation.primary_provider_npub, revocation.workload_id
         );
         let v_tag = revocation.version.to_string();
-        let workload_id_str = revocation.workload_id.to_string();
 
         let mut tags = vec![
             Tag::hashtag("paygress"),
             Tag::hashtag("paygress-revocation"),
             Tag::parse(["d", d_tag.as_str()])?,
             Tag::parse(["v", v_tag.as_str()])?,
-            Tag::parse(["workload", workload_id_str.as_str()])?,
+            Tag::parse(["workload", revocation.workload_id.as_str()])?,
         ];
         for standby_npub in &revocation.standby_providers {
             if let Ok(pk) = nostr_sdk::PublicKey::parse(standby_npub) {
@@ -1418,10 +1102,6 @@ impl NostrRelaySubscriber {
         }
     }
 
-    /// Publish a `StandbyPromotionAnnouncement` for a freshly-
-    /// promoted workload. NIP-33 addressable: `d` tag is
-    /// `paygress:promoted:v1:<workload_id>` so a re-failover for
-    /// the same workload replaces the prior announcement.
     pub async fn publish_standby_promotion_announcement(
         &self,
         announcement: StandbyPromotionAnnouncementContent,
@@ -1462,12 +1142,10 @@ impl NostrRelaySubscriber {
         }
     }
 
-    /// Query for any `StandbyPromotionAnnouncement` for `workload_id`
-    /// authored by one of `peer_npubs`. Returns the first matching
-    /// event's content (or None). The watchdog/promotion path uses
-    /// this BEFORE spawning a container to detect that a peer has
-    /// already promoted; if any event is found, the local standby
-    /// drops its slot rather than producing a duplicate primary.
+    /// Any `StandbyPromotionAnnouncement` for `workload_id` authored by one of
+    /// `peer_npubs`. The promotion path calls this *before* spawning: if a peer
+    /// already promoted, the local standby drops its slot instead of producing
+    /// a duplicate primary.
     pub async fn query_standby_promotion_announcements(
         &self,
         workload_id: &str,
@@ -1511,7 +1189,8 @@ impl NostrRelaySubscriber {
         Ok(None)
     }
 
-    /// Query all provider offers from relays
+    /// Query all provider offers from relays, dropping any whose body claims a
+    /// `provider_npub` other than the event's (signature-verified) signer.
     pub async fn query_providers(&self) -> Result<Vec<ProviderOfferContent>> {
         let filter = Filter::new()
             .kind(Kind::Custom(KIND_PROVIDER_OFFER))
@@ -1524,11 +1203,6 @@ impl NostrRelaySubscriber {
 
         let mut providers = Vec::new();
         for event in events {
-            // Bind the offer to its signer. nostr-sdk verifies the event
-            // signature on fetch, so `event.pubkey` is authenticated;
-            // `provider_npub` in the body is attacker-controllable. Drop
-            // any offer whose claimed provider_npub doesn't match the
-            // signer to defeat offer spoofing (CWE-345).
             let signer_hex = event.pubkey.to_hex();
             match serde_json::from_str::<ProviderOfferContent>(&event.content) {
                 Ok(offer) => {
@@ -1551,7 +1225,6 @@ impl NostrRelaySubscriber {
         Ok(providers)
     }
 
-    /// Query heartbeats for a specific provider since a given time
     pub async fn query_heartbeats(
         &self,
         provider_npub: &str,
@@ -1582,12 +1255,8 @@ impl NostrRelaySubscriber {
         Ok(heartbeats)
     }
 
-    /// Get the latest heartbeat for a provider (to check if online).
-    /// Queries the stored kind 38384 (which now retains per-minute
-    /// bucketed history thanks to the `d`-tag fix in Unit 4) within
-    /// the live window. Ephemeral kind 20384 is not queried here
-    /// because relays do not store it; it would only be visible to
-    /// live subscribers.
+    /// Latest heartbeat for a provider within the live window. Only the stored
+    /// kind is queried; relays do not retain the ephemeral one.
     pub async fn get_latest_heartbeat(
         &self,
         provider_npub: &str,
@@ -1620,7 +1289,7 @@ impl NostrRelaySubscriber {
         Ok(None)
     }
 
-    /// Get the latest heartbeats for multiple providers in a single batch query
+    /// Batched [`Self::get_latest_heartbeat`] over many providers.
     pub async fn get_latest_heartbeats_multi(
         &self,
         provider_npubs: Vec<String>,
@@ -1641,16 +1310,11 @@ impl NostrRelaySubscriber {
             .as_secs()
             - LIVE_HEARTBEAT_WINDOW_SECS;
 
-        // Query the stored kind 38384 (now retains bucketed history
-        // per Unit 4) for "have any of these providers heartbeat'd
-        // recently?". Ephemeral 20384 isn't queried because relays
-        // do not store it.
         let filter = Filter::new()
             .kind(Kind::Custom(KIND_PROVIDER_HEARTBEAT))
             .authors(pubkeys)
             .since(Timestamp::from(live_since));
 
-        // Use a short timeout of 3 seconds for fast feedback
         let events = self
             .client
             .fetch_events(filter, std::time::Duration::from_secs(3))
@@ -1658,7 +1322,7 @@ impl NostrRelaySubscriber {
 
         let mut heartbeats = std::collections::HashMap::new();
 
-        // Process events, keeping only the latest for each provider
+        // Keep only the latest heartbeat per provider.
         for event in events {
             if let Ok(hb) = serde_json::from_str::<HeartbeatContent>(&event.content) {
                 match heartbeats.entry(hb.provider_npub.clone()) {
@@ -1678,11 +1342,8 @@ impl NostrRelaySubscriber {
         Ok(heartbeats)
     }
 
-    /// Calculate uptime percentage for a provider over the last N
-    /// days, against the stored kind 38384 (which now retains
-    /// per-minute bucketed history thanks to Unit 4's `d`-tag fix —
-    /// previously every new heartbeat replaced the prior one and
-    /// uptime always returned ~0).
+    /// Uptime percentage over the last `days`, as the ratio of stored
+    /// heartbeats found to the number expected at one per bucket.
     pub async fn calculate_uptime(&self, provider_npub: &str, days: u32) -> Result<f32> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -1695,9 +1356,6 @@ impl NostrRelaySubscriber {
             return Ok(0.0);
         }
 
-        // Expected heartbeats: one per HEARTBEAT_BUCKET_SECS over
-        // the window. Distinct heartbeats coexist on the relay
-        // because each lands in its own bucketed `d`-tag slot.
         let expected = (days as f32) * 24.0 * 3600.0 / HEARTBEAT_BUCKET_SECS as f32;
         let actual = heartbeats.len() as f32;
 
@@ -1707,7 +1365,8 @@ impl NostrRelaySubscriber {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusRequestContent {
-    pub pod_id: String, // Can be NPUB or container ID
+    /// NPUB or container id.
+    pub pod_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1735,15 +1394,12 @@ mod isolation_level_tests {
 
     #[test]
     fn meets_accepts_equal_or_stricter_tiers() {
-        // SharedKernel as the minimum: any tier qualifies.
         assert!(IsolationLevel::SharedKernel.meets(IsolationLevel::SharedKernel));
         assert!(IsolationLevel::DedicatedHost.meets(IsolationLevel::SharedKernel));
         assert!(IsolationLevel::AttestedResearchTier.meets(IsolationLevel::SharedKernel));
-        // DedicatedHost as the minimum: SharedKernel does NOT qualify.
         assert!(!IsolationLevel::SharedKernel.meets(IsolationLevel::DedicatedHost));
         assert!(IsolationLevel::DedicatedHost.meets(IsolationLevel::DedicatedHost));
         assert!(IsolationLevel::AttestedResearchTier.meets(IsolationLevel::DedicatedHost));
-        // AttestedResearchTier as the minimum: only it qualifies.
         assert!(!IsolationLevel::SharedKernel.meets(IsolationLevel::AttestedResearchTier));
         assert!(!IsolationLevel::DedicatedHost.meets(IsolationLevel::AttestedResearchTier));
         assert!(IsolationLevel::AttestedResearchTier.meets(IsolationLevel::AttestedResearchTier));
@@ -1764,7 +1420,6 @@ mod isolation_level_tests {
     fn from_slug_rejects_unknown() {
         assert!(IsolationLevel::from_slug("paranoid-mode").is_none());
         assert!(IsolationLevel::from_slug("").is_none());
-        // Underscore form (not what we serialize) — must NOT be accepted.
         assert!(IsolationLevel::from_slug("dedicated_host").is_none());
     }
 }
@@ -1773,12 +1428,7 @@ mod isolation_level_tests {
 mod npubs_equal_tests {
     use super::*;
 
-    // A real Nostr secret key generated via Keys::generate() in
-    // test setup, frozen here to avoid relying on test-time
-    // randomness. The two encodings of its public key:
-    //   bech32: npub1ae40uj62de87f8tvx56e6ytp5m7jd7l96mh0ew43e8q5wucm7z9q2uqvuc
-    //   hex:    ee6afe4b4a6e4fe49d6c3534eb446868df49bef2eb77f2eac72707473b1bf045
-
+    // Two encodings of one frozen public key.
     const PUBKEY_BECH32: &str = "npub1ae40uj62de87f8tvx56e6ytp5m7jd7l96mh0ew43e8q5wucm7z9q2uqvuc";
     const PUBKEY_HEX: &str = "ee6afe4b4a6e4fe49d6c35359d1161a6fd26fbe5d6eefcbab1c9c147731bf08a";
 
@@ -1792,11 +1442,8 @@ mod npubs_equal_tests {
         assert!(npubs_equal(PUBKEY_HEX, PUBKEY_HEX));
     }
 
-    /// The actual bug surfaced by the warm-standby end-to-end test:
-    /// the provider stores its npub as hex (via `.to_hex()`), the
-    /// consumer ships bech32. Without normalization, the role check
-    /// always returned `NotAddressed`, breaking warm-standby for
-    /// every consumer using the bech32 form.
+    /// Regression: the provider stores hex, the consumer ships bech32, and
+    /// without normalization the role check always returned `NotAddressed`.
     #[test]
     fn bech32_matches_hex_for_same_key() {
         assert!(npubs_equal(PUBKEY_BECH32, PUBKEY_HEX));
@@ -1805,24 +1452,18 @@ mod npubs_equal_tests {
 
     #[test]
     fn different_keys_in_different_encodings_do_not_match() {
-        // A different bech32 npub.
         let other_bech32 = "npub1hyr9m7zeegr98w4e07gvdpqrk25jfp3vku8029u8pcxsc48dq6nqxtwztv";
         assert!(!npubs_equal(PUBKEY_HEX, other_bech32));
     }
 
     #[test]
     fn unparseable_strings_fall_back_to_string_equality() {
-        // Test placeholder npubs (used by existing provider tests
-        // with strings like "npub1primary") still match by direct
-        // equality; that's the contract.
         assert!(npubs_equal("npub1primary", "npub1primary"));
         assert!(!npubs_equal("npub1primary", "npub1secondary"));
     }
 
     #[test]
     fn one_real_one_typoed_returns_false() {
-        // Mixing a real key with a typoed/placeholder string must
-        // never match — the typoed string isn't a key.
         assert!(!npubs_equal(PUBKEY_BECH32, "npub1primary"));
         assert!(!npubs_equal("npub1primary", PUBKEY_HEX));
     }

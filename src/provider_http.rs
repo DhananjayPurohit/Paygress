@@ -1,45 +1,10 @@
-// Provider HTTP Interface — ngx_l402 Path
+// Provider HTTP interface, served behind the `ngx_l402` nginx module and
+// enabled by `http_bind_addr` in the provider config.
 //
-// Exposes HTTP endpoints for the Proxmox / LXD / KVM provider that sit
-// behind the `ngx_l402` nginx module.
-//
-// This is one of two redemption paths that share the same CDK SQLite wallet
-// (`cashu_wallet_db_path`). The other is the Nostr-DM handler in
-// src/provider.rs. ngx_l402 sweeps accumulated ecash from both paths to
-// Lightning on a configurable schedule.
-//
-// Payment flow (single-redemption, no double-spend risk):
-//   Client
-//     → nginx  (ngx_l402 issues 402 if no valid Cashu token; verifies
-//               the token format, redeems it at the Cashu mint via NUT-03,
-//               enforces replay protection, stores proofs in the shared
-//               SQLite wallet, then forwards the request)
-//     → POST paygress:8080/pods/spawn  OR  POST paygress:8080/pods/topup
-//     → this axum backend: reads the token's face value from the header
-//               via `extract_token_value()` (no mint call — ngx_l402
-//               already redeemed it), then provisions / extends the
-//               container via the configured backend (Proxmox / LXD / KVM).
-//
-// The backend MUST NOT call the Cashu mint again — the token is already
-// spent and the proofs are in the shared wallet.
-//
-// Lightning sweep:
-//   ngx_l402 opens the same SQLite file used by the Nostr-DM CdkRedeemer
-//   (volume: /var/lib/paygress:/var/lib/nginx, CASHU_DB_PATH points to
-//   cashu-wallet.sqlite). Its melt loop drains all accumulated proofs —
-//   from both this HTTP path and the Nostr-DM path —
-//   to LNURL_ADDRESS at CASHU_REDEMPTION_INTERVAL_SECS.
-//
-// Endpoints:
-//   GET  /health        — liveness probe (no payment)
-//   GET  /offers        — available pod specs and pricing (no payment)
-//   POST /pods/spawn    — spawn a new container (ngx_l402 paywall)
-//   POST /pods/topup    — extend an existing lease (ngx_l402 paywall)
-//
-// Enable by setting `http_bind_addr` in the provider config. The nginx
-// config in nginx/conf.d/paygress-l402.conf targets port 8080 with the
-// correct `l402 on` directives. Bootstrap auto-generates the Docker
-// Compose setup (Step 8 in src/cli/commands/bootstrap.rs).
+// ngx_l402 returns 402 without a valid Cashu token, redeems the token at the
+// mint, and forwards the request with the token still in the Authorization
+// header. These handlers MUST NOT call the mint again — the token is already
+// spent — so they only decode its face value via `extract_token_value`.
 
 use anyhow::Result;
 use axum::{
@@ -64,16 +29,11 @@ use crate::provider::{
     generate_password, parse_pod_npub, ProviderConfig, ProviderStats, WorkloadInfo,
 };
 
-// ─── Shared state ─────────────────────────────────────────────────────────────
-
-/// State shared between the Nostr-DM handler and the HTTP+ngx_l402
-/// interface. All fields are Arc-wrapped so the struct is cheaply
-/// cloneable into axum's `State<_>` extractor.
+/// State shared with the Nostr-DM handler in `provider`. Arc-wrapped fields
+/// keep it cheap to clone into axum's `State<_>` extractor.
 ///
-/// There is intentionally **no** `redeemer` field here: ngx_l402 fully
-/// redeems the Cashu token at the nginx layer before forwarding the
-/// request. The backend only decodes the token's face value from the
-/// forwarded header — no mint interaction required or safe.
+/// There is deliberately no `redeemer` field: ngx_l402 has already redeemed the
+/// token, so mint interaction here would double-spend.
 #[derive(Clone)]
 pub(crate) struct ProviderHttpState {
     pub(crate) config: ProviderConfig,
@@ -81,17 +41,9 @@ pub(crate) struct ProviderHttpState {
     pub(crate) active_workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
     pub(crate) stats: Arc<Mutex<ProviderStats>>,
     pub(crate) state_machine: Arc<Mutex<WorkloadStateMachine>>,
-    /// Provider's Nostr public key, stored here so the HTTP handler can
-    /// record it in the state-machine's `DurableWorkload` without needing
-    /// a live Nostr connection.
     pub(crate) provider_npub: String,
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
-
-/// Start the provider HTTP+ngx_l402 interface.
-/// Binds on `bind_addr` and serves until an error occurs or the
-/// containing `tokio::select!` in `ProviderService::run()` cancels it.
 pub(crate) async fn run_provider_http_interface(
     state: ProviderHttpState,
     bind_addr: &str,
@@ -130,26 +82,16 @@ pub(crate) async fn run_provider_http_interface(
     Ok(())
 }
 
-// ─── Header helpers ───────────────────────────────────────────────────────────
-
-/// Extract a Cashu token from request headers.
-///
-/// ngx_l402 injects the validated token as:
-///   `Authorization: Cashu <token>`
-///
-/// `X-Cashu: <token>` is also accepted for direct calls that bypass
-/// nginx (e.g. integration tests, local development).
+/// ngx_l402 injects the validated token as `Authorization: Cashu <token>`.
+/// `X-Cashu: <token>` is also accepted for calls that bypass nginx.
 fn extract_cashu_token(headers: &HeaderMap) -> Option<String> {
-    // Authorization: Cashu <token>  (ngx_l402 canonical)
     if let Some(auth) = headers.get("authorization") {
         if let Ok(s) = auth.to_str() {
-            // Case-insensitive prefix check so both "Cashu " and "cashu " work.
             if s.len() > 6 && s[..6].eq_ignore_ascii_case("cashu ") {
                 return Some(s[6..].trim().to_string());
             }
         }
     }
-    // X-Cashu: <token>  (alternative)
     if let Some(xc) = headers.get("x-cashu") {
         if let Ok(s) = xc.to_str() {
             return Some(s.trim().to_string());
@@ -158,7 +100,41 @@ fn extract_cashu_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
+/// Header token, falling back to the request body for direct calls that bypass
+/// nginx.
+fn payment_token(headers: &HeaderMap, body_token: Option<String>) -> Option<String> {
+    extract_cashu_token(headers).or_else(|| body_token.filter(|t| !t.is_empty()))
+}
+
+fn payment_required_response() -> Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(serde_json::json!({
+            "error": "payment_required",
+            "message": "Provide payment via Authorization: Cashu <token> header"
+        })),
+    )
+        .into_response()
+}
+
+/// Face value of an already-redeemed token, in msats. `Err` holds the response
+/// to return verbatim.
+async fn decode_payment_msats(token: &str, endpoint: &str) -> Result<u64, Response> {
+    extract_token_value(token).await.map_err(|e| {
+        error!(
+            "[HTTP] {}: failed to decode Cashu token value: {}",
+            endpoint, e
+        );
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_token",
+                "message": format!("Could not decode token value: {}", e)
+            })),
+        )
+            .into_response()
+    })
+}
 
 async fn health_check() -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -182,14 +158,7 @@ async fn get_offers(State(state): State<ProviderHttpState>) -> Json<serde_json::
     }))
 }
 
-/// Spawn a container with Cashu payment enforced by ngx_l402.
-///
-/// ngx_l402 intercepts the request, returns HTTP 402 if no valid token
-/// is present, verifies the format and amount, redeems the token at the
-/// Cashu mint, and forwards to this handler with the token still in
-/// `Authorization: Cashu <token>`. This handler decodes the token's
-/// face value to compute the container lifetime, then provisions the
-/// container via the configured backend (Proxmox / LXD / KVM).
+/// Spawn a container, paid for by the token ngx_l402 already redeemed.
 async fn spawn_pod(
     State(state): State<ProviderHttpState>,
     headers: HeaderMap,
@@ -197,49 +166,17 @@ async fn spawn_pod(
 ) -> Response {
     info!("📨 [HTTP] spawn request received");
 
-    // 1. Extract Cashu token: ngx_l402 header takes priority over the
-    //    body fallback (the body fallback enables direct testing without
-    //    nginx in front).
-    let cashu_token = match extract_cashu_token(&headers)
-        .or_else(|| request.cashu_token.filter(|t| !t.is_empty()))
-    {
-        Some(t) => t,
-        None => {
-            warn!("[HTTP] spawn: no Cashu token provided");
-            return (
-                StatusCode::PAYMENT_REQUIRED,
-                Json(serde_json::json!({
-                    "error": "payment_required",
-                    "message": "Provide payment via Authorization: Cashu <token> header"
-                })),
-            )
-                .into_response();
-        }
+    let Some(cashu_token) = payment_token(&headers, request.cashu_token) else {
+        warn!("[HTTP] spawn: no Cashu token provided");
+        return payment_required_response();
     };
 
-    // 2. Decode the token's face value.
-    //    ngx_l402 already verified the token format, checked the amount
-    //    against `l402_amount_msat_default`, redeemed it at the Cashu
-    //    mint, and stored its hash in Redis — so the token is already
-    //    spent. We must NOT call the mint again; we only read the proof
-    //    amounts from the decoded token (no network I/O).
-    let payment_msats = match extract_token_value(&cashu_token).await {
+    let payment_msats = match decode_payment_msats(&cashu_token, "spawn").await {
         Ok(v) => v,
-        Err(e) => {
-            error!("[HTTP] spawn: failed to decode Cashu token value: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_token",
-                    "message": format!("Could not decode token value: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
 
-    // 3. Find the requested pod spec; fall back to the first spec if
-    //    `pod_spec_id` is absent or doesn't match.
+    // Fall back to the first spec when `pod_spec_id` is absent or unknown.
     let spec = match state
         .config
         .specs
@@ -261,7 +198,6 @@ async fn spawn_pod(
         }
     };
 
-    // 4. Calculate container lifetime from the payment amount.
     let duration_secs = payment_msats / spec.rate_msats_per_sec;
     if duration_secs < state.config.minimum_duration_seconds {
         let required = state.config.minimum_duration_seconds * spec.rate_msats_per_sec;
@@ -285,7 +221,6 @@ async fn spawn_pod(
             .into_response();
     }
 
-    // 5. Allocate a VMID from the configured range.
     let id = match state
         .backend
         .find_available_id(state.config.vmid_range_start, state.config.vmid_range_end)
@@ -305,14 +240,12 @@ async fn spawn_pod(
         }
     };
 
-    // 6. Generate credentials and compute the SSH host port.
     let password = generate_password();
     let host_port = match state.config.ssh_port_start {
         Some(start) => start + (id - state.config.vmid_range_start) as u16,
         None => 30000 + (id % 10000) as u16,
     };
 
-    // 7. Provision the container via the configured backend.
     let image = request
         .pod_image
         .as_deref()
@@ -348,9 +281,8 @@ async fn spawn_pod(
             .into_response();
     }
 
-    // 8. Register the workload in the shared tracking tables so the
-    //    cleanup_loop, orchestrator_loop, and Nostr DM handler all see
-    //    the same live state.
+    // Register in the shared tracking tables so cleanup_loop,
+    // orchestrator_loop, and the Nostr DM handler all see the same state.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -362,9 +294,6 @@ async fn spawn_pod(
         spec_id: spec.id.clone(),
         created_at: now,
         expires_at: now + duration_secs,
-        // HTTP callers may optionally supply their Nostr npub so the
-        // cleanup_loop can send a revocation DM if needed; defaults to
-        // empty for anonymous HTTP requests.
         owner_npub: request.requester_npub.unwrap_or_default(),
         replication: ReplicationMode::default(),
         restart_policy: RestartPolicy::default(),
@@ -378,8 +307,6 @@ async fn spawn_pod(
         .await
         .insert(id, workload.clone());
 
-    // Wire into the state machine so the orchestrator loop drives lifecycle
-    // transitions (Provisioning → Live → Suspect …) for this workload.
     state.state_machine.lock().await.track(DurableWorkload {
         workload_id: id,
         provider_npub: state.provider_npub.clone(),
@@ -429,11 +356,8 @@ async fn spawn_pod(
         .into_response()
 }
 
-/// Extend an existing container's lease with Cashu payment via ngx_l402.
-///
-/// Same payment flow as spawn: ngx_l402 redeems the token at the nginx
-/// layer, then this handler decodes the face value (no mint call) and
-/// extends `expires_at` in the shared workloads map.
+/// Extend an existing container's lease, paid for by the token ngx_l402 already
+/// redeemed.
 async fn topup_pod(
     State(state): State<ProviderHttpState>,
     headers: HeaderMap,
@@ -441,24 +365,10 @@ async fn topup_pod(
 ) -> Response {
     info!("📨 [HTTP] topup request for {}", request.pod_npub);
 
-    // 1. Extract token.
-    let cashu_token = match extract_cashu_token(&headers)
-        .or_else(|| request.cashu_token.filter(|t| !t.is_empty()))
-    {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::PAYMENT_REQUIRED,
-                Json(serde_json::json!({
-                    "error": "payment_required",
-                    "message": "Provide payment via Authorization: Cashu <token> header"
-                })),
-            )
-                .into_response();
-        }
+    let Some(cashu_token) = payment_token(&headers, request.cashu_token) else {
+        return payment_required_response();
     };
 
-    // 2. Resolve VMID from the pod identifier.
     let vmid = match parse_pod_npub(&request.pod_npub) {
         Some(v) => v,
         None => {
@@ -481,9 +391,7 @@ async fn topup_pod(
         .unwrap_or_default()
         .as_secs();
 
-    // 3. Snapshot workload state under a brief read-only lock so we know
-    //    the billing rate before decoding the token (avoids holding the
-    //    lock across the token-decoding step).
+    // Snapshot under a brief lock rather than holding it across the decode.
     let (spec_id, current_expires_at) = {
         let lock = state.active_workloads.lock().await;
         match lock.get(&vmid) {
@@ -512,7 +420,6 @@ async fn topup_pod(
             .into_response();
     }
 
-    // 4. Resolve the spec (needed to compute the billing rate).
     let spec = match state.config.specs.iter().find(|s| s.id == spec_id) {
         Some(s) => s.clone(),
         None => {
@@ -531,22 +438,9 @@ async fn topup_pod(
         }
     };
 
-    // 5. Decode the token's face value (ngx_l402 already redeemed it).
-    //    Same reasoning as spawn: the token is already spent at the mint.
-    //    We only extract the proof-amount sum without any network call.
-    let payment_msats = match extract_token_value(&cashu_token).await {
+    let payment_msats = match decode_payment_msats(&cashu_token, "topup").await {
         Ok(v) => v,
-        Err(e) => {
-            error!("[HTTP] topup: failed to decode Cashu token value: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_token",
-                    "message": format!("Could not decode token value: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
 
     let extension_secs = payment_msats / spec.rate_msats_per_sec;
@@ -564,8 +458,8 @@ async fn topup_pod(
             .into_response();
     }
 
-    // 6. Apply the extension — re-lock and re-verify existence to guard
-    //    against a cleanup_loop race between the snapshot above and now.
+    // Re-lock and re-check existence: cleanup_loop may have removed the
+    // workload since the snapshot above.
     let new_expires_at = {
         let mut lock = state.active_workloads.lock().await;
         match lock.get_mut(&vmid) {
@@ -574,8 +468,6 @@ async fn topup_pod(
                 w.expires_at
             }
             None => {
-                // Pod was cleaned up between our snapshot and this lock;
-                // the token is already spent at the mint.
                 return (
                     StatusCode::GONE,
                     Json(serde_json::json!({
@@ -614,36 +506,19 @@ async fn topup_pod(
         .into_response()
 }
 
-// ─── Request types ─────────────────────────────────────────────────────────────
-
-/// Request body for `POST /pods/spawn`.
-///
-/// The Cashu token is normally injected by ngx_l402 via
-/// `Authorization: Cashu <token>` and does not need to be in the body.
-/// The body field is provided as a fallback for direct testing without
-/// nginx in front.
 #[derive(Debug, Deserialize)]
 struct SpawnPodRequest {
-    /// Cashu token (body fallback; ngx_l402 header takes priority).
     #[serde(default)]
     cashu_token: Option<String>,
-    /// Pod spec id (e.g. `"basic"`, `"standard"`).
-    /// Defaults to the first configured spec if absent.
     pod_spec_id: Option<String>,
-    /// Container image. Defaults to `ubuntu:22.04`.
     pod_image: Option<String>,
-    /// Optional Nostr npub of the requester.
-    /// Used for ownership tracking so the Nostr DM path can cross-
-    /// reference containers spawned via HTTP.
     requester_npub: Option<String>,
 }
 
-/// Request body for `POST /pods/topup`.
 #[derive(Debug, Deserialize)]
 struct TopUpPodRequest {
-    /// Pod identifier returned by the spawn endpoint, e.g. `container-1000`.
+    /// Pod identifier returned by spawn, e.g. `container-1000`.
     pod_npub: String,
-    /// Cashu token (body fallback; ngx_l402 header takes priority).
     #[serde(default)]
     cashu_token: Option<String>,
 }
