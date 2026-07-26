@@ -1,19 +1,10 @@
-// Durable Workload abstraction (Unit 5 of the 12-month plan,
-// docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
+// Provider-side workload lifecycle: an explicit state machine driven
+// by heartbeats observed across M-of-N Nostr relays.
 //
-// A workload is described by a structured manifest; the provider
-// tracks each workload via an explicit state machine driven by
-// observed heartbeats from M-of-N Nostr relays.
-//
-// Single-writer invariant
-// -----------------------
-// A workload's state machine emits `PublishLeaseRevocation` only
-// after its own local state has left `Live`. The standby cannot
-// promote until it observes the revocation, so the union of "Live"
-// states across all providers tracking the same workload is at
-// most one. The proptest in `tests/durable_workload.rs` checks
-// the local half of this invariant; cross-provider integration is
-// out of scope here.
+// Single-writer invariant: a workload emits `PublishLeaseRevocation`
+// only after its own local state has left `Live`, and a standby
+// cannot promote until it observes that revocation. So at most one
+// provider is `Live` for a workload at any moment.
 
 use std::collections::HashMap;
 
@@ -22,25 +13,18 @@ use serde::{Deserialize, Serialize};
 /// Replication / availability mode chosen by the consumer at spawn.
 ///
 /// `None` is cheapest: one container, no checkpoint, no failover.
-/// `WarmStandby` registers a list of standby providers; on
-/// eviction the state machine emits `PublishLeaseRevocation` so the
-/// caller can hand off the lease.
-///
-/// `Checkpointed` (without warm-standby) is reserved for Unit 6 —
-/// the consumer-side SDK will respawn from the latest Blossom
-/// checkpoint on a fresh provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `WarmStandby` registers standby providers; on eviction the state
+/// machine emits `PublishLeaseRevocation` so the lease can be handed
+/// off. `Checkpointed` respawns from the latest Blossom checkpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum ReplicationMode {
+    #[default]
     None,
     Checkpointed,
-    WarmStandby { standby_providers: Vec<String> },
-}
-
-impl Default for ReplicationMode {
-    fn default() -> Self {
-        Self::None
-    }
+    WarmStandby {
+        standby_providers: Vec<String>,
+    },
 }
 
 /// What to do when a workload exits unexpectedly.
@@ -57,12 +41,10 @@ impl Default for RestartPolicy {
     }
 }
 
-/// Lifecycle state for a workload tracked by a single provider.
-///
-/// Mermaid diagram is in the 12-month plan. Roughly:
-/// `Provisioning -> Live -> Suspect -> {Live, Evicted}`
-/// `Evicted -> {Respawning, Failed}` depending on replication +
-/// restart policy.
+/// Lifecycle state for a workload tracked by a single provider:
+/// `Provisioning -> Live -> Suspect -> {Live, Evicted}`, then
+/// `Evicted -> {Respawning, Failed}` per replication + restart
+/// policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadState {
     Provisioning {
@@ -94,11 +76,9 @@ pub enum WorkloadState {
 }
 
 /// A heartbeat the provider received from the relay pool.
-///
-/// `seen_at` is when our local clock saw the event (for `t1/t2`
-/// timing); `event_timestamp` is the heartbeat's claimed creation
-/// time. Heartbeats whose event_timestamp is older than
-/// `stale_secs` are ignored to defeat replay-on-relay.
+/// `seen_at` is our local clock; `event_timestamp` is the
+/// heartbeat's claimed creation time, and anything older than
+/// `stale_secs` is ignored to defeat replay-on-relay.
 #[derive(Debug, Clone)]
 pub struct HeartbeatObservation {
     pub provider_npub: String,
@@ -112,8 +92,8 @@ pub struct HeartbeatObservation {
 pub struct QuorumConfig {
     /// Required count of live relays (M).
     pub m: u8,
-    /// Total relay set size (N). Used for symmetry; quorum logic
-    /// only requires that we observe `m` distinct live relays.
+    /// Total relay set size (N). Informational — quorum logic only
+    /// requires observing `m` distinct live relays.
     pub n: u8,
     /// Live → Suspect after this many seconds with quorum lost.
     pub t1_secs: u64,
@@ -143,16 +123,15 @@ pub struct DurableWorkload {
     pub state: WorkloadState,
     pub replication: ReplicationMode,
     pub restart_policy: RestartPolicy,
-    /// Optional Blossom URI of the latest checkpoint (Unit 6).
+    /// Blossom URI of the latest checkpoint, when there is one.
     pub state_uri: Option<String>,
     pub created_at: u64,
     pub expires_at: u64,
 }
 
 /// Side-effects the state machine asks the controller to perform.
-/// The state machine never does I/O — it returns events and the
-/// caller (typically `ProviderService::run`'s fourth concurrent
-/// loop) translates them into Nostr publishes / backend respawns.
+/// The state machine never does I/O; the caller translates these
+/// into Nostr publishes and backend respawns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateMachineEvent {
     EnteredLive {
@@ -184,8 +163,7 @@ pub enum StateMachineEvent {
     },
 }
 
-/// The state machine. Holds a map of tracked workloads keyed by
-/// `workload_id`. Drives transitions on each `tick`.
+/// Tracked workloads keyed by `workload_id`, advanced by `tick`.
 pub struct WorkloadStateMachine {
     config: QuorumConfig,
     workloads: HashMap<u32, DurableWorkload>,
@@ -226,11 +204,10 @@ impl WorkloadStateMachine {
         let cfg = self.config;
 
         for workload in self.workloads.values_mut() {
-            // Live relays = distinct relays where this provider was
-            // observed within stale_secs. We trust `event_timestamp`
-            // because the relay round-trip already authenticated it
-            // (signed event); replay-on-relay is defeated by
-            // staleness.
+            // Distinct relays where this provider was observed within
+            // stale_secs. `event_timestamp` is trusted because the
+            // relay round-trip authenticated the signed event;
+            // staleness is what defeats replay.
             let mut live_relays = std::collections::HashSet::new();
             for obs in observations {
                 if obs.provider_npub != workload.provider_npub {
@@ -279,8 +256,8 @@ impl WorkloadStateMachine {
                 ),
             };
         } else {
-            // Hold in Respawning; the controller can re-attempt on
-            // its own cadence. Record the error for diagnostics.
+            // Hold in Respawning so the controller can re-attempt on
+            // its own cadence; record the error for diagnostics.
             workload.state = WorkloadState::Respawning {
                 since: workload_state_since(&workload.state).unwrap_or(0),
                 attempts_used,
@@ -289,9 +266,8 @@ impl WorkloadStateMachine {
         }
     }
 
-    /// Controller reports that a respawn attempt succeeded. State
-    /// transitions back to Live (heartbeats from the new container
-    /// will keep it there).
+    /// Controller reports a successful respawn; heartbeats from the
+    /// new container keep the workload in `Live`.
     pub fn notify_respawn_succeeded(&mut self, workload_id: u32, now: u64) {
         if let Some(workload) = self.workloads.get_mut(&workload_id) {
             workload.state = WorkloadState::Live { since: now };
@@ -313,19 +289,12 @@ fn workload_state_since(state: &WorkloadState) -> Option<u64> {
 /// Whether losing heartbeat quorum should push this workload toward
 /// eviction.
 ///
-/// Quorum here is a **provider-level** signal: `send_heartbeat`
-/// publishes one heartbeat for the whole provider and records an
-/// observation per accepting relay, so "quorum lost" means *the
-/// provider could not reach enough relays*, not that any particular
-/// container is unhealthy.
-///
-/// That signal is only actionable for warm-standby: a standby needs
-/// it to take over, and the single-writer invariant depends on the
-/// primary evicting itself before the revocation is published. For
-/// every other workload there is no standby to promote — the
-/// consumer paid for wall-clock time, and a relay hiccup on the
-/// provider's side is not their problem. Evicting them would tear
-/// down healthy, paid-for containers during a network blip.
+/// Quorum is a **provider-level** signal — "the provider could not
+/// reach enough relays", not "this container is unhealthy". Only
+/// warm-standby can act on it (the standby needs the primary to
+/// evict itself first). For everything else there is no standby to
+/// promote, so evicting would tear down healthy, paid-for containers
+/// during a network blip.
 fn failover_eligible(workload: &DurableWorkload) -> bool {
     matches!(workload.replication, ReplicationMode::WarmStandby { .. })
 }
@@ -348,7 +317,6 @@ fn advance(
         }
         WorkloadState::Live { since } => {
             if quorum_alive {
-                // refresh
                 workload.state = WorkloadState::Live { since };
             } else if failover_eligible(workload) && now.saturating_sub(since) >= cfg.t1_secs {
                 workload.state = WorkloadState::Suspect { since: now };
@@ -370,10 +338,9 @@ fn advance(
         WorkloadState::Evicted { .. }
         | WorkloadState::Respawning { .. }
         | WorkloadState::Failed { .. } => {
-            // Terminal-ish: the controller drives transitions out
-            // of these via notify_respawn_succeeded / failed. We
-            // don't auto-recover from quorum because the original
-            // container is gone.
+            // The original container is gone, so regained quorum
+            // means nothing here; only notify_respawn_{succeeded,
+            // failed} move a workload out of these states.
         }
     }
 }
@@ -387,11 +354,9 @@ fn evict(workload: &mut DurableWorkload, now: u64, events: &mut Vec<StateMachine
 
     match (&workload.replication, workload.restart_policy) {
         (ReplicationMode::WarmStandby { standby_providers }, _) => {
-            // Single-writer invariant: emit revocation only AFTER
-            // the local state has left Live (we just set it to
-            // Evicted above). Standby cannot promote until it
-            // observes this event; in the local state machine
-            // we stay in Evicted.
+            // Single-writer invariant: revocation is emitted only
+            // after the local state has left Live (set to Evicted
+            // just above), and we stay in Evicted from here.
             events.push(StateMachineEvent::PublishLeaseRevocation {
                 workload_id: workload.workload_id,
                 standby_providers: standby_providers.clone(),

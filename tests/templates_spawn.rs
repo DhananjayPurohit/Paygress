@@ -93,7 +93,7 @@ fn template_ports_offset_from_ssh_host_port() {
         .map(|(i, p)| PortMapping {
             host_port: host_port.saturating_add(1 + i as u16),
             container_port: p.container_port,
-            protocol: "tcp",
+            protocol: "tcp".to_string(),
         })
         .collect();
     assert_eq!(allocated.len(), 2);
@@ -129,7 +129,7 @@ fn container_config_carries_template_data() {
             .map(|(i, p)| PortMapping {
                 host_port: 30042u16.saturating_add(1 + i as u16),
                 container_port: p.container_port,
-                protocol: "tcp",
+                protocol: "tcp".to_string(),
             })
             .collect(),
         template_env: env,

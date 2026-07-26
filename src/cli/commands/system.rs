@@ -85,7 +85,6 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
         }
     }
 
-    // 1. Stop and disable service
     print!("  Stopping paygress-provider service... ");
     io::stdout().flush()?;
     let _ = Command::new("systemctl")
@@ -96,7 +95,6 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
         .output();
     println!("{}", "DONE".green());
 
-    // 2. Remove systemd unit
     print!("  Removing systemd unit... ");
     io::stdout().flush()?;
     let _ = Command::new("rm")
@@ -105,13 +103,11 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
     println!("{}", "DONE".green());
 
-    // 3. Remove configurations
     print!("  Removing /etc/paygress... ");
     io::stdout().flush()?;
     let _ = Command::new("rm").args(["-rf", "/etc/paygress"]).output();
     println!("{}", "DONE".green());
 
-    // 4. Uninstall Backend if requested
     if args.uninstall_backend {
         println!("{}", "  Uninstalling compute backend...".yellow());
 

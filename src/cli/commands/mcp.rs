@@ -1,25 +1,14 @@
-// MCP (Model Context Protocol) server.
+// MCP (Model Context Protocol) server over stdio.
 //
-// Exposes the Paygress CLI's consumer commands (list, spawn, batch,
-// status, topup) as tools that Claude Desktop / Claude Code / Cline /
-// Cursor / any MCP client can call directly. Stdio transport so the
-// host plugs us in via:
+// Exposes the consumer commands (list, spawn, batch, status, topup,
+// exec) as tools an MCP client can call:
 //
-//     {
-//       "mcpServers": {
-//         "paygress": {
-//           "command": "paygress-cli",
-//           "args": ["mcp"]
-//         }
-//       }
-//     }
+//     {"mcpServers": {"paygress": {"command": "paygress-cli",
+//                                  "args": ["mcp"]}}}
 //
-// The server is intentionally a thin wrapper: each tool calls into
-// the same helpers the regular CLI subcommands use, so behavior stays
-// identical regardless of how the user invokes it.
-//
-// Tracing is routed to stderr by `cli/main.rs` (line ~68) so MCP's
-// stdio transport on stdout stays uncluttered.
+// Each tool calls the same helpers the CLI subcommands use, so behavior
+// stays identical regardless of how the user invokes it. Tracing goes
+// to stderr (see cli/main.rs) so the stdio transport stays clean.
 
 use std::future::Future;
 
@@ -32,26 +21,23 @@ use rmcp::{tool, tool_handler, tool_router, Error as McpError, ServerHandler, Se
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::batch;
-use super::identity::{get_or_create_identity, parse_relays};
-use super::spawn::{nostr_spawn_round_trip, NostrSpawnOutcome};
+use super::batch::{self, FanOutConfig, ShardResult};
+use super::spawn::{nostr_spawn_round_trip, NostrSpawnOutcome, NostrSpawnParams};
 use super::status::{nostr_status_round_trip, NostrStatusOutcome};
 use super::topup::{nostr_topup_round_trip, NostrTopupOutcome};
-use crate::exec_client;
+use crate::exec_client::{self, ExecRequest, ExecTarget};
+use crate::util::{generate_password, get_or_create_identity, parse_relays};
 use paygress::discovery::DiscoveryClient;
-use paygress::nostr::ProviderFilter;
+use paygress::nostr::{IsolationLevel, ProviderFilter};
 
 #[derive(Args, Default, Debug, Clone)]
 pub struct McpArgs {
-    /// Override the Nostr private key used when calling Paygress
-    /// providers. Falls back to ~/.paygress/identity if unset.
-    /// Most users won't set this — Claude Desktop / Cursor pass it
-    /// through environment variables if they need to override.
+    /// Nostr private key used when calling providers. Falls back to
+    /// ~/.paygress/identity.
     #[arg(long)]
     pub nostr_key: Option<String>,
 
-    /// Custom Nostr relays (comma-separated). Falls back to the
-    /// CLI's default relay list.
+    /// Custom Nostr relays (comma-separated)
     #[arg(long)]
     pub relays: Option<String>,
 }
@@ -64,9 +50,6 @@ pub async fn execute(args: McpArgs, _verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// The MCP server. Holds the rmcp tool router plus the per-process
-/// defaults (nostr key + relays) so tools don't have to plumb them
-/// from every call.
 #[derive(Clone)]
 pub struct PaygressMcpServer {
     nostr_key: Option<String>,
@@ -74,12 +57,9 @@ pub struct PaygressMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-// ---- Tool parameter types ----
-//
-// Each tool's parameters are a JsonSchema-derivable struct so rmcp
-// can publish a schema to the client. Keep these stable — once a
-// client has cached our tool schema, breaking changes here mean
-// silent tool-call failures from older harnesses.
+// Tool parameter types. Keep these stable — once a client has cached
+// our tool schema, breaking changes mean silent tool-call failures from
+// older harnesses.
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListProvidersParams {
@@ -117,13 +97,11 @@ pub struct SpawnParams {
     /// Per-spawn timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Minimum isolation tier the provider must offer. Stricter
-    /// tiers also match. One of:
-    ///   - "shared-kernel" (Docker / LXC; weakest)
-    ///   - "dedicated-host" (per-VM; no co-tenants)
-    ///   - "attested-research-tier" (SEV-SNP / TDX confidential VM)
-    /// When unset, no filter is applied. The check runs before the
-    /// Cashu token is sent — a tier mismatch fails fast.
+    /// Minimum isolation tier the provider must offer; stricter tiers
+    /// also match. One of "shared-kernel" (Docker / LXC; weakest),
+    /// "dedicated-host" (per-VM; no co-tenants), or
+    /// "attested-research-tier" (SEV-SNP / TDX confidential VM).
+    /// Checked before the Cashu token is sent.
     #[serde(default)]
     pub isolation_level: Option<String>,
 }
@@ -165,8 +143,8 @@ pub struct BatchParams {
     /// Per-shard timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Minimum isolation tier the provider must offer (same enum
-    /// as `SpawnParams.isolation_level`). Applied to every shard.
+    /// Minimum isolation tier the provider must offer (same values as
+    /// `SpawnParams.isolation_level`). Applied to every shard.
     #[serde(default)]
     pub isolation_level: Option<String>,
 }
@@ -175,14 +153,12 @@ fn default_batch_template() -> String {
     "agent-sandbox".to_string()
 }
 
-/// Resolve the optional MCP `isolation_level` string into the
-/// internal enum. Returns an MCP error if the slug is not one of
-/// the three valid values, so an agent-driven caller learns about
-/// the typo immediately rather than after the spawn round-trip.
-fn parse_iso_param(s: Option<&str>) -> Result<Option<paygress::nostr::IsolationLevel>, McpError> {
+/// Resolve the optional `isolation_level` string into the internal
+/// enum, erroring on a typo before any spawn round-trip.
+fn parse_iso_param(s: Option<&str>) -> Result<Option<IsolationLevel>, McpError> {
     match s {
         None => Ok(None),
-        Some(slug) => paygress::nostr::IsolationLevel::from_slug(slug).map(Some).ok_or_else(|| {
+        Some(slug) => IsolationLevel::from_slug(slug).map(Some).ok_or_else(|| {
             McpError::invalid_params(
                 format!(
                     "isolation_level: unknown value `{}` (expected: shared-kernel, dedicated-host, attested-research-tier)",
@@ -192,6 +168,14 @@ fn parse_iso_param(s: Option<&str>) -> Result<Option<paygress::nostr::IsolationL
             )
         }),
     }
+}
+
+/// Serialize a tool result body. Serialization of a `serde_json::Value`
+/// cannot fail, so the fallback is unreachable.
+fn tool_json(body: serde_json::Value) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
+    )]))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -270,9 +254,6 @@ impl PaygressMcpServer {
         }
     }
 
-    /// Resolve the effective Nostr key. Falls back to
-    /// `~/.paygress/identity`. Surfaced as a Result so we can map
-    /// identity-load errors into McpError cleanly.
     fn resolve_nostr_key(&self) -> Result<String, McpError> {
         get_or_create_identity(self.nostr_key.clone()).map_err(|e| {
             McpError::internal_error(format!("failed to load Nostr identity: {}", e), None)
@@ -297,12 +278,11 @@ impl PaygressMcpServer {
             .await
             .map_err(|e| McpError::internal_error(format!("nostr connect: {}", e), None))?;
 
-        // ProviderFilter applies server-side via DiscoveryClient. We
-        // don't filter on `is_online` here so the model can decide
+        // Deliberately no `is_online` filter, so the model can decide
         // what to do with offline providers (e.g. wait + retry).
         let filter = if params.capability.is_some() || params.min_uptime.is_some() {
             Some(ProviderFilter {
-                capability: params.capability.clone(),
+                capability: params.capability,
                 min_uptime: params.min_uptime,
                 min_memory_mb: None,
                 min_cpu: None,
@@ -330,25 +310,21 @@ impl PaygressMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let relays = self.resolve_relays();
         let nostr_key = self.resolve_nostr_key()?;
-        let ssh_pass = params
-            .ssh_pass
-            .clone()
-            .unwrap_or_else(|| generate_password(16));
-        let iso = parse_iso_param(params.isolation_level.as_deref())?;
+        let ssh_pass = params.ssh_pass.unwrap_or_else(|| generate_password(16));
+        let isolation_level = parse_iso_param(params.isolation_level.as_deref())?;
 
         let outcome = nostr_spawn_round_trip(
             &params.provider,
-            &params.tier,
-            &params.token,
-            params.image.clone(),
-            params.ssh_user.clone(),
-            ssh_pass.clone(),
-            params.template.clone(),
-            None,
-            None,
-            None,
-            None,
-            iso,
+            NostrSpawnParams {
+                tier: params.tier,
+                token: params.token,
+                image: params.image,
+                ssh_user: params.ssh_user.clone(),
+                ssh_pass: ssh_pass.clone(),
+                template_slug: params.template,
+                isolation_level,
+                ..Default::default()
+            },
             relays,
             nostr_key,
             params.timeout_secs,
@@ -357,8 +333,8 @@ impl PaygressMcpServer {
         .map_err(|e| McpError::internal_error(format!("spawn: {}", e), None))?;
 
         // Always reply with structured JSON so the caller can act on
-        // either branch (success vs error) without parsing prose.
-        let body = match outcome {
+        // either branch without parsing prose.
+        tool_json(match outcome {
             NostrSpawnOutcome::Success(access) => serde_json::json!({
                 "status": "spawned",
                 "ssh_user": params.ssh_user,
@@ -383,10 +359,7 @@ impl PaygressMcpServer {
                 "status": "timeout",
                 "message": "no response within timeout; token may have been spent",
             }),
-        };
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
-        )]))
+        })
     }
 
     #[tool(
@@ -396,9 +369,8 @@ impl PaygressMcpServer {
         &self,
         Parameters(params): Parameters<BatchParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Use the same materialize_tokens logic the CLI uses, so the
-        // split path behaves identically. We synthesize a BatchArgs
-        // because that's what materialize_tokens consumes.
+        // Reuse the CLI's token materialization so the split path
+        // behaves identically; BatchArgs is what it consumes.
         let cli_args = batch::BatchArgs {
             provider: params.provider.clone(),
             tokens: params.tokens.as_ref().map(|v| v.join(",")),
@@ -412,9 +384,6 @@ impl PaygressMcpServer {
             image: default_image(),
             nostr_key: self.nostr_key.clone(),
             relays: self.relays_override.clone(),
-            // The MCP-side `iso` is parsed below and applied per
-            // shard directly to nostr_spawn_round_trip; we don't
-            // need batch::materialize_tokens to know about it.
             isolation_level: None,
         };
         let tokens = batch::materialize_tokens(&cli_args)
@@ -422,96 +391,22 @@ impl PaygressMcpServer {
             .map_err(|e| McpError::invalid_params(format!("token resolution: {}", e), None))?;
         let n = tokens.len();
 
-        let relays = self.resolve_relays();
-        let nostr_key = self.resolve_nostr_key()?;
-        let iso = parse_iso_param(params.isolation_level.as_deref())?;
+        let cfg = FanOutConfig {
+            provider: params.provider.clone(),
+            tier: params.tier.clone(),
+            template: params.template.clone(),
+            image: default_image(),
+            timeout_secs: params.timeout_secs,
+            isolation_level: parse_iso_param(params.isolation_level.as_deref())?,
+            relays: self.resolve_relays(),
+            nostr_key: self.resolve_nostr_key()?,
+        };
 
-        // Concurrent spawn fan-out (same shape as batch::execute, but
-        // collected into a JSON manifest rather than written to disk).
-        let mut handles = Vec::with_capacity(n);
-        for (i, token) in tokens.into_iter().enumerate() {
-            let provider = params.provider.clone();
-            let tier = params.tier.clone();
-            let image = default_image();
-            let template = Some(params.template.clone());
-            let relays = relays.clone();
-            let nostr_key = nostr_key.clone();
-            let timeout = params.timeout_secs;
-            let ssh_user = "user".to_string();
-            let ssh_pass = generate_password(16);
-            let iso_per_shard = iso;
-
-            handles.push(tokio::spawn(async move {
-                let outcome = nostr_spawn_round_trip(
-                    &provider,
-                    &tier,
-                    &token,
-                    image,
-                    ssh_user.clone(),
-                    ssh_pass.clone(),
-                    template,
-                    None,
-                    None,
-                    None,
-                    None,
-                    iso_per_shard,
-                    relays,
-                    nostr_key,
-                    timeout,
-                )
-                .await;
-                (i, ssh_user, ssh_pass, outcome)
-            }));
-        }
-
-        let mut shards: Vec<serde_json::Value> = Vec::with_capacity(n);
-        for h in handles {
-            let (i, ssh_user, ssh_pass, outcome) = match h.await {
-                Ok(v) => v,
-                Err(e) => {
-                    shards.push(serde_json::json!({
-                        "index": 0,
-                        "status": "join_error",
-                        "error": e.to_string(),
-                    }));
-                    continue;
-                }
-            };
-            let entry = match outcome {
-                Ok(NostrSpawnOutcome::Success(access)) => serde_json::json!({
-                    "index": i,
-                    "status": "spawned",
-                    "ssh_user": ssh_user,
-                    "ssh_pass": ssh_pass,
-                    "access": access,
-                }),
-                Ok(NostrSpawnOutcome::ProviderOffline) => serde_json::json!({
-                    "index": i,
-                    "status": "offline",
-                }),
-                Ok(NostrSpawnOutcome::ProviderError(err)) => serde_json::json!({
-                    "index": i,
-                    "status": "provider_error",
-                    "error_type": err.error_type,
-                    "message": err.message,
-                }),
-                Ok(NostrSpawnOutcome::UnknownResponse(content)) => serde_json::json!({
-                    "index": i,
-                    "status": "unknown_response",
-                    "content": content,
-                }),
-                Ok(NostrSpawnOutcome::Timeout) => serde_json::json!({
-                    "index": i,
-                    "status": "timeout",
-                }),
-                Err(e) => serde_json::json!({
-                    "index": i,
-                    "status": "transport_error",
-                    "error": e.to_string(),
-                }),
-            };
-            shards.push(entry);
-        }
+        let mut shards: Vec<serde_json::Value> = batch::fan_out_spawns(&cfg, tokens)
+            .await
+            .into_iter()
+            .map(shard_result_json)
+            .collect();
         // Sort by index so the JSON ordering matches shard ordering.
         shards.sort_by_key(|v| v["index"].as_u64().unwrap_or(0));
 
@@ -519,17 +414,14 @@ impl PaygressMcpServer {
             .iter()
             .filter(|s| s["status"].as_str() == Some("spawned"))
             .count();
-        let manifest = serde_json::json!({
+        tool_json(serde_json::json!({
             "provider": params.provider,
             "template": params.template,
             "tier": params.tier,
             "shard_count": n,
             "spawned_count": spawned_count,
             "shards": shards,
-        });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string()),
-        )]))
+        }))
     }
 
     #[tool(
@@ -552,7 +444,7 @@ impl PaygressMcpServer {
         .await
         .map_err(|e| McpError::internal_error(format!("status: {}", e), None))?;
 
-        let body = match outcome {
+        tool_json(match outcome {
             NostrStatusOutcome::Success(s) => serde_json::json!({
                 "status": "ok",
                 "pod_id": s.pod_id,
@@ -573,10 +465,7 @@ impl PaygressMcpServer {
                 "status": "timeout",
                 "message": "provider did not respond within the timeout window",
             }),
-        };
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
-        )]))
+        })
     }
 
     #[tool(
@@ -600,7 +489,7 @@ impl PaygressMcpServer {
         .await
         .map_err(|e| McpError::internal_error(format!("topup: {}", e), None))?;
 
-        let body = match outcome {
+        tool_json(match outcome {
             NostrTopupOutcome::Success(r) => serde_json::json!({
                 "status": "ok",
                 "pod_id": r.pod_npub,
@@ -622,10 +511,7 @@ impl PaygressMcpServer {
                 "status": "timeout",
                 "message": "provider did not respond within the timeout window — token MAY have been spent; call workload_status to verify before retrying"
             }),
-        };
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
-        )]))
+        })
     }
 
     #[tool(
@@ -636,35 +522,78 @@ impl PaygressMcpServer {
         Parameters(params): Parameters<RunCommandParams>,
     ) -> Result<CallToolResult, McpError> {
         let total_timeout = std::time::Duration::from_secs(params.timeout_secs.saturating_add(5));
-        let outcome = exec_client::call_exec(
-            &params.host,
-            params.port,
-            &params.user,
-            &params.pass,
-            &params.command,
-            Some(params.timeout_secs),
-            params.working_dir.as_deref(),
-            total_timeout,
-        )
-        .await;
-
-        let body = match outcome {
-            Ok(resp) => serde_json::json!({
-                "status": "ok",
-                "stdout": resp.stdout,
-                "stderr": resp.stderr,
-                "exit_code": resp.exit_code,
-                "duration_ms": resp.duration_ms,
-                "timed_out": resp.timed_out,
-            }),
-            Err(e) => serde_json::json!({
-                "status": "transport_error",
-                "message": e.to_string(),
-            }),
+        let target = ExecTarget {
+            host: &params.host,
+            port: params.port,
+            user: &params.user,
+            pass: &params.pass,
         };
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
-        )]))
+        let request = ExecRequest {
+            command: params.command.clone(),
+            timeout_secs: Some(params.timeout_secs),
+            working_dir: params.working_dir.clone(),
+        };
+
+        tool_json(
+            match exec_client::call_exec(target, &request, total_timeout).await {
+                Ok(resp) => serde_json::json!({
+                    "status": "ok",
+                    "stdout": resp.stdout,
+                    "stderr": resp.stderr,
+                    "exit_code": resp.exit_code,
+                    "duration_ms": resp.duration_ms,
+                    "timed_out": resp.timed_out,
+                }),
+                Err(e) => serde_json::json!({
+                    "status": "transport_error",
+                    "message": e.to_string(),
+                }),
+            },
+        )
+    }
+}
+
+/// Render one fan-out shard as the MCP manifest's per-shard object.
+fn shard_result_json(result: ShardResult) -> serde_json::Value {
+    let spawn = match result {
+        ShardResult::Done(s) => *s,
+        ShardResult::JoinError(msg) => {
+            return serde_json::json!({"index": 0, "status": "join_error", "error": msg})
+        }
+    };
+    let index = spawn.index;
+    match spawn.outcome {
+        Ok(NostrSpawnOutcome::Success(access)) => serde_json::json!({
+            "index": index,
+            "status": "spawned",
+            "ssh_user": spawn.ssh_user,
+            "ssh_pass": spawn.ssh_pass,
+            "access": access,
+        }),
+        Ok(NostrSpawnOutcome::ProviderOffline) => serde_json::json!({
+            "index": index,
+            "status": "offline",
+        }),
+        Ok(NostrSpawnOutcome::ProviderError(err)) => serde_json::json!({
+            "index": index,
+            "status": "provider_error",
+            "error_type": err.error_type,
+            "message": err.message,
+        }),
+        Ok(NostrSpawnOutcome::UnknownResponse(content)) => serde_json::json!({
+            "index": index,
+            "status": "unknown_response",
+            "content": content,
+        }),
+        Ok(NostrSpawnOutcome::Timeout) => serde_json::json!({
+            "index": index,
+            "status": "timeout",
+        }),
+        Err(e) => serde_json::json!({
+            "index": index,
+            "status": "transport_error",
+            "error": e.to_string(),
+        }),
     }
 }
 
@@ -689,31 +618,18 @@ impl ServerHandler for PaygressMcpServer {
     }
 }
 
-fn generate_password(len: usize) -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..len)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn server_advertises_tool_capability() {
-        // Pin the get_info contract: clients use this to discover
-        // that we expose tools (vs prompts/resources).
         let server = PaygressMcpServer::new(McpArgs::default());
         let info = server.get_info();
         assert!(info.capabilities.tools.is_some());
         let inst = info.instructions.as_deref().unwrap_or("");
         assert!(inst.contains("Paygress"));
-        // Pin the lifecycle hint so future edits don't drop the
-        // workload_status / topup_workload / run_command mentions —
-        // agents rely on these to know when to call them.
+        // Agents rely on these lifecycle hints to know when to call them.
         assert!(inst.contains("workload_status"));
         assert!(inst.contains("topup_workload"));
         assert!(inst.contains("run_command"));
@@ -787,8 +703,6 @@ mod tests {
 
     #[test]
     fn batch_params_split_mode_carries_through() {
-        // The model is going to send {split_token, shards} as the
-        // common pattern; pin that the schema accepts it.
         let v = serde_json::from_value::<BatchParams>(serde_json::json!({
             "provider": "npub1abc",
             "split_token": "big-token",

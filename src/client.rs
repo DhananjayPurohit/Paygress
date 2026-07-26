@@ -1,15 +1,9 @@
-// Paygress consumer-side SDK (Unit 17 of the 12-month plan).
+// Consumer-side Rust SDK: `DiscoveryClient`'s read-only queries plus
+// the spawn/topup/status DM round-trips, returning typed `*Outcome`
+// enums so embedders don't hand-roll JSON parsing.
 //
-// `PaygressClient` is the canonical Rust SDK for talking to a
-// provider over Nostr DMs. It wraps `DiscoveryClient` (read-only
-// queries) plus the spawn/topup/status round-trip flows, and
-// exposes them as typed methods returning structured `*Outcome`
-// enums so embedders don't have to hand-roll JSON parsing.
-//
-// Today the CLI hand-rolls these flows in `src/cli/commands/{spawn,
-// topup,status}.rs`. A follow-up will refactor the CLI to consume
-// this SDK; this PR adds the surface so external Rust callers
-// (and the in-progress Python wrapper) can use it now.
+// The CLI still hand-rolls these flows in
+// `src/cli/commands/{spawn,topup,status}.rs`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,8 +22,8 @@ use crate::nostr::{
 const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_MESSAGE_TYPE: &str = "nip04";
 
-/// Builder for a Paygress consumer SDK client. Wraps the existing
-/// `DiscoveryClient` with typed write-side operations.
+/// Consumer SDK client: `DiscoveryClient` plus typed write-side
+/// operations.
 pub struct PaygressClient {
     discovery: DiscoveryClient,
     response_timeout_secs: u64,
@@ -37,11 +31,9 @@ pub struct PaygressClient {
 }
 
 impl PaygressClient {
-    /// Construct against the given relays and a Nostr private key
-    /// (`nsec1...` or hex). The key is required for any operation
-    /// that sends a DM (spawn / topup / status); read-only queries
-    /// would also work without one but this constructor unifies the
-    /// path so callers don't need two clients.
+    /// `private_key` is `nsec1…` or hex. Required for spawn / topup
+    /// / status; read-only queries would work without one, but a
+    /// single constructor saves callers from holding two clients.
     pub async fn new(relays: Vec<String>, private_key: String) -> Result<Self> {
         let discovery = DiscoveryClient::new_with_key(relays, private_key).await?;
         Ok(Self {
@@ -51,32 +43,26 @@ impl PaygressClient {
         })
     }
 
-    /// Override how long each round-trip waits for a provider
-    /// response. Defaults to 60s.
     pub fn with_response_timeout_secs(mut self, secs: u64) -> Self {
         self.response_timeout_secs = secs;
         self
     }
 
-    /// Override the encryption mode used for outbound DMs
-    /// (`"nip04"` or `"nip17"`). Defaults to `nip04`. NIP-17
-    /// gift-wrap is sender-anonymous but supported by fewer relays.
+    /// `"nip04"` (default) or `"nip17"`. NIP-17 gift-wrap is
+    /// sender-anonymous but supported by fewer relays.
     pub fn with_message_type(mut self, message_type: impl Into<String>) -> Self {
         self.message_type = message_type.into();
         self
     }
 
-    /// Consumer's npub (handy for receipts).
     pub fn npub(&self) -> String {
         self.discovery.get_npub()
     }
 
-    /// Underlying discovery client for read-only queries.
     pub fn discovery(&self) -> &DiscoveryClient {
         &self.discovery
     }
 
-    /// Discover providers matching an optional filter.
     pub async fn list_offers(
         &self,
         filter: Option<crate::nostr::ProviderFilter>,
@@ -84,7 +70,6 @@ impl PaygressClient {
         self.discovery.list_providers(filter).await
     }
 
-    /// Send a spawn request and wait for the provider's response.
     pub async fn spawn(&self, provider_npub: &str, request: SpawnRequest) -> Result<SpawnOutcome> {
         let payload = EncryptedSpawnPodRequest {
             cashu_token: request.cashu_token,
@@ -103,7 +88,6 @@ impl PaygressClient {
             .await
     }
 
-    /// Send a top-up request and wait for the provider's response.
     pub async fn topup(&self, provider_npub: &str, request: TopupRequest) -> Result<TopupOutcome> {
         let payload = EncryptedTopUpPodRequest {
             pod_npub: request.pod_id,
@@ -114,7 +98,6 @@ impl PaygressClient {
             .await
     }
 
-    /// Send a status query and wait for the provider's response.
     pub async fn status(&self, provider_npub: &str, pod_id: String) -> Result<StatusOutcome> {
         let payload = StatusRequestContent { pod_id };
         let json = serde_json::to_string(&payload)?;
@@ -148,38 +131,30 @@ impl PaygressClient {
     }
 }
 
-// ---------- request payloads ----------
-
-/// Inputs for a spawn request. Maps onto `EncryptedSpawnPodRequest`
-/// but the SDK type is the public-facing surface.
+/// SDK-facing form of `EncryptedSpawnPodRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRequest {
-    /// Cashu token paying for the workload.
     pub cashu_token: String,
-    /// Optional spec id (`basic`, `standard`, ...). Provider's
-    /// first spec is used if `None`.
+    /// Spec id (`basic`, `standard`, …); the provider's first spec
+    /// is used when `None`.
     pub pod_spec_id: Option<String>,
-    /// Container image to run.
     pub pod_image: String,
     pub ssh_username: String,
     pub ssh_password: String,
 }
 
-/// Inputs for a top-up request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopupRequest {
-    /// Pod identifier as returned by [`AccessDetailsContent::pod_npub`]
-    /// (e.g. `container-1234`).
+    /// Pod identifier from [`AccessDetailsContent::pod_npub`], e.g.
+    /// `container-1234`.
     pub pod_id: String,
     pub cashu_token: String,
 }
 
-// ---------- typed outcomes ----------
-
-/// Result of a spawn round-trip. Anything the provider sent that's
-/// neither an `AccessDetailsContent` nor an `ErrorResponseContent`
-/// surfaces as `Other(raw)` so callers can keep moving even when a
-/// provider speaks an evolved schema.
+/// Result of a spawn round-trip. Anything that is neither
+/// `AccessDetailsContent` nor `ErrorResponseContent` surfaces as
+/// `Other(raw)`, so a provider speaking an evolved schema doesn't
+/// break the caller.
 #[derive(Debug, Clone)]
 pub enum SpawnOutcome {
     Success(AccessDetailsContent),
@@ -201,10 +176,7 @@ pub enum StatusOutcome {
     Other(String),
 }
 
-// ---------- response parsers ----------
-
-/// Try to parse a provider response as an `ErrorResponseContent`.
-/// Returns `Some(err)` only when the JSON has the discriminating
+/// `Some(err)` only when the JSON carries the discriminating
 /// `error_type` + `message` fields and parses cleanly.
 fn try_parse_error(content: &str) -> Option<ErrorResponseContent> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
@@ -246,23 +218,15 @@ pub fn parse_status_response(content: &str) -> Result<StatusOutcome> {
 
 // ==================== Lease keep-alive (streaming payment) ====================
 //
-// Turns the one-shot `topup` round-trip into a streaming payer: instead
-// of pre-paying a whole lease (and losing it all if provisioning or the
-// provider fails), the consumer buys the lease in small pre-paid
-// intervals that this loop auto-renews before each one lapses.
-//
-//   - Max consumer loss on ANY failure = one interval, not the whole lease.
-//   - Cross-provider failover is trivial: stop paying npub A, start paying B.
-//   - `budget_msats` is the spend cap (guardrail for autonomous agents):
-//     the payer stops before a renewal would push cumulative spend over it.
-//
-// The per-tick decision is a pure function (`decide_tick`) so it's
-// testable without a clock or network; `LeaseKeepAlive::run` is the thin
-// I/O driver around it.
+// Buys the lease in small pre-paid intervals auto-renewed before each
+// lapses, rather than pre-paying the whole thing. Max loss on any
+// failure is one interval, and failover is just "stop paying npub A,
+// start paying B". `decide_tick` holds all the logic as a pure
+// function; `LeaseKeepAlive::run` is the I/O driver around it.
 
-/// Produces a fresh Cashu token worth at least `amount_msats`, drawn from
-/// the consumer's funds. Abstracted so the payer doesn't hard-depend on a
-/// wallet impl: `CdkTokenSource` wires a real cdk wallet; tests stub it.
+/// Produces a fresh Cashu token worth at least `amount_msats` from
+/// the consumer's funds. `CdkTokenSource` wires a real cdk wallet;
+/// tests stub it.
 #[async_trait]
 pub trait TokenSource: Send + Sync {
     async fn mint_token(&self, amount_msats: u64, mint_url: &str) -> Result<String>;
@@ -278,9 +242,9 @@ pub fn seconds_remaining(now: u64, expires_at: u64) -> u64 {
     expires_at.saturating_sub(now)
 }
 
-/// Renew when remaining lease has fallen to/below `interval * frac`.
-/// Renewing *before* expiry (not at it) absorbs relay + mint latency so
-/// the lease never actually lapses and the provider's reclaim never fires.
+/// Renew once the remaining lease falls to/below `interval * frac`.
+/// Renewing before expiry absorbs relay + mint latency, so the lease
+/// never lapses and the provider's reclaim never fires.
 pub fn should_renew(now: u64, expires_at: u64, interval_secs: u64, threshold_frac: f64) -> bool {
     let threshold = (interval_secs as f64 * threshold_frac).max(0.0) as u64;
     seconds_remaining(now, expires_at) <= threshold
@@ -293,9 +257,10 @@ pub struct KeepAliveConfig {
     pub provider_npub: String,
     /// Pod id from the spawn's AccessDetails (`container-<vmid>`).
     pub pod_id: String,
-    /// The chosen spec's price, used to size each interval's token.
+    /// The chosen spec's price, sizing each interval's token.
     pub rate_msats_per_sec: u64,
-    /// Mint the renewal tokens are drawn from (must be provider-whitelisted).
+    /// Mint the renewal tokens are drawn from; must be
+    /// provider-whitelisted.
     pub mint_url: String,
     /// Seconds of lease each renewal buys.
     pub interval_secs: u64,
@@ -303,24 +268,21 @@ pub struct KeepAliveConfig {
     pub renew_threshold_frac: f64,
     /// How often to re-check the clock.
     pub check_period: Duration,
-    /// Total spend cap in msats; `None` = unlimited. The payer stops
-    /// before a renewal would push cumulative spend over this.
+    /// Spend cap in msats; `None` = unlimited. The payer stops
+    /// before a renewal would push cumulative spend over it.
     pub budget_msats: Option<u64>,
 }
 
-/// What the payer should do this tick. Pure output of `decide_tick`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TickAction {
     /// Enough lease left — sleep and re-check.
     Sleep,
-    /// Time to renew; mint a token worth `amount_msats` and top up.
+    /// Mint a token worth `amount_msats` and top up.
     Renew { amount_msats: u64 },
     /// Renewing would exceed `budget_msats`; stop.
     StopBudget,
 }
 
-/// Pure per-tick decision. All the payer's logic lives here so it's
-/// testable without I/O.
 pub fn decide_tick(
     now: u64,
     expires_at: u64,
@@ -346,8 +308,7 @@ pub enum KeepAliveExit {
     Stopped { spent_msats: u64 },
     /// Hit the spend cap.
     BudgetExhausted { spent_msats: u64 },
-    /// Provider says the lease is gone (expired / not found / race) — no
-    /// point renewing a lease that no longer exists.
+    /// Provider says the lease is gone (expired / not found / race).
     LeaseGone { reason: String, spent_msats: u64 },
     /// Unrecoverable local error (mint failure past retries, etc.).
     Fatal { reason: String, spent_msats: u64 },
@@ -355,9 +316,7 @@ pub enum KeepAliveExit {
 
 const MAX_CONSECUTIVE_ERRS: u32 = 5;
 
-/// Streaming lease payer. Construct with a `KeepAliveConfig`, a
-/// `TokenSource` over the consumer's funds, and the initial `expires_at`
-/// from the spawn response, then `run`.
+/// Streaming lease payer.
 pub struct LeaseKeepAlive<T: TokenSource> {
     cfg: KeepAliveConfig,
     token_source: T,
@@ -368,10 +327,10 @@ impl<T: TokenSource> LeaseKeepAlive<T> {
         Self { cfg, token_source }
     }
 
-    /// Drive the lease forward, renewing before each interval lapses,
-    /// until `stop` is set, the budget is exhausted, or the lease is gone.
-    /// `initial_expires_at` is the unix-second expiry from the spawn's
-    /// AccessDetails.
+    /// Renew before each interval lapses until `stop` is set, the
+    /// budget is exhausted, or the lease is gone.
+    /// `initial_expires_at` is the unix-second expiry from the
+    /// spawn's AccessDetails.
     pub async fn run(
         &self,
         client: &PaygressClient,
@@ -395,63 +354,23 @@ impl<T: TokenSource> LeaseKeepAlive<T> {
                     return KeepAliveExit::BudgetExhausted { spent_msats };
                 }
                 TickAction::Renew { amount_msats } => {
-                    // Mint a small token from the consumer's funds.
-                    let token = match self
-                        .token_source
-                        .mint_token(amount_msats, &self.cfg.mint_url)
-                        .await
-                    {
-                        Ok(t) => t,
-                        Err(e) => {
-                            consecutive_errs += 1;
-                            if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
-                                return KeepAliveExit::Fatal {
-                                    reason: format!("mint failed {consecutive_errs}x: {e}"),
-                                    spent_msats,
-                                };
-                            }
-                            tokio::time::sleep(self.cfg.check_period).await;
-                            continue;
-                        }
-                    };
-
-                    let req = TopupRequest {
-                        pod_id: self.cfg.pod_id.clone(),
-                        cashu_token: token,
-                    };
-                    match client.topup(&self.cfg.provider_npub, req).await {
-                        Ok(TopupOutcome::Success(resp)) => {
+                    match self.renew_once(client, now, amount_msats).await {
+                        RenewStep::Extended(next_expiry) => {
                             consecutive_errs = 0;
                             spent_msats = spent_msats.saturating_add(amount_msats);
-                            expires_at = parse_rfc3339_unix(&resp.new_expires_at)
-                                // Provider extended but we couldn't parse the
-                                // timestamp; advance locally so we don't hot-loop.
-                                .unwrap_or_else(|| now.saturating_add(self.cfg.interval_secs));
+                            expires_at = next_expiry;
                         }
-                        Ok(TopupOutcome::Error(e)) => {
-                            if is_lease_gone(&e.error_type) {
-                                return KeepAliveExit::LeaseGone {
-                                    reason: format!("{}: {}", e.error_type, e.message),
-                                    spent_msats,
-                                };
-                            }
+                        RenewStep::Gone(reason) => {
+                            return KeepAliveExit::LeaseGone {
+                                reason,
+                                spent_msats,
+                            };
+                        }
+                        RenewStep::Retry(reason) => {
                             consecutive_errs += 1;
                             if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
                                 return KeepAliveExit::Fatal {
-                                    reason: format!(
-                                        "topup errored {consecutive_errs}x: {}",
-                                        e.error_type
-                                    ),
-                                    spent_msats,
-                                };
-                            }
-                            tokio::time::sleep(self.cfg.check_period).await;
-                        }
-                        Ok(TopupOutcome::Other(_)) | Err(_) => {
-                            consecutive_errs += 1;
-                            if consecutive_errs >= MAX_CONSECUTIVE_ERRS {
-                                return KeepAliveExit::Fatal {
-                                    reason: "topup failed past retry limit".to_string(),
+                                    reason: format!("{reason} ({consecutive_errs}x)"),
                                     spent_msats,
                                 };
                             }
@@ -462,6 +381,49 @@ impl<T: TokenSource> LeaseKeepAlive<T> {
             }
         }
     }
+
+    /// One mint-then-topup attempt. Never sleeps or counts errors —
+    /// `run` owns the retry budget.
+    async fn renew_once(&self, client: &PaygressClient, now: u64, amount_msats: u64) -> RenewStep {
+        let token = match self
+            .token_source
+            .mint_token(amount_msats, &self.cfg.mint_url)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => return RenewStep::Retry(format!("mint failed: {e}")),
+        };
+
+        let req = TopupRequest {
+            pod_id: self.cfg.pod_id.clone(),
+            cashu_token: token,
+        };
+        match client.topup(&self.cfg.provider_npub, req).await {
+            Ok(TopupOutcome::Success(resp)) => RenewStep::Extended(
+                parse_rfc3339_unix(&resp.new_expires_at)
+                    // Provider extended but the timestamp didn't
+                    // parse; advance locally so we don't hot-loop.
+                    .unwrap_or_else(|| now.saturating_add(self.cfg.interval_secs)),
+            ),
+            Ok(TopupOutcome::Error(e)) if is_lease_gone(&e.error_type) => {
+                RenewStep::Gone(format!("{}: {}", e.error_type, e.message))
+            }
+            Ok(TopupOutcome::Error(e)) => {
+                RenewStep::Retry(format!("topup errored: {}", e.error_type))
+            }
+            Ok(TopupOutcome::Other(_)) | Err(_) => RenewStep::Retry("topup failed".to_string()),
+        }
+    }
+}
+
+/// Outcome of a single renewal attempt.
+enum RenewStep {
+    /// Lease now runs to this unix second.
+    Extended(u64),
+    /// Recoverable; counts against the retry budget.
+    Retry(String),
+    /// Terminal — the lease no longer exists.
+    Gone(String),
 }
 
 fn unix_now() -> u64 {
@@ -477,8 +439,8 @@ fn parse_rfc3339_unix(s: &str) -> Option<u64> {
         .map(|dt| dt.timestamp().max(0) as u64)
 }
 
-/// Terminal provider error types where renewing is pointless. Matches the
-/// `error_type` strings the provider's topup handler emits.
+/// `error_type` strings from the provider's topup handler that mean
+/// renewing is pointless.
 fn is_lease_gone(error_type: &str) -> bool {
     matches!(
         error_type,
@@ -486,11 +448,9 @@ fn is_lease_gone(error_type: &str) -> bool {
     )
 }
 
-/// `TokenSource` backed by a cdk wallet. Mints a fresh token per interval
-/// with the same prepare_send/confirm dance `cashu::split_token_into_n`
-/// uses. The wallet is bound to one mint + unit at construction; assumes a
-/// `sat`-unit wallet and rounds msats up to the nearest sat so the
-/// provider never sees a short payment.
+/// `TokenSource` backed by a cdk wallet, bound to one mint + unit at
+/// construction. Assumes a `sat`-unit wallet and rounds msats *up*
+/// so the provider never sees a short payment.
 pub struct CdkTokenSource {
     wallet: Arc<cdk::wallet::Wallet>,
 }
@@ -731,7 +691,6 @@ mod tests {
 
     #[test]
     fn malformed_json_does_not_panic() {
-        // Provider sent something we can't even tokenize.
         let out = parse_topup_response("definitely not json").unwrap();
         assert!(matches!(out, TopupOutcome::Other(_)));
     }

@@ -1,14 +1,13 @@
-// Paygress CLI - Command Line Interface
-
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
 mod api;
 mod commands;
 mod exec_client;
+mod util;
 
 use commands::{
-    batch, bootstrap, ci, deploy, exec, list, mcp, provider, spawn, status, system, topup, wallet,
+    batch, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system, topup, wallet,
 };
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
@@ -35,7 +34,7 @@ enum Commands {
     /// Spawn a new workload with Cashu payment
     Spawn(spawn::SpawnArgs),
 
-    /// Deploy an opinionated template (Unit 9)
+    /// Deploy an opinionated template
     Deploy(deploy::DeployArgs),
 
     /// Top up an existing workload with additional payment
@@ -44,27 +43,16 @@ enum Commands {
     /// Get status of a workload
     Status(status::StatusArgs),
 
-    /// Fan-out N workloads in parallel for map-reduce shards, CI
-    /// matrices, and embarrassingly-parallel batch jobs.
+    /// Fan out N workloads in parallel
     Batch(batch::BatchArgs),
 
-    /// Run a Model Context Protocol (MCP) server over stdio so AI
-    /// harnesses (Claude Desktop, Claude Code, Cline, Cursor, ...)
-    /// can spawn / batch / discover providers as native tools.
+    /// Run a Model Context Protocol (MCP) server over stdio
     Mcp(mcp::McpArgs),
 
     /// Run a shell command inside a spawned agent-sandbox workload
-    /// via its baked-in HTTP exec server. Returns stdout/stderr/exit.
     Exec(exec::ExecArgs),
 
-    /// Run CI jobs on rented compute. `ci runner` attaches a leased
-    /// workload to a GitHub repo as an ephemeral self-hosted Actions
-    /// runner that takes exactly one job.
-    Ci(ci::CiArgs),
-
-    /// Local token utilities. `wallet mint` mints a fresh token from
-    /// a testnut-style mint — the funding source for unattended flows
-    /// like CI.
+    /// Local token utilities
     Wallet(wallet::WalletArgs),
 
     // ============ Provider Commands ============
@@ -87,7 +75,7 @@ fn print_banner() {
 #[tokio::main]
 async fn main() {
     // Default to `error` so relay-pool noise stays hidden during normal
-    // consumer use.  Set RUST_LOG=info (or pass --verbose) to see it.
+    // consumer use. Set RUST_LOG=info to see it.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -103,7 +91,6 @@ async fn main() {
     }
 
     let result = match cli.command {
-        // Consumer
         Commands::List(args) => list::execute(args, cli.verbose).await,
         Commands::Spawn(args) => spawn::execute(args, cli.verbose).await,
         Commands::Deploy(args) => deploy::execute(args, cli.verbose).await,
@@ -112,10 +99,7 @@ async fn main() {
         Commands::Batch(args) => batch::execute(args, cli.verbose).await,
         Commands::Mcp(args) => mcp::execute(args, cli.verbose).await,
         Commands::Exec(args) => exec::execute(args, cli.verbose).await,
-        Commands::Ci(args) => ci::execute(args, cli.verbose).await,
         Commands::Wallet(args) => wallet::execute(args).await,
-
-        // Provider
         Commands::Provider(args) => provider::execute(args, cli.verbose).await,
         Commands::Bootstrap(args) => bootstrap::execute(args, cli.verbose).await,
         Commands::System(args) => system::execute(args, cli.verbose).await,

@@ -1,12 +1,8 @@
-// Topup command - Extend workload lifetime with additional payment
+// `paygress-cli topup` — extend a workload's lease with more payment.
 //
-// Modes:
-//   - Single-shot Nostr (default with --provider): one TopUp DM,
-//     wait for response.
-//   - Single-shot HTTP (--server): one HTTP topup call.
-//   - Streaming (--stream + --tokens-file): one TopUp DM per tick,
-//     pulling fresh tokens from the file, until exhausted or
-//     Ctrl-C. Implements R15 in its year-1 chunked form (Unit 16).
+// Single-shot via Nostr (--provider) or HTTP (--server), or streaming
+// (--stream --tokens-file): one TopUp DM per tick, pulling fresh tokens
+// from the file until exhausted or Ctrl-C.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -16,10 +12,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
 
-use super::identity::{get_or_create_identity, parse_relays};
 use crate::api::{PaygressClient, TopupRequest};
+use crate::util::{get_or_create_identity, parse_relays, spinner};
 use paygress::discovery::DiscoveryClient;
 
 #[derive(Args)]
@@ -49,15 +44,12 @@ pub struct TopupArgs {
     pub relays: Option<String>,
 
     /// Stream chunked top-ups: one TopUp DM per tick, pulling fresh
-    /// tokens from `--tokens-file` until exhausted or Ctrl-C.
-    /// Sub-second streaming (full Cashu streaming-NUT) is out of
-    /// scope for year 1 — this is "stream sats, not stream Cashu
-    /// protocol bytes" (Unit 16).
+    /// tokens from --tokens-file until exhausted or Ctrl-C
     #[arg(long)]
     pub stream: bool,
 
-    /// Seconds between top-ups in streaming mode. Smaller ticks
-    /// have higher message overhead; larger ticks coarsen failover.
+    /// Seconds between top-ups in streaming mode. Smaller ticks have
+    /// higher message overhead; larger ticks coarsen failover.
     #[arg(long, default_value_t = 60)]
     pub tick_secs: u64,
 
@@ -67,23 +59,21 @@ pub struct TopupArgs {
     pub tokens_file: Option<PathBuf>,
 }
 
-pub async fn execute(args: TopupArgs, verbose: bool) -> Result<()> {
+pub async fn execute(mut args: TopupArgs, verbose: bool) -> Result<()> {
     if args.stream {
-        return execute_stream(args, verbose).await;
+        return execute_stream(args).await;
     }
 
-    // Single-shot path: --token is required.
     let token = args
         .token
-        .clone()
+        .take()
         .ok_or_else(|| anyhow::anyhow!("--token is required (or use --stream --tokens-file)"))?;
 
-    if args.provider.is_some() {
-        let provider = args.provider.clone().unwrap();
-        return execute_nostr_topup(provider, args, token, verbose).await;
+    if let Some(provider) = args.provider.take() {
+        return execute_nostr_topup(provider, args, token).await;
     }
 
-    let server = args.server.clone().ok_or_else(|| {
+    let server = args.server.take().ok_or_else(|| {
         anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required")
     })?;
 
@@ -102,72 +92,56 @@ async fn execute_http_topup(
         println!("  Pod ID: {}", args.pod_id);
     }
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.blue} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Processing top-up payment...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
-
+    let spinner = spinner("Processing top-up payment...");
     let client = PaygressClient::new(server);
-
-    let request = TopupRequest {
-        pod_id: args.pod_id.clone(),
-        cashu_token: Some(token),
-    };
-
-    let response = client.topup_pod(request).await?;
+    let response = client
+        .topup_pod(TopupRequest {
+            pod_id: args.pod_id,
+            cashu_token: Some(token),
+        })
+        .await?;
     spinner.finish_and_clear();
 
-    if response.success {
-        println!("{}", "Pod topped up successfully!".green().bold());
-        println!();
-
-        if let Some(pod_id) = &response.pod_id {
-            println!("  {} {}", "Pod ID:".bold(), pod_id);
-        }
-        if let Some(expires) = &response.new_expires_at {
-            println!("  {} {}", "New Expiry:".bold(), expires);
-        }
-        if let Some(added) = response.added_seconds {
-            let minutes = added / 60;
-            let seconds = added % 60;
-            println!("  {} +{}m {}s", "Added:".bold(), minutes, seconds);
-        }
-        if let Some(msg) = &response.message {
-            println!("  {} {}", "Message:".bold(), msg);
-        }
-    } else {
-        let error_msg = response
-            .error
-            .unwrap_or_else(|| "Unknown error".to_string());
+    if !response.success {
+        let error_msg = response.error.as_deref().unwrap_or("Unknown error");
         return Err(anyhow::anyhow!("Failed to top up pod: {}", error_msg));
+    }
+
+    println!("{}", "Pod topped up successfully!".green().bold());
+    println!();
+
+    if let Some(pod_id) = &response.pod_id {
+        println!("  {} {}", "Pod ID:".bold(), pod_id);
+    }
+    if let Some(expires) = &response.new_expires_at {
+        println!("  {} {}", "New Expiry:".bold(), expires);
+    }
+    if let Some(added) = response.added_seconds {
+        println!("  {} +{}m {}s", "Added:".bold(), added / 60, added % 60);
+    }
+    if let Some(msg) = &response.message {
+        println!("  {} {}", "Message:".bold(), msg);
     }
 
     Ok(())
 }
 
-/// Typed outcome of a Nostr topup round-trip. Same dual-shape pattern
-/// as `NostrSpawnOutcome` — lets the pretty-print path and the MCP
-/// server share one transport.
+/// Typed outcome of a Nostr topup round-trip, shared by the CLI
+/// pretty-printer and the MCP server.
 #[derive(Debug, Clone)]
 pub enum NostrTopupOutcome {
     Success(paygress::nostr::TopUpResponseContent),
     /// Provider rejected the topup (insufficient payment, lease
-    /// expired, not the owner, race-lost, etc.). Error type strings
-    /// are stable — callers can match.
+    /// expired, not the owner, race-lost, ...). Error type strings are
+    /// stable — callers can match on them.
     ProviderError(paygress::nostr::ErrorResponseContent),
-    /// Provider responded but the body wasn't either schema.
     UnknownResponse(String),
-    /// Provider didn't respond within the timeout window. The token
-    /// MAY have been spent — caller should `status` to check.
+    /// No reply in the timeout window. The token MAY have been spent.
     Timeout,
 }
 
-/// Dispatch a single Nostr topup request and wait for the provider's
-/// reply. No I/O on stdout — pure round-trip + structured outcome.
+/// Dispatch one Nostr topup request and wait for the provider's reply.
+/// No stdout I/O — pure round-trip plus structured outcome.
 pub async fn nostr_topup_round_trip(
     pod_id: &str,
     token: &str,
@@ -197,9 +171,8 @@ pub async fn nostr_topup_round_trip(
         .await
     {
         Ok(response) => {
-            // Provider reply order: try TopUpResponseContent first
-            // (the success path) then ErrorResponseContent. Both have
-            // distinct shapes so the wrong-type parse fails cleanly.
+            // Success and error bodies have distinct shapes, so the
+            // wrong-type parse fails cleanly.
             if let Ok(s) = serde_json::from_str::<TopUpResponseContent>(&response.content) {
                 Ok(NostrTopupOutcome::Success(s))
             } else if let Ok(err) = serde_json::from_str::<ErrorResponseContent>(&response.content)
@@ -213,12 +186,7 @@ pub async fn nostr_topup_round_trip(
     }
 }
 
-async fn execute_nostr_topup(
-    provider_npub: String,
-    args: TopupArgs,
-    token: String,
-    _verbose: bool,
-) -> Result<()> {
+async fn execute_nostr_topup(provider_npub: String, args: TopupArgs, token: String) -> Result<()> {
     println!("{}", "Topping Up Workload".blue().bold());
     println!("{}", "-".repeat(50).blue());
     println!();
@@ -276,11 +244,9 @@ async fn execute_nostr_topup(
     Ok(())
 }
 
-// ==================== Streaming ====================
-
-/// Read tokens from a file (one per line). Blank lines and `#`
-/// comments are ignored. Returned in file order so callers can
-/// reason about per-tick spend predictably.
+/// Read tokens from a file (one per line). Blank lines and `#` comments
+/// are ignored. Returned in file order so callers can reason about
+/// per-tick spend predictably.
 pub fn read_tokens_file(path: &std::path::Path) -> Result<Vec<String>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
@@ -292,8 +258,6 @@ pub fn read_tokens_file(path: &std::path::Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Outcome of a streaming session, useful for tests and CLI exit
-/// reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamSummary {
     pub chunks_sent: usize,
@@ -301,17 +265,13 @@ pub struct StreamSummary {
     pub exhausted: bool,
 }
 
-/// Future returned by the per-chunk send function.
 pub type SendFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 
-/// Pure streaming loop: pulls tokens off `tokens` and calls
-/// `send_one(token)` once per tick until the iterator is empty.
-/// Errors from `send_one` are counted but do not abort the loop —
-/// the user's wallet has already paid for the chunk; we don't get
-/// it back by retrying.
+/// Pull tokens off `tokens` and call `send_one` once per tick until the
+/// list is empty. Errors are counted but do not abort the loop — the
+/// wallet already paid for the chunk; retrying doesn't get it back.
 ///
-/// The loop is generic over the send function so unit tests can
-/// pass a mock that records calls (no Nostr / no provider needed).
+/// Generic over the send function so tests can pass a recording mock.
 pub async fn run_stream_loop<F>(tokens: Vec<String>, tick: Duration, send_one: F) -> StreamSummary
 where
     F: for<'a> Fn(&'a str) -> SendFuture<'a> + Send + Sync,
@@ -340,7 +300,7 @@ where
     }
 }
 
-async fn execute_stream(args: TopupArgs, _verbose: bool) -> Result<()> {
+async fn execute_stream(args: TopupArgs) -> Result<()> {
     let provider_npub = args.provider.clone().ok_or_else(|| {
         anyhow::anyhow!("--stream requires --provider (HTTP streaming is not yet supported)")
     })?;
@@ -371,8 +331,8 @@ async fn execute_stream(args: TopupArgs, _verbose: bool) -> Result<()> {
     let relays = parse_relays(args.relays);
     let nostr_key = get_or_create_identity(args.nostr_key)?;
     let client = Arc::new(DiscoveryClient::new_with_key(relays, nostr_key).await?);
-    let pod_id = args.pod_id.clone();
-    let provider = provider_npub.clone();
+    let pod_id = args.pod_id;
+    let provider = provider_npub;
 
     let summary = run_stream_loop(tokens, Duration::from_secs(args.tick_secs), move |token| {
         let client = client.clone();

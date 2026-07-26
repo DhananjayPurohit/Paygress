@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|(i, p)| PortMapping {
             host_port: host_port_base.saturating_add(1 + i as u16),
             container_port: p.container_port,
-            protocol: "tcp",
+            protocol: "tcp".to_string(),
         })
         .collect();
     let template_env: HashMap<String, String> = def

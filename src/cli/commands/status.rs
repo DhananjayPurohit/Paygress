@@ -1,16 +1,12 @@
-// Status command - Get workload status
-//
-// Unified command that works in both modes:
-//   - Nostr mode (--provider): queries a provider via Nostr
-//   - HTTP mode (--server): queries a Paygress HTTP server
+// `paygress-cli status` — query a workload's lease, either via Nostr
+// (`--provider`) or against a Paygress HTTP server (`--server`).
 
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
 
-use super::identity::{get_or_create_identity, parse_relays};
 use crate::api::PaygressClient;
+use crate::util::{get_or_create_identity, parse_relays, spinner};
 
 #[derive(Args)]
 pub struct StatusArgs {
@@ -31,14 +27,12 @@ pub struct StatusArgs {
     pub relays: Option<String>,
 }
 
-pub async fn execute(args: StatusArgs, verbose: bool) -> Result<()> {
-    if args.provider.is_some() {
-        let provider = args.provider.clone().unwrap();
-        return execute_nostr_status(args.pod_id.clone(), provider, args.relays.clone(), verbose)
-            .await;
+pub async fn execute(mut args: StatusArgs, verbose: bool) -> Result<()> {
+    if let Some(provider) = args.provider.take() {
+        return execute_nostr_status(args.pod_id, provider, args.relays, verbose).await;
     }
 
-    let server = args.server.clone().ok_or_else(|| {
+    let server = args.server.take().ok_or_else(|| {
         anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required")
     })?;
 
@@ -52,54 +46,41 @@ async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> R
         println!("  Pod ID: {}", args.pod_id);
     }
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.blue} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Fetching pod status...");
-    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-
+    let spinner = spinner("Fetching pod status...");
     let client = PaygressClient::new(server);
     let response = client.get_pod_status(&args.pod_id).await?;
     spinner.finish_and_clear();
 
-    if response.success {
-        display_status(
-            response.pod_id.as_deref().unwrap_or(&args.pod_id),
-            response.status.as_deref().unwrap_or("Unknown"),
-            response.ssh_host.as_deref(),
-            response.ssh_port,
-            response.ssh_username.as_deref(),
-            response.expires_at.as_deref(),
-            response.time_remaining_seconds.map(|t| t as u64),
-        );
-    } else {
-        let error_msg = response
-            .error
-            .unwrap_or_else(|| "Unknown error".to_string());
+    if !response.success {
+        let error_msg = response.error.as_deref().unwrap_or("Unknown error");
         return Err(anyhow::anyhow!("Failed to get pod status: {}", error_msg));
     }
+
+    display_status(
+        response.pod_id.as_deref().unwrap_or(&args.pod_id),
+        response.status.as_deref().unwrap_or("Unknown"),
+        response.ssh_host.as_deref(),
+        response.ssh_port,
+        response.ssh_username.as_deref(),
+        response.expires_at.as_deref(),
+        response.time_remaining_seconds.map(|t| t as u64),
+    );
 
     Ok(())
 }
 
-/// Typed outcome of a Nostr status round-trip. Same dual-shape
-/// pattern as `NostrSpawnOutcome`: lets the pretty-print path and
-/// the MCP server share one transport.
+/// Typed outcome of a Nostr status round-trip, shared by the CLI
+/// pretty-printer and the MCP server.
 #[derive(Debug, Clone)]
 pub enum NostrStatusOutcome {
     Success(paygress::nostr::StatusResponseContent),
-    /// Provider responded but the body wasn't a valid status response
-    /// (could be a future-shape forward-compat surprise).
+    /// Provider replied, but not with a status response we recognize.
     UnparseableResponse(String),
-    /// Provider didn't respond within the timeout window.
     Timeout,
 }
 
-/// Dispatch a single Nostr status request and wait for the provider's
-/// reply. No I/O on stdout — pure round-trip + structured outcome.
+/// Dispatch one Nostr status request and wait for the provider's
+/// reply. No stdout I/O — pure round-trip plus structured outcome.
 pub async fn nostr_status_round_trip(
     pod_id: &str,
     provider_npub: &str,
@@ -147,14 +128,7 @@ async fn execute_nostr_status(
         println!("  Workload ID: {}", pod_id);
     }
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.blue} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Connecting to Nostr and querying provider...");
-    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    let spinner = spinner("Connecting to Nostr and querying provider...");
 
     let nostr_key = get_or_create_identity(None)?;
     let relays = parse_relays(relays_opt);
@@ -173,21 +147,16 @@ async fn execute_nostr_status(
                 Some(&status_resp.expires_at),
                 Some(status_resp.time_remaining_seconds),
             );
+            Ok(())
         }
-        NostrStatusOutcome::UnparseableResponse(body) => {
-            return Err(anyhow::anyhow!(
-                "Provider returned an unrecognized status response (forward-compat schema?): {}",
-                body
-            ));
-        }
-        NostrStatusOutcome::Timeout => {
-            return Err(anyhow::anyhow!(
-                "Timed out waiting for status from provider"
-            ));
-        }
+        NostrStatusOutcome::UnparseableResponse(body) => Err(anyhow::anyhow!(
+            "Provider returned an unrecognized status response (forward-compat schema?): {}",
+            body
+        )),
+        NostrStatusOutcome::Timeout => Err(anyhow::anyhow!(
+            "Timed out waiting for status from provider"
+        )),
     }
-
-    Ok(())
 }
 
 fn display_status(
@@ -215,14 +184,11 @@ fn display_status(
 
     if let Some(host) = ssh_host {
         let username = ssh_username.unwrap_or("root");
-        if let Some(port) = ssh_port {
-            if port != 0 && port != 22 {
-                println!("  {} ssh {}@{} -p {}", "SSH:".bold(), username, host, port);
-            } else {
-                println!("  {} ssh {}@{}", "SSH:".bold(), username, host);
+        match ssh_port {
+            Some(port) if port != 0 && port != 22 => {
+                println!("  {} ssh {}@{} -p {}", "SSH:".bold(), username, host, port)
             }
-        } else {
-            println!("  {} ssh {}@{}", "SSH:".bold(), username, host);
+            _ => println!("  {} ssh {}@{}", "SSH:".bold(), username, host),
         }
     }
 
@@ -231,31 +197,33 @@ fn display_status(
     }
 
     if let Some(remaining) = time_remaining {
-        if remaining > 0 {
-            let hours = remaining / 3600;
-            let minutes = (remaining % 3600) / 60;
-            let seconds = remaining % 60;
-
-            let time_str = if hours > 0 {
-                format!("{}h {}m {}s", hours, minutes, seconds)
-            } else if minutes > 0 {
-                format!("{}m {}s", minutes, seconds)
-            } else {
-                format!("{}s", seconds)
-            };
-
-            let time_colored = if remaining < 300 {
-                time_str.red().to_string()
-            } else if remaining < 600 {
-                time_str.yellow().to_string()
-            } else {
-                time_str.green().to_string()
-            };
-
-            println!("  {} {}", "Time Left:".bold(), time_colored);
-        } else {
-            println!("  {} {}", "Time Left:".bold(), "Expired".red());
-        }
+        println!("  {} {}", "Time Left:".bold(), format_time_left(remaining));
     }
     println!();
+}
+
+fn format_time_left(remaining: u64) -> String {
+    if remaining == 0 {
+        return "Expired".red().to_string();
+    }
+
+    let hours = remaining / 3600;
+    let minutes = (remaining % 3600) / 60;
+    let seconds = remaining % 60;
+
+    let time_str = if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    };
+
+    if remaining < 300 {
+        time_str.red().to_string()
+    } else if remaining < 600 {
+        time_str.yellow().to_string()
+    } else {
+        time_str.green().to_string()
+    }
 }

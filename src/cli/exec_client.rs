@@ -1,10 +1,6 @@
 // Typed HTTP client for the agent-sandbox exec server
 // (`images/agent-sandbox/server.py`).
 //
-// Used by:
-//   - `paygress-cli exec`              (interactive shell convenience)
-//   - `paygress-cli mcp` `run_command` (agent-driven exec)
-//
 // Wire format mirrors the server's:
 //   POST http://<host>:<port>/exec
 //   Authorization: Basic <base64(user:pass)>
@@ -17,6 +13,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+
+/// Where to reach an exec server, and how to authenticate to it.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecTarget<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub user: &'a str,
+    pub pass: &'a str,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecRequest {
@@ -38,73 +43,52 @@ pub struct ExecResponse {
     pub timed_out: bool,
 }
 
-/// Endpoint construction is deliberately schemed: a stray `https://`
-/// in the host (because the user pasted a URL) shouldn't double-prefix.
-/// We accept either bare host or full base URL and normalize.
+/// Accept either a bare host or a full base URL so a pasted URL
+/// doesn't end up double-prefixed or double-ported.
 fn normalize_endpoint(host: &str, port: u16) -> String {
     let h = host.trim();
-    if h.starts_with("http://") || h.starts_with("https://") {
-        // Already a URL — assume the user knows what port they want
-        // and only append the port if the input has no port section.
-        // Heuristic: if there's a colon AFTER the scheme delimiter,
-        // there's already a port.
-        if let Some(rest) = h
-            .strip_prefix("http://")
-            .or_else(|| h.strip_prefix("https://"))
-        {
-            let scheme = if h.starts_with("https://") {
-                "https"
-            } else {
-                "http"
-            };
-            let host_part = rest.split('/').next().unwrap_or(rest);
-            if host_part.contains(':') {
-                return format!("{}://{}", scheme, rest.trim_end_matches('/'));
-            }
-            return format!("{}://{}:{}", scheme, rest.trim_end_matches('/'), port);
-        }
+    let (scheme, rest) = if let Some(r) = h.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = h.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return format!("http://{}:{}", h, port);
+    };
+
+    let rest = rest.trim_end_matches('/');
+    let host_part = rest.split('/').next().unwrap_or(rest);
+    if host_part.contains(':') {
+        format!("{}://{}", scheme, rest)
+    } else {
+        format!("{}://{}:{}", scheme, rest, port)
     }
-    format!("http://{}:{}", h, port)
 }
 
 /// HTTP Basic auth header value. Public so test harnesses can
 /// build the same value the server expects.
 pub fn basic_auth(user: &str, pass: &str) -> String {
-    let creds = format!("{}:{}", user, pass);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
     format!("Basic {}", encoded)
 }
 
-/// POST /exec on the agent-sandbox HTTP server. Returns the typed
-/// response. `total_timeout` covers the full HTTP request including
-/// the server-side command runtime — set it slightly above the
-/// `timeout_secs` body field to allow the server to surface a
-/// `timed_out: true` response rather than hitting the client's
-/// transport timeout first.
+/// POST /exec on the agent-sandbox HTTP server. `total_timeout` covers
+/// the full request including the server-side command runtime — set it
+/// slightly above `request.timeout_secs` so the server can return a
+/// structured `timed_out: true` before our transport gives up.
 pub async fn call_exec(
-    host: &str,
-    port: u16,
-    user: &str,
-    pass: &str,
-    command: &str,
-    timeout_secs: Option<u64>,
-    working_dir: Option<&str>,
+    target: ExecTarget<'_>,
+    request: &ExecRequest,
     total_timeout: Duration,
 ) -> Result<ExecResponse> {
-    let url = format!("{}/exec", normalize_endpoint(host, port));
-    let body = ExecRequest {
-        command: command.to_string(),
-        timeout_secs,
-        working_dir: working_dir.map(|s| s.to_string()),
-    };
+    let url = format!("{}/exec", normalize_endpoint(target.host, target.port));
     let client = reqwest::Client::builder()
         .timeout(total_timeout)
         .build()
         .context("failed to build reqwest client")?;
     let resp = client
         .post(&url)
-        .header("Authorization", basic_auth(user, pass))
-        .json(&body)
+        .header("Authorization", basic_auth(target.user, target.pass))
+        .json(request)
         .send()
         .await
         .with_context(|| format!("POST {} failed", url))?;
@@ -116,26 +100,6 @@ pub async fn call_exec(
     resp.json::<ExecResponse>()
         .await
         .context("exec server response was not the expected JSON shape")
-}
-
-/// Health check for the exec server. Unauthenticated by design (so
-/// the provider can liveness-probe). Returns Ok(()) on 2xx, error
-/// otherwise.
-pub async fn call_health(host: &str, port: u16, total_timeout: Duration) -> Result<()> {
-    let url = format!("{}/health", normalize_endpoint(host, port));
-    let client = reqwest::Client::builder()
-        .timeout(total_timeout)
-        .build()
-        .context("failed to build reqwest client")?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", url))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("health check returned HTTP {}", resp.status());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -165,7 +129,6 @@ mod tests {
 
     #[test]
     fn endpoint_keeps_explicit_port_in_url() {
-        // If the URL already has a port, we don't override it.
         assert_eq!(
             normalize_endpoint("http://1.2.3.4:7777", 8080),
             "http://1.2.3.4:7777"
@@ -182,9 +145,8 @@ mod tests {
 
     #[test]
     fn basic_auth_matches_servers_python_format() {
-        // Pin the format so a python-side change in server.py would
-        // also need a Rust-side change: both must base64-encode
-        // "user:pass" with standard alphabet.
+        // Pin the format: a python-side change in server.py must also
+        // change this side. Both base64-encode "user:pass".
         assert_eq!(basic_auth("root", "hunter2"), "Basic cm9vdDpodW50ZXIy");
     }
 
