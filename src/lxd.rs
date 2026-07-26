@@ -3,7 +3,7 @@
 // Implements ComputeBackend using the 'lxc' command line tool.
 // This is suitable for single-node setups like a VPS.
 
-use crate::compute::{ComputeBackend, ContainerConfig, NodeStatus};
+use crate::compute::{ComputeBackend, ContainerConfig, ContainerStatus, NodeStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::process::Command;
@@ -207,6 +207,27 @@ impl ComputeBackend for LxdBackend {
         let name = format!("paygress-{}", id);
         self.run_lxc(&["start", &name])?;
         Ok(())
+    }
+
+    async fn get_container_status(&self, id: u32) -> Result<ContainerStatus> {
+        let name = format!("paygress-{}", id);
+        let raw = self.run_lxc(&["list", &format!("^{}$", name), "--format", "json"])?;
+        let containers = Self::parse_lxc_json(&raw)?;
+        let entry = containers.as_array().and_then(|a| {
+            a.iter()
+                .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(&name))
+        });
+
+        Ok(match entry {
+            None => ContainerStatus::Absent,
+            Some(c) => match c.get("status").and_then(|s| s.as_str()) {
+                Some("Running") => ContainerStatus::Running,
+                // Stopped, Frozen, and anything else non-running are
+                // all "not serving the tenant" for our purposes.
+                Some(_) => ContainerStatus::Stopped,
+                None => ContainerStatus::Running,
+            },
+        })
     }
 
     /// Idempotent: `lxc stop` exits non-zero on an already-stopped

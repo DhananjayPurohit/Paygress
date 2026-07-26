@@ -7,10 +7,11 @@ name: CI
 # itself off, releasing the lease's compute). Dogfooding with teeth —
 # every push is a real spawn paid over the real protocol.
 #
-# Fork PRs never touch self-hosted runners: they run on the hosted
-# duplicates at the bottom. If the provider is down, spawn-runners
-# fails loud; fix the provider (or re-run) rather than papering over
-# it — outages are exactly the signal dogfooding exists to surface.
+# Fork PRs never touch self-hosted runners, and a repo without the
+# paygress config below runs everything hosted — both use the hosted
+# jobs at the bottom. A *configured* provider that is down still
+# fails loudly: outages are the signal dogfooding exists to surface,
+# whereas "not set up yet" is not a failure.
 #
 # Repo configuration this workflow expects:
 #   secrets.CI_RUNNER_PAT      fine-grained PAT, Administration: RW
@@ -51,7 +52,15 @@ jobs:
   spawn-runners:
     name: Spawn paygress runner (${{ matrix.target }})
     # Same-repo pushes and PRs only — fork PRs use the hosted jobs.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Needs the paygress config to exist. An unconfigured repo (fresh
+    # clone, or before the PAT is issued) falls back to hosted runners
+    # rather than failing — a missing variable is a configuration
+    # state, not a provider outage. A configured provider that is
+    # *down* still fails loudly, which is the signal worth having.
+    if: >-
+      vars.PAYGRESS_PROVIDER != '' &&
+      (github.event_name == 'push' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -176,9 +185,14 @@ jobs:
   # foot-gun; ephemeral single-job runners narrow it, this eliminates
   # it).
 
-  test-fork:
-    name: Test (fork, hosted)
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+  # Hosted fallback: fork PRs (never trust them on self-hosted) and
+  # repos with no paygress config yet.
+  test-hosted:
+    name: Test (hosted)
+    if: >-
+      vars.PAYGRESS_PROVIDER == '' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -189,9 +203,12 @@ jobs:
       - name: cargo test --all-features
         run: cargo test --all-features
 
-  clippy-fork:
-    name: Clippy (fork, hosted, advisory)
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+  clippy-hosted:
+    name: Clippy (hosted, advisory)
+    if: >-
+      vars.PAYGRESS_PROVIDER == '' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -206,23 +223,23 @@ jobs:
 
   # The single required check. Without it, a provider outage skips
   # `test` — and a skipped required check reads as green, i.e. the
-  # tests silently never ran. Skipped counts as failure here; only
-  # the fork/non-fork pair that was supposed to run may be skipped.
+  # tests silently never ran. Exactly one of the two test paths runs
+  # per event (paygress when configured, hosted otherwise), so the
+  # gate asserts that one of them actually passed.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [fmt, test, clippy, test-fork, clippy-fork]
+    needs: [fmt, test, clippy, test-hosted, clippy-hosted]
     runs-on: ubuntu-latest
     steps:
       - name: Require tests to have actually run
         run: |
           fmt='${{ needs.fmt.result }}'
-          own='${{ needs.test.result }}'
-          fork='${{ needs.test-fork.result }}'
-          echo "fmt=$fmt test=$own test-fork=$fork"
+          paygress='${{ needs.test.result }}'
+          hosted='${{ needs.test-hosted.result }}'
+          echo "fmt=$fmt test(paygress)=$paygress test(hosted)=$hosted"
           [ "$fmt" = success ] || { echo "::error::rustfmt did not pass"; exit 1; }
-          # Exactly one of the two test paths runs per event.
-          if [ "$own" = success ] || [ "$fork" = success ]; then
+          if [ "$paygress" = success ] || [ "$hosted" = success ]; then
             echo "test suite ran and passed"
           else
             echo "::error::no test job succeeded (provider outage or test failure)"

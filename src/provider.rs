@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use crate::cashu::{
     resolve_wallet_seed, validate_and_redeem, CdkRedeemer, MintRedeemer, RedeemError,
 };
-use crate::compute::{ComputeBackend, ContainerConfig, PortMapping};
+use crate::compute::{ComputeBackend, ContainerConfig, ContainerStatus, PortMapping};
 use crate::docker::DockerBackend;
 use crate::durable_workload::{
     DurableWorkload, HeartbeatObservation, QuorumConfig, StateMachineEvent, WorkloadState,
@@ -876,9 +876,48 @@ impl ProviderService {
                 reason,
             } => {
                 error!("Workload {} marked Failed: {}", workload_id, reason);
-                // Drop from active_workloads so cleanup_loop doesn't
-                // also try to delete a container that was never
-                // successfully respawned.
+
+                // Once the workload leaves active_workloads, cleanup_loop
+                // can never see it again — so anything left behind here
+                // strands the container and burns its vmid for good
+                // (`find_available_id` reads live backend state).
+                //
+                // Only reclaim a container that has already terminated
+                // itself, which is what a CI runner does when its single
+                // job ends. A still-running box belongs to a consumer who
+                // paid through `expires_at`: leave it, and let the normal
+                // expiry sweep take it. Anything other than a definite
+                // "not running" answer errs toward leaving it alone.
+                match self.backend.get_container_status(workload_id).await {
+                    Ok(ContainerStatus::Stopped) => {
+                        if let Err(e) = self.backend.delete_container(workload_id).await {
+                            warn!(
+                                "failed to delete self-terminated workload {}: {}",
+                                workload_id, e
+                            );
+                        }
+                    }
+                    Ok(ContainerStatus::Absent) => {}
+                    Ok(ContainerStatus::Running) => {
+                        warn!(
+                            "workload {} failed but its container is still running; \
+                             leaving it to the expiry sweep",
+                            workload_id
+                        );
+                        // Keep it tracked so the sweep still owns it.
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "could not determine container status for failed workload {}: {} \
+                             — leaving it to the expiry sweep",
+                            workload_id, e
+                        );
+                        return;
+                    }
+                }
+
+                self.state_machine.lock().await.untrack(workload_id);
                 let mut wl = self.active_workloads.lock().await;
                 wl.remove(&workload_id);
             }

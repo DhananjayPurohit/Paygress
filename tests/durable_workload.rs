@@ -46,6 +46,16 @@ fn workload(id: u32, provider: &str, replication: ReplicationMode, now: u64) -> 
     }
 }
 
+/// Heartbeat quorum is a provider-level signal, so only warm-standby
+/// workloads act on losing it — they have a standby to promote. Tests
+/// that exercise the Suspect / eviction path must therefore use this
+/// mode; `ReplicationMode::None` deliberately stays Live.
+fn warm_standby() -> ReplicationMode {
+    ReplicationMode::WarmStandby {
+        standby_providers: vec![PROVIDER_B.to_string()],
+    }
+}
+
 fn observation(provider: &str, relay: &str, when: u64) -> HeartbeatObservation {
     HeartbeatObservation {
         provider_npub: provider.to_string(),
@@ -107,7 +117,7 @@ fn live_stays_live_with_one_relay_silent() {
 #[test]
 fn live_transitions_to_suspect_after_t1_silence() {
     let mut sm = WorkloadStateMachine::new(quorum());
-    sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
+    sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
     let _ = sm.tick(
         10,
         &RELAYS
@@ -127,7 +137,7 @@ fn live_transitions_to_suspect_after_t1_silence() {
 #[test]
 fn suspect_recovers_to_live_within_t2() {
     let mut sm = WorkloadStateMachine::new(quorum());
-    sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
+    sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
     let _ = sm.tick(
         10,
         &RELAYS
@@ -151,7 +161,7 @@ fn suspect_recovers_to_live_within_t2() {
 #[test]
 fn suspect_evicts_after_t2_silence() {
     let mut sm = WorkloadStateMachine::new(quorum());
-    sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
+    sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
     let _ = sm.tick(
         10,
         &RELAYS
@@ -175,6 +185,61 @@ fn suspect_evicts_after_t2_silence() {
     assert!(events
         .iter()
         .any(|e| matches!(e, StateMachineEvent::Evicted { workload_id: 1, .. })));
+}
+
+#[test]
+fn non_replicated_workload_survives_quorum_loss() {
+    // Quorum is a provider-level signal: it says the provider could
+    // not reach enough relays, NOT that this container is unhealthy.
+    // A `replication: none` consumer paid through `expires_at` and
+    // has no standby to promote, so a relay outage must not start
+    // tearing their workload down. Regression test: this path used to
+    // evict, and eviction dropped the workload without deleting the
+    // container — leaking it and burning its vmid.
+    let mut sm = WorkloadStateMachine::new(quorum());
+    sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
+    let _ = sm.tick(
+        10,
+        &RELAYS
+            .iter()
+            .map(|r| observation(PROVIDER_A, r, 10))
+            .collect::<Vec<_>>(),
+    );
+
+    // Total relay silence, well past both T1 and T2.
+    let _ = sm.tick(200, &[]);
+    let events = sm.tick(5000, &[]);
+
+    assert!(
+        matches!(sm.state_of(1), Some(WorkloadState::Live { .. })),
+        "non-replicated workload must stay Live through quorum loss; got {:?}",
+        sm.state_of(1)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StateMachineEvent::Evicted { .. })),
+        "no eviction event expected; got events={:?}",
+        events
+    );
+}
+
+#[test]
+fn checkpointed_workload_also_survives_quorum_loss() {
+    // Checkpointed has no standby either — same reasoning.
+    let mut sm = WorkloadStateMachine::new(quorum());
+    sm.track(workload(1, PROVIDER_A, ReplicationMode::Checkpointed, 0));
+    let _ = sm.tick(
+        10,
+        &RELAYS
+            .iter()
+            .map(|r| observation(PROVIDER_A, r, 10))
+            .collect::<Vec<_>>(),
+    );
+    let _ = sm.tick(200, &[]);
+    let _ = sm.tick(5000, &[]);
+
+    assert!(matches!(sm.state_of(1), Some(WorkloadState::Live { .. })));
 }
 
 #[test]
@@ -238,24 +303,25 @@ fn untrack_removes_workload() {
 
 #[test]
 fn respawn_failure_after_max_attempts_goes_to_failed() {
+    // Entered directly rather than driven through quorum loss:
+    // warm-standby evicts to a standby instead of respawning, and
+    // non-replicated workloads no longer evict on quorum at all, so
+    // nothing reaches Respawning today. The restart-policy logic is
+    // still worth pinning — the trigger it's waiting for is a
+    // container-health signal (the workload's own process dying),
+    // which the provider does not yet observe.
     let mut sm = WorkloadStateMachine::new(quorum());
     let mut wl = workload(1, PROVIDER_A, ReplicationMode::None, 0);
     wl.restart_policy = RestartPolicy::OnFailure { max_attempts: 1 };
+    wl.state = WorkloadState::Respawning {
+        since: 600,
+        attempts_used: 1,
+        last_error: None,
+    };
     sm.track(wl);
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
-    let _ = sm.tick(200, &[]); // Suspect
-    let _ = sm.tick(600, &[]); // Evicted → Respawning
 
-    // First respawn attempt fails.
+    // The attempt fails, and max_attempts is already used up.
     sm.notify_respawn_failed(1, "backend down");
-    // After exhausting max_attempts the next tick must surface Failed.
-    let _ = sm.tick(1200, &[]);
 
     assert!(matches!(sm.state_of(1), Some(WorkloadState::Failed { .. })));
 }
