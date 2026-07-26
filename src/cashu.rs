@@ -181,16 +181,13 @@ pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
 /// (BIP39 / NUT-13 standard); tests can construct `CdkRedeemer` directly
 /// with any 64-byte seed.
 pub struct CdkRedeemer {
-    localstore: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync>,
+    localstore: Arc<dyn WalletDatabase<DbError> + Send + Sync>,
     seed: [u8; 64],
     wallets: Mutex<HashMap<(String, CurrencyUnit), Arc<Wallet>>>,
 }
 
 impl CdkRedeemer {
-    pub fn new(
-        localstore: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync>,
-        seed: [u8; 64],
-    ) -> Self {
+    pub fn new(localstore: Arc<dyn WalletDatabase<DbError> + Send + Sync>, seed: [u8; 64]) -> Self {
         Self {
             localstore,
             seed,
@@ -249,7 +246,10 @@ impl MintRedeemer for CdkRedeemer {
 
                 if is_keyset_err {
                     // Refresh keysets from the live mint, then retry once.
-                    let _ = wallet.get_mint_keysets().await;
+                    // `refresh_keysets` bypasses the metadata cache;
+                    // `get_mint_keysets` would serve the stale cache that
+                    // produced this error in the first place.
+                    let _ = wallet.refresh_keysets().await;
                     wallet
                         .receive(token_str, ReceiveOptions::default())
                         .await
@@ -459,7 +459,7 @@ mod wallet_seed_tests {
 ///
 /// Caveats:
 ///   - Exercised end-to-end against `testnut.cashu.space` only.
-///     The bundled cdk 0.14 wallet supports v2 (66-char) keyset
+///     The bundled cdk wallet supports v2 (66-char) keyset
 ///     IDs in code, so mainnet mints (e.g. `mint.minibits.cash`)
 ///     are expected to work for receive+split, but that path has
 ///     not been verified against a live mainnet mint yet.
@@ -514,7 +514,7 @@ pub async fn split_token_into_n(
                 e
             )
         })?;
-    let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
+    let db: Arc<dyn WalletDatabase<DbError> + Send + Sync> = Arc::new(db);
 
     // Random seed — the wallet is ephemeral, so deterministic
     // derivation buys us nothing. cdk's Wallet::new requires [u8; 64].
@@ -581,7 +581,7 @@ pub async fn mint_fresh_token(
     db_path: &Path,
 ) -> Result<String, anyhow::Error> {
     use cdk::amount::SplitTarget;
-    use cdk::nuts::MintQuoteState;
+    use cdk::nuts::{MintQuoteState, PaymentMethod};
     use rand::RngCore;
 
     if amount_sats == 0 {
@@ -597,7 +597,7 @@ pub async fn mint_fresh_token(
                 e
             )
         })?;
-    let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
+    let db: Arc<dyn WalletDatabase<DbError> + Send + Sync> = Arc::new(db);
 
     let mut seed = [0u8; 64];
     rand::thread_rng().fill_bytes(&mut seed);
@@ -606,7 +606,12 @@ pub async fn mint_fresh_token(
         .map_err(|e| anyhow::anyhow!("wallet construction failed: {}", e))?;
 
     let quote = wallet
-        .mint_quote(Amount::from(amount_sats), None)
+        .mint_quote(
+            PaymentMethod::BOLT11,
+            Some(Amount::from(amount_sats)),
+            None,
+            None,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("mint quote request to {} failed: {}", mint_url, e))?;
 
@@ -617,11 +622,11 @@ pub async fn mint_fresh_token(
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
     let mut paid = false;
     for _ in 0..POLL_ATTEMPTS {
-        let state = wallet
-            .mint_quote_state(&quote.id)
+        let quote_status = wallet
+            .check_mint_quote_status(&quote.id)
             .await
             .map_err(|e| anyhow::anyhow!("mint quote status check failed: {}", e))?;
-        if state.state == MintQuoteState::Paid {
+        if quote_status.state == MintQuoteState::Paid {
             paid = true;
             break;
         }
@@ -662,7 +667,7 @@ pub async fn extract_token_value(token_str: &str) -> anyhow::Result<u64> {
     let token = Token::from_str(token_str)
         .map_err(|e| anyhow::anyhow!("Failed to decode Cashu token: {}", e))?;
 
-    // cdk 0.14 made `Token::proofs(&keysets)` require keyset metadata,
+    // cdk made `Token::proofs(&keysets)` require keyset metadata,
     // but `Token::value()` still works without — it's just the sum of
     // proof amounts. That's exactly what this legacy function does.
     let amount: Amount = token
