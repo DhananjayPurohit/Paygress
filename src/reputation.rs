@@ -1,47 +1,34 @@
-// Signed completion receipts and Sybil-resistant scoring (Unit 10
-// of the 12-month plan,
-// docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
+// Scoring logic for signed completion receipts.
 //
-// Receipts that contribute to a provider's reputation must be:
-//   1. Co-signed by both consumer and provider.
-//   2. Bound to a verifiable Cashu spend proof (a swap-response
-//      signature from the mint, captured on the provider side at
-//      the moment of redemption — Unit 1 produces this).
-//   3. Weighted to resist Sybil amplification: a consumer needs
-//      enough history before their receipts count, and any single
-//      consumer-provider pair is capped at 20% of the consumer's
-//      receipt volume.
+// A receipt only counts when it is co-signed by consumer and
+// provider, bound to a verifiable Cashu spend proof, and survives
+// the Sybil weighting: the consumer needs enough history, and any
+// one consumer-provider pair is capped at 20% of that consumer's
+// receipt volume.
 //
-// This module owns the **scoring logic**. The Nostr event publish
-// path and the provider co-sign flow are wired in follow-up units
-// (a per-event `KIND_COMPLETION_RECEIPT = 38385` parameterized
-// replaceable; provider-side co-sign on lease completion).
+// The Nostr publish path and the provider co-sign flow live
+// elsewhere; this module is pure math over receipts.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The Cashu spend proof carried by a receipt. Captured by the
-/// provider at redemption (Unit 1) and pasted verbatim into the
-/// receipt the provider co-signs. Aggregators verify this against
-/// the mint's published keys before counting the receipt.
+/// Cashu spend proof captured by the provider at redemption and
+/// pasted verbatim into the receipt it co-signs. Aggregators check
+/// it against the mint's published keys before counting the receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentProof {
     /// URL of the mint that issued the swap.
     pub mint_url: String,
-    /// Signature over the swap response by the mint's keys (or a
-    /// hash thereof — exact bytes TBD by mint capabilities).
+    /// Mint's signature over the swap response (or a hash thereof —
+    /// exact bytes depend on mint capabilities).
     pub swap_response_signature: String,
 }
 
-/// Co-signed completion receipt. The consumer signs the
-/// canonicalized JSON of `(lease_id, provider_npub, consumer_npub,
-/// duration_paid, duration_delivered, success_flag, payment_proof,
-/// version)`; the provider returns a `provider_co_signature` over
-/// the same bytes; the receipt event carries both.
-///
-/// Receipts missing either signature do not contribute to score
-/// (see `score_provider`).
+/// Co-signed completion receipt. Both parties sign the canonicalized
+/// JSON of `(lease_id, provider_npub, consumer_npub, duration_paid,
+/// duration_delivered, success_flag, payment_proof, version)`;
+/// missing either signature means the receipt does not score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionReceipt {
     pub lease_id: String,
@@ -49,56 +36,45 @@ pub struct CompletionReceipt {
     pub consumer_npub: String,
     /// Seconds the consumer paid for.
     pub duration_paid: u64,
-    /// Seconds the workload was actually live (provider-reported,
-    /// cross-checkable against heartbeat history from Unit 4).
+    /// Seconds the workload was live, provider-reported and
+    /// cross-checkable against heartbeat history.
     pub duration_delivered: u64,
-    /// 1.0 = success, 0.0 = failure. Floats so future units can
-    /// surface partial-credit cases (e.g. lease delivered but with
-    /// SLA violations).
+    /// 1.0 = success, 0.0 = failure. A float so partial credit
+    /// (delivered but with SLA violations) stays expressible.
     pub success_flag: f32,
     pub payment_proof: PaymentProof,
     pub version: u8,
     /// Schnorr signature over the canonical content by the
-    /// consumer's Nostr key. None means "consumer hasn't signed",
-    /// which is invalid for scoring.
+    /// consumer's Nostr key.
     pub consumer_signature: Option<String>,
-    /// Schnorr signature over the same content by the provider's
-    /// Nostr key. None means "provider hasn't co-signed".
+    /// The provider's co-signature over the same content.
     pub provider_co_signature: Option<String>,
-    /// Unix timestamp (provider-stamped) at which this receipt was
-    /// minted. Aggregators can window by this.
+    /// Provider-stamped unix time; aggregators window by it.
     pub completed_at: u64,
 }
 
-/// Heuristics the scoring function uses to defeat Sybil
-/// amplification. Operator-tunable via the observatory config.
+/// Anti-Sybil knobs, operator-tunable via the observatory config.
 #[derive(Debug, Clone, Copy)]
 pub struct SybilHeuristics {
     /// Receipts from consumers younger than this don't count.
     pub min_consumer_history_secs: u64,
-    /// Cap on the share of a single consumer's receipts that can
-    /// be directed at any one provider before excess is weighted
-    /// to zero.
+    /// Share of one consumer's receipts that may point at a single
+    /// provider before the excess is weighted down.
     pub max_same_counterparty_share: f32,
 }
 
 impl Default for SybilHeuristics {
     fn default() -> Self {
         Self {
-            // 30 days. Plan §Unit 10. Anti-bootstrap-fakery: a
-            // brand-new consumer can't single-handedly score a
-            // brand-new provider.
+            // 30 days, so a brand-new consumer can't single-handedly
+            // score a brand-new provider.
             min_consumer_history_secs: 30 * 24 * 3600,
-            // 20% per the plan's score function. Receipts past
-            // this share are weighted to zero.
             max_same_counterparty_share: 0.20,
         }
     }
 }
 
-/// Per-consumer metadata the scoring function consults. Real
-/// observatory builds this from the consumer's first-seen Nostr
-/// activity; tests can stub it directly.
+/// Built from the consumer's first-seen Nostr activity.
 #[derive(Debug, Clone)]
 pub struct ConsumerProfile {
     pub npub: String,
@@ -106,11 +82,9 @@ pub struct ConsumerProfile {
     pub first_seen: u64,
 }
 
-/// Receipt validity check. A `false` here means the receipt
-/// MUST NOT contribute to score. The signature verification itself
-/// is delegated to `verify_signatures` so the scoring function is
-/// pure (no crypto side-effects); callers can supply a stub
-/// verifier in tests.
+/// Cheap structural checks. `false` means the receipt must not
+/// contribute to score; signature verification is a separate,
+/// caller-supplied step.
 fn receipt_well_formed(r: &CompletionReceipt) -> bool {
     r.consumer_signature.is_some()
         && r.provider_co_signature.is_some()
@@ -119,22 +93,14 @@ fn receipt_well_formed(r: &CompletionReceipt) -> bool {
         && r.version > 0
 }
 
-/// Score a single provider against the receipt set in `receipts`.
-/// Returns a non-negative score; magnitude is the sum of weighted
-/// success flags from receipts that survive every filter.
+/// Sum of weighted success flags from the receipts that survive, in
+/// order: well-formedness, `verify_signatures`,
+/// `verify_payment_proof`, the consumer-history floor, and the
+/// per-consumer Sybil cap.
 ///
-/// Filters applied (in order, short-circuiting):
-///   - well-formed (both signatures present, version > 0).
-///   - signature verification (`verify_signatures`).
-///   - payment-proof verification (`verify_payment_proof`).
-///   - consumer history >= `heuristics.min_consumer_history_secs`.
-///   - per-consumer Sybil cap on share of receipts directed at
-///     this provider.
-///
-/// `verify_signatures` and `verify_payment_proof` are passed as
-/// closures so tests can stub them (real implementations call into
-/// nostr-sdk Schnorr verification and the cdk mint key store
-/// respectively).
+/// The two verifiers are closures so tests can stub them; production
+/// wires them to nostr-sdk Schnorr verification and the cdk mint key
+/// store.
 pub fn score_provider<S, P>(
     provider_npub: &str,
     receipts: &[CompletionReceipt],
@@ -148,11 +114,9 @@ where
     S: Fn(&CompletionReceipt) -> bool,
     P: Fn(&CompletionReceipt) -> bool,
 {
-    // First pass: pre-count each consumer's total valid receipts so
-    // we can apply the Sybil cap on a per-consumer basis. We
-    // pre-filter on cheap predicates only; expensive crypto checks
-    // are deferred to the second pass for the receipts we're
-    // actually about to count toward this provider.
+    // Pre-count each consumer's receipts so the Sybil cap has a
+    // denominator. Cheap predicates only — the crypto checks run in
+    // the second pass, over just the receipts we might count.
     let mut per_consumer_total: HashMap<&str, u32> = HashMap::new();
     let mut per_consumer_for_provider: HashMap<&str, u32> = HashMap::new();
     for r in receipts {
@@ -181,7 +145,6 @@ where
             continue;
         }
 
-        // Consumer history gate.
         let Some(profile) = consumers.get(&r.consumer_npub) else {
             continue;
         };
@@ -190,9 +153,8 @@ where
             continue;
         }
 
-        // Sybil cap. If this consumer has directed > max_share of
-        // their receipts at this provider, excess is weighted to
-        // zero so the share rounds back down to max_share.
+        // Sybil cap: scale the weight down so this consumer's total
+        // contribution to this provider equals max_share.
         let total = *per_consumer_total
             .get(r.consumer_npub.as_str())
             .unwrap_or(&0);
@@ -204,8 +166,6 @@ where
         }
         let share = same as f32 / total as f32;
         let weight = if share > heuristics.max_same_counterparty_share {
-            // Cap weight so the *effective* contribution from this
-            // consumer to this provider equals the cap.
             heuristics.max_same_counterparty_share / share
         } else {
             1.0
@@ -262,11 +222,8 @@ mod tests {
 
     #[test]
     fn single_consumer_with_single_provider_is_capped_to_share() {
-        // The Sybil cap is share-based: a consumer whose 100% of
-        // receipts go to one provider can only contribute
-        // `max_share` (= 20% by default), no matter how many
-        // receipts they file. This is the intended floor — a lone
-        // consumer cannot fully credit a lone provider.
+        // A lone consumer cannot fully credit a lone provider: 100%
+        // of their receipts still contributes only `max_share`.
         let receipts = vec![signed_receipt("l1", "P", "C", 1.0)];
         let mut consumers = HashMap::new();
         consumers.insert(
@@ -287,8 +244,7 @@ mod tests {
 
     #[test]
     fn diversified_consumers_each_contributing_one_receipt_sum() {
-        // Five distinct consumers, each filing exactly one receipt
-        // against P. Each is capped to 0.20; total = 1.0.
+        // Five consumers × one receipt each, capped to 0.20 → 1.0.
         let mut receipts = Vec::new();
         let mut consumers = HashMap::new();
         for i in 0..5 {
@@ -389,14 +345,12 @@ mod tests {
 
     #[test]
     fn same_counterparty_cap_caps_contribution() {
-        // Consumer has 10 total receipts; 9 of them are against
-        // provider P. Per the 20% cap, P's effective contribution
-        // from this consumer is capped at 20% × 10 = 2.0, not 9.0.
+        // 9 of the consumer's 10 receipts point at P, so the 20% cap
+        // limits P's credit to 2.0 rather than 9.0.
         let mut receipts = Vec::new();
         for i in 0..9 {
             receipts.push(signed_receipt(&format!("lp{}", i), "P", "C", 1.0));
         }
-        // One receipt against a different provider so total = 10.
         receipts.push(signed_receipt("lq", "Q", "C", 1.0));
         let mut consumers = HashMap::new();
         consumers.insert(
@@ -414,7 +368,6 @@ mod tests {
             always_valid,
         );
 
-        // 9 receipts × (0.20 / 0.90) ≈ 2.0
         let expected = 9.0 * (0.20 / 0.90);
         assert!(
             (score - expected).abs() < 1e-4,
@@ -431,11 +384,9 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
-        /// Sybil bound: across any random set of receipts where a
-        /// single consumer fires at most N receipts at one provider
-        /// out of M total, that consumer can never push the score
-        /// past `max_share * M`. (The cap applies per-consumer; the
-        /// invariant we check is the per-consumer ceiling.)
+        /// A single consumer firing N of M receipts at one provider
+        /// can never push that provider's score past
+        /// `max_share * M`.
         #[test]
         fn single_consumer_cannot_exceed_share_cap(
             same_count in 1u32..200,
@@ -479,8 +430,6 @@ mod proptests {
             );
             let total = (same_count + other_count) as f32;
             let cap = h.max_same_counterparty_share * total;
-            // Allow tiny float epsilon. score should never exceed
-            // the cap (when same_count is the only contribution).
             prop_assert!(
                 score <= cap + 1e-3,
                 "score {} exceeds Sybil cap {}",

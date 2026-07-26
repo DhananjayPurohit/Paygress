@@ -1,24 +1,24 @@
-// Discovery Client
-//
-// Used by end users to discover available providers on Nostr
-// and interact with them for spawning workloads.
+// Consumer-side discovery of providers advertised on Nostr.
 
 use anyhow::Result;
 use tracing::info;
 
 use crate::nostr::{NostrRelaySubscriber, ProviderFilter, ProviderInfo, RelayConfig};
 
-/// Discovery client for finding providers
 pub struct DiscoveryClient {
     nostr: NostrRelaySubscriber,
 }
 
+/// A provider whose most recent heartbeat is older than this is
+/// reported offline.
+const ONLINE_HEARTBEAT_WINDOW_SECS: u64 = 120;
+
 impl DiscoveryClient {
-    /// Create a new discovery client
+    /// Read-only client; no key needed for queries.
     pub async fn new(relays: Vec<String>) -> Result<Self> {
         let config = RelayConfig {
             relays,
-            private_key: None, // Read-only client doesn't need a key
+            private_key: None,
         };
 
         let nostr = NostrRelaySubscriber::new(config).await?;
@@ -26,7 +26,7 @@ impl DiscoveryClient {
         Ok(Self { nostr })
     }
 
-    /// Create with a private key (for sending spawn requests)
+    /// Client that can also send DMs (spawn / topup / status).
     pub async fn new_with_key(relays: Vec<String>, private_key: String) -> Result<Self> {
         let config = RelayConfig {
             relays,
@@ -38,12 +38,10 @@ impl DiscoveryClient {
         Ok(Self { nostr })
     }
 
-    /// Get the client's public key (npub)
     pub fn get_npub(&self) -> String {
         self.nostr.get_service_public_key()
     }
 
-    /// List all available providers
     pub async fn list_providers(
         &self,
         filter: Option<ProviderFilter>,
@@ -52,24 +50,23 @@ impl DiscoveryClient {
 
         let mut providers = Vec::new();
 
-        // Optimisation: Fetch all heartbeats in parallel (batch query)
+        // One batched query rather than a round-trip per provider.
         let provider_npubs: Vec<String> = offers.iter().map(|o| o.provider_npub.clone()).collect();
         let heartbeats = self
             .nostr
             .get_latest_heartbeats_multi(provider_npubs)
             .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         for offer in offers {
-            // Check if provider is online (has recent heartbeat)
             let (is_online, last_seen) = match heartbeats.get(&offer.provider_npub) {
-                Some(hb) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    // Consider online if heartbeat within last 2 minutes
-                    (now - hb.timestamp < 120, hb.timestamp)
-                }
+                Some(hb) => (
+                    now.saturating_sub(hb.timestamp) < ONLINE_HEARTBEAT_WINDOW_SECS,
+                    hb.timestamp,
+                ),
                 None => (false, 0),
             };
 
@@ -123,24 +120,16 @@ impl DiscoveryClient {
         Ok(providers)
     }
 
-    /// Look up a provider by ID or friendly name.
+    /// Look up a provider by ID or friendly name, so every
+    /// `--provider` flag accepts either form. `input` is tried as:
     ///
-    /// The `input` argument is tried in this order:
-    ///
-    /// 1. **Exact ID match** — full hex pubkey or `npub1…` bech32.
-    /// 2. **ID prefix match** — unambiguous prefix of ≥ 8 hex chars.
-    /// 3. **Name match** — case-insensitive match against the provider's
-    ///    3-word friendly name (e.g. `"SwiftGoldenOwl"`). If two providers
-    ///    share the same name (rare — 2M+ combinations) an error is returned
-    ///    asking the user to use the ID instead.
-    ///
-    /// This means every CLI flag that accepts a `--provider` value works
-    /// with either form interchangeably.
+    /// 1. an exact ID — full hex pubkey or `npub1…` bech32;
+    /// 2. an unambiguous ID prefix of ≥ 8 hex chars;
+    /// 3. the provider's 3-word name, case-insensitively.
     pub async fn get_provider(&self, input: &str) -> Result<Option<ProviderInfo>> {
         let providers = self.list_providers(None).await?;
 
-        // ── 1. Exact ID match ────────────────────────────────────────────────
-        // Normalize input to hex (handles both raw hex and npub1… bech32).
+        // Normalize to hex; handles both raw hex and npub1… bech32.
         let lookup_hex = match nostr_sdk::PublicKey::parse(input) {
             Ok(pk) => pk.to_hex(),
             Err(_) => input.to_string(),
@@ -150,7 +139,6 @@ impl DiscoveryClient {
             return Ok(Some(p.clone()));
         }
 
-        // ── 2. ID prefix match (≥ 8 chars) ──────────────────────────────────
         if lookup_hex.len() >= 8 {
             let matches: Vec<&ProviderInfo> = providers
                 .iter()
@@ -162,7 +150,6 @@ impl DiscoveryClient {
             }
         }
 
-        // ── 3. Friendly name match (case-insensitive) ────────────────────────
         let input_lower = input.to_lowercase();
         let name_matches: Vec<&ProviderInfo> = providers
             .iter()
@@ -173,9 +160,8 @@ impl DiscoveryClient {
             0 => Ok(None),
             1 => Ok(Some(name_matches[0].clone())),
             _ => {
-                // Two providers sharing a name is extremely unlikely (2M+ combos)
-                // but possible if someone bootstrapped with the same Nostr key on
-                // two machines, or in tests. Surface a clear error.
+                // Possible when the same Nostr key was bootstrapped
+                // on two machines. Make the user disambiguate.
                 let ids: Vec<String> = name_matches
                     .iter()
                     .map(|p| format!("  {}", &p.npub[..16]))
@@ -189,7 +175,6 @@ impl DiscoveryClient {
         }
     }
 
-    /// Check if a provider is online
     pub async fn is_provider_online(&self, npub: &str) -> bool {
         match self.get_provider(npub).await {
             Ok(Some(p)) => p.is_online,
@@ -197,9 +182,7 @@ impl DiscoveryClient {
         }
     }
 
-    /// Get uptime percentage for a provider
     pub async fn get_uptime(&self, npub: &str, days: u32) -> Result<f32> {
-        // Resolve full npub
         let full_npub = if let Ok(Some(p)) = self.get_provider(npub).await {
             p.npub
         } else {
@@ -208,12 +191,13 @@ impl DiscoveryClient {
         self.nostr.calculate_uptime(&full_npub, days).await
     }
 
-    /// Get the underlying Nostr client (for sending messages)
+    /// Underlying Nostr client, for sending messages.
     pub fn nostr(&self) -> &NostrRelaySubscriber {
         &self.nostr
     }
 
-    /// Sort providers by various criteria
+    /// Sort in place by `price`, `uptime`, `capacity` or `jobs`.
+    /// Any other value leaves the order untouched.
     pub fn sort_providers(providers: &mut [ProviderInfo], sort_by: &str) {
         match sort_by {
             "price" => {
@@ -248,18 +232,17 @@ impl DiscoveryClient {
             "jobs" => {
                 providers.sort_by(|a, b| b.total_jobs_completed.cmp(&a.total_jobs_completed));
             }
-            _ => {} // No sorting
+            _ => {}
         }
     }
 
-    /// Format provider list for display
     pub fn format_provider_table(providers: &[ProviderInfo]) -> String {
         use std::fmt::Write;
 
         let mut output = String::new();
 
         // Column widths: ID(16) | PROVIDER(18) | LOCATION(10) | UPTIME(8) | CHEAPEST(8) | TIER(10) | MINTS(36) | ONLINE(6)
-        // Inner = 16+18+10+8+8+10+36+6 = 112, separators = 9×3 = 27 → 139 + 2 borders = 141
+        // Inner = 112, separators = 9×3 = 27 → 139 + 2 borders = 141
         writeln!(&mut output, "┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
         writeln!(
             &mut output,
@@ -279,7 +262,7 @@ impl DiscoveryClient {
                 .min()
                 .map(|r| format!("{}m/s", r))
                 .unwrap_or_else(|| "-".to_string());
-            // Compact tier label that fits the 10-char column.
+            // Compact labels that fit the 10-char column.
             let tier = match p.isolation_level {
                 crate::nostr::IsolationLevel::SharedKernel => "shared",
                 crate::nostr::IsolationLevel::DedicatedHost => "dedicated",
@@ -308,7 +291,6 @@ impl DiscoveryClient {
         output
     }
 
-    /// Format single provider details
     pub fn format_provider_details(provider: &ProviderInfo) -> String {
         use std::fmt::Write;
 
@@ -360,10 +342,6 @@ impl DiscoveryClient {
             provider.capabilities.join(", ")
         )
         .unwrap();
-        // Full slug here (vs the abbreviated form in the table).
-        // Annotated so a reader who's only just discovering the
-        // tier system understands what each label means without
-        // bouncing to the docs.
         let iso_annotation = match provider.isolation_level {
             crate::nostr::IsolationLevel::SharedKernel => " (containers; co-tenant boundary only)",
             crate::nostr::IsolationLevel::DedicatedHost => {
@@ -422,7 +400,6 @@ impl DiscoveryClient {
     }
 }
 
-/// Helper to truncate strings for display
 fn truncate_str(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         s
@@ -431,38 +408,22 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
     }
 }
 
-/// Compact mint label for the list table.
-///
-/// Strips the URL scheme (`https://` / `http://`) and any trailing path,
-/// keeping the full hostname as-is (including any `mint.` subdomain).
-///
-/// Examples:
-///   "https://mint.minibits.cash"  → "mint.minibits.cash"
-///   "https://testnut.cashu.space" → "testnut.cashu.space"
-///   "http://localhost:3338"        → "localhost:3338"
+/// Strip the URL scheme and any path, keeping the full hostname
+/// (`https://mint.minibits.cash/api` → `mint.minibits.cash`).
 fn mint_label(url: &str) -> String {
     let stripped = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    // Drop trailing path (e.g. "/api")
     stripped.split('/').next().unwrap_or(stripped).to_string()
 }
 
-/// Formats the list of whitelisted mints for the table column (width `col`).
-///
-/// - 0 mints  →  "-"
-/// - 1 mint   →  "mint.minibits.cash"
-/// - 2 mints  →  "mint.minibits.cash, mint.nucash.com"
-/// - 3+ mints →  "mint.minibits.cash, mint.nucash.com +N"
-///
-/// Each label is truncated only if the combined string would exceed `col`.
+/// Render whitelisted mints into a `col`-wide table column:
+/// `-` when empty, one or two labels otherwise, with a ` +N`
+/// overflow suffix and truncation only when the result won't fit.
 fn format_mints_column(mints: &[String], col: usize) -> String {
     match mints.len() {
         0 => "-".to_string(),
-        1 => {
-            let l = mint_label(&mints[0]);
-            truncate_owned(l, col)
-        }
+        1 => truncate_owned(mint_label(&mints[0]), col),
         n => {
             let l0 = mint_label(&mints[0]);
             let l1 = mint_label(&mints[1]);
@@ -473,23 +434,15 @@ fn format_mints_column(mints: &[String], col: usize) -> String {
             };
             let combined = format!("{}, {}{}", l0, l1, suffix);
             if combined.len() <= col {
-                combined
-            } else {
-                // Try just two labels without suffix first, then fall back
-                // to first label + suffix
-                let two = format!("{}, {}", l0, l1);
-                if two.len() <= col {
-                    truncate_owned(two, col)
-                } else {
-                    let sfx = if n > 2 {
-                        format!(" +{}", n - 1)
-                    } else {
-                        format!(" +{}", 1)
-                    };
-                    let room = col.saturating_sub(sfx.len());
-                    format!("{}{}", truncate_owned(l0, room), sfx)
-                }
+                return combined;
             }
+            let two = format!("{}, {}", l0, l1);
+            if two.len() <= col {
+                return truncate_owned(two, col);
+            }
+            let sfx = format!(" +{}", if n > 2 { n - 1 } else { 1 });
+            let room = col.saturating_sub(sfx.len());
+            format!("{}{}", truncate_owned(l0, room), sfx)
         }
     }
 }
@@ -518,7 +471,6 @@ mod tests {
             "testnut.cashu.space"
         );
         assert_eq!(mint_label("http://localhost:3338"), "localhost:3338");
-        // Path is stripped
         assert_eq!(
             mint_label("https://mint.example.com/api/v1"),
             "mint.example.com"

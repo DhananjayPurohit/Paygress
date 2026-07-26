@@ -1,33 +1,63 @@
-// Compute Backend Trait
-//
-// Abstracts the underlying container/VM platform (Proxmox vs LXD vs
-// Docker). The Docker backend (src/docker.rs) is the one that uses
-// ports + env in `ContainerConfig`; LXD/Proxmox backends ignore
-// those fields today and only use the SSH-style fields.
+// Compute backend trait shared by the Docker, LXD, KVM and Proxmox
+// backends.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeStatus {
-    pub cpu_usage: f64,    // 0.0 to 1.0
-    pub memory_used: u64,  // bytes
-    pub memory_total: u64, // bytes
-    pub disk_used: u64,    // bytes
-    pub disk_total: u64,   // bytes
+/// Host-visible name for a workload. Every name-addressed backend
+/// uses this form and `find_available_id` parses the id back out of
+/// it, so the two must stay in sync.
+pub fn container_name(id: u32) -> String {
+    format!("paygress-{}", id)
 }
 
-/// One published port mapping. The Docker backend translates this to
-/// a `-p host_port:container_port` flag; LXD/Proxmox can ignore
-/// (they expose the SSH port via the existing host_port field).
+/// Id encoded in a `paygress-<id>` name, or `None` for anything else.
+pub fn id_from_container_name(name: &str) -> Option<u32> {
+    name.strip_prefix("paygress-")?.parse().ok()
+}
+
+/// Run `program` and return its stdout, failing with the child's
+/// stderr when it exits non-zero.
+pub(crate) async fn run_checked(program: &str, args: &[&str]) -> Result<String> {
+    let out = tokio::process::Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("invoke {}", program))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{} failed: {}",
+            program,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub cpu_usage: f64,
+    pub memory_used: u64,
+    pub memory_total: u64,
+    pub disk_used: u64,
+    pub disk_total: u64,
+}
+
+/// One published port mapping. Docker translates this to
+/// `-p host_port:container_port`; LXD/Proxmox ignore it and expose
+/// only SSH via `ContainerConfig::host_port`.
 #[derive(Debug, Clone)]
 pub struct PortMapping {
     pub host_port: u16,
     pub container_port: u16,
-    pub protocol: &'static str, // "tcp" | "udp"
+    /// "tcp" | "udp"
+    pub protocol: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -40,75 +70,42 @@ pub struct ContainerConfig {
     pub storage_gb: u32,
     pub password: String,
     pub ssh_key: Option<String>,
-    /// SSH host-port forwarding (LXD/Proxmox: SSH access). Distinct
-    /// from `template_ports` which are workload-specific.
+    /// SSH host-port forward. Distinct from `template_ports`.
     pub host_port: Option<u16>,
-    /// Workload ports the consumer reaches (e.g. nostr-relay 7777,
-    /// bitcoind RPC 18443). Empty for non-template spawns. Docker
-    /// backend translates each to `-p host:container`; LXD/Proxmox
-    /// backends ignore for now.
+    /// Workload ports the consumer reaches. Docker-only.
     pub template_ports: Vec<PortMapping>,
-    /// Workload environment variables (template defaults +
-    /// consumer overrides). Docker backend passes via `-e KEY=VAL`.
+    /// Workload environment (template defaults + consumer overrides).
     pub template_env: HashMap<String, String>,
-
-    /// Extra `docker run` flags from the template definition (e.g.
-    /// `--ulimit nofile=1048576:1048576` for strfry). LXD/Proxmox
-    /// backends ignore these.
+    /// Extra `docker run` flags from the template definition.
     pub extra_runtime_args: Vec<String>,
-
-    /// In-container path for the workload's persistent state.
-    /// Docker backend mounts a vmid-scoped volume there.
-    /// `None` = stateless (no volume created).
+    /// In-container path for persistent state. `None` = stateless,
+    /// no volume created.
     pub data_path: Option<String>,
-
-    /// Optional 32-byte LUKS key for the persistent data volume.
-    /// When set (Phase 2 of consumer-encrypted-volumes), the
-    /// `DockerBackend` creates a LUKS-on-loop file instead of a
-    /// plain Docker named volume; the key is fed to `cryptsetup
-    /// luksFormat`/`luksOpen` over stdin and never persisted to
-    /// disk. On `delete_container` the LUKS header is erased
-    /// (`cryptsetup luksErase`) so the keyslots are unrecoverable
-    /// even if the operator forensically extracts the underlying
-    /// file.
-    ///
-    /// Provider populates this from
-    /// `EncryptedSpawnPodRequest.volume_encryption.decoded_key()`
-    /// when present; `None` means a plain volume (today's default).
-    /// `data_path: None` makes this field a no-op (stateless
-    /// workloads have nothing to encrypt).
+    /// 32-byte LUKS key for the persistent data volume. When set the
+    /// Docker backend builds a LUKS-on-loop file instead of a plain
+    /// named volume; the key is fed to cryptsetup over stdin and
+    /// never written to disk. No-op when `data_path` is `None`.
     pub volume_encryption_key: Option<[u8; 32]>,
 }
 
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
-    /// Find an available ID in the given range
     async fn find_available_id(&self, range_start: u32, range_end: u32) -> Result<u32>;
 
-    /// Create a new container
-    async fn create_container(&self, config: &ContainerConfig) -> Result<String>; // Returns container ID/Name
+    /// Returns the backend's container ID/name.
+    async fn create_container(&self, config: &ContainerConfig) -> Result<String>;
 
-    /// Start a container
     async fn start_container(&self, id: u32) -> Result<()>;
 
-    /// Stop a container
     async fn stop_container(&self, id: u32) -> Result<()>;
 
-    /// Delete a container
     async fn delete_container(&self, id: u32) -> Result<()>;
 
-    /// Get node resource usage
     async fn get_node_status(&self) -> Result<NodeStatus>;
 
-    /// Get public IP of the container/VM
     async fn get_container_ip(&self, id: u32) -> Result<Option<String>>;
 
     /// Whether the workload is still running.
-    ///
-    /// Distinguishes "the tenant's box is alive" from "the tenant's
-    /// box already terminated itself" — a CI runner powers off when
-    /// its single job ends. Callers use it to avoid destroying a
-    /// healthy container on an ambiguous signal.
     ///
     /// Defaults to `Running` so a backend that cannot answer never
     /// causes a destructive action to be taken on its behalf.
@@ -125,4 +122,17 @@ pub enum ContainerStatus {
     Stopped,
     /// The backend answered, but the workload is not in its list.
     Absent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_name_round_trips() {
+        assert_eq!(container_name(1234), "paygress-1234");
+        assert_eq!(id_from_container_name("paygress-1234"), Some(1234));
+        assert_eq!(id_from_container_name("something-else"), None);
+        assert_eq!(id_from_container_name("paygress-notanumber"), None);
+    }
 }

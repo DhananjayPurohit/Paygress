@@ -1,34 +1,23 @@
-// Client-side encryption for Blossom-stored blobs (Unit 6 of the
-// 12-month plan,
-// docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
+// Client-side encryption for Blossom-stored blobs.
 //
-// Blossom servers are content-addressed by SHA-256 of the *upload*
-// bytes. When a workload's checkpoint sits on a third-party Blossom
-// server, we don't trust the operator. We encrypt the blob
-// **before** computing the hash so the server (and anyone who
-// downloads by hash) sees only ciphertext.
+// Blossom servers content-address by SHA-256 of the *uploaded*
+// bytes, and we don't trust a third-party operator, so blobs are
+// encrypted before hashing: the server only ever sees ciphertext.
 //
-// Algorithm: XChaCha20-Poly1305. 32-byte key, 24-byte nonce.
-// Nonces are randomly generated per-encryption (non-deterministic
-// — the proptest in tests/blossom.rs pins this) and prepended to
-// the ciphertext on the wire so `decrypt` can recover them
-// without out-of-band coordination.
-//
-// Wire format on the Blossom server: `nonce || aead-ciphertext`.
-// AEAD authentication tag is appended by the chacha20poly1305 crate
-// itself, so a wrong key fails AEAD verification rather than
+// Wire format: `nonce || XChaCha20-Poly1305 ciphertext`, where the
+// 24-byte nonce is fresh per encryption and prepended so `decrypt`
+// recovers it without out-of-band coordination. The AEAD tag the
+// cipher appends means a wrong key fails verification instead of
 // silently returning garbage.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
-/// 32-byte symmetric key for XChaCha20-Poly1305. Per-blob (or
-/// per-lease for checkpoint chains).
+/// 32-byte symmetric key, per-blob or per-lease.
 pub type EncryptionKey = [u8; 32];
 
-/// Errors from the encryption layer. Distinct from anyhow so
-/// callers can map AEAD failures (wrong key, tampered ciphertext)
-/// to specific user-facing messages.
+/// Distinct from `anyhow` so callers can map AEAD failures to
+/// specific user-facing messages.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("ciphertext too short to contain a nonce")]
@@ -41,12 +30,9 @@ pub enum CryptoError {
 
 const NONCE_LEN: usize = 24;
 
-/// Encrypt `plaintext` with `key`. The output is `nonce || ciphertext`,
-/// where `ciphertext` includes the AEAD authentication tag.
-///
-/// Each call generates a fresh random nonce, so encrypting the same
-/// plaintext twice produces different bytes — observers cannot
-/// detect that two checkpoints carry identical state.
+/// Encrypt `plaintext`, returning `nonce || ciphertext`. The fresh
+/// per-call nonce means two encryptions of the same plaintext differ,
+/// so observers can't tell that two checkpoints carry identical state.
 pub fn encrypt_for_upload(plaintext: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, CryptoError> {
     use rand::RngCore;
     let cipher = XChaCha20Poly1305::new(key.into());
@@ -65,10 +51,8 @@ pub fn encrypt_for_upload(plaintext: &[u8], key: &EncryptionKey) -> Result<Vec<u
     Ok(out)
 }
 
-/// Decrypt the wire format produced by [`encrypt_for_upload`]. AEAD
-/// failures (wrong key, tampered bytes, truncated input) surface as
-/// `AuthenticationFailed` so callers don't have to reason about
-/// chacha20poly1305 internals.
+/// Inverse of [`encrypt_for_upload`]. Wrong key, tampered bytes and
+/// truncated input all surface as typed `CryptoError`s.
 pub fn decrypt_after_download(wire: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, CryptoError> {
     if wire.len() < NONCE_LEN {
         return Err(CryptoError::Truncated);
@@ -82,10 +66,9 @@ pub fn decrypt_after_download(wire: &[u8], key: &EncryptionKey) -> Result<Vec<u8
         .map_err(|_| CryptoError::AuthenticationFailed)
 }
 
-/// Compute the SHA-256 hash of the wire-format ciphertext. Blossom
-/// servers index by this value, so callers must hash the
-/// post-encryption bytes (not the plaintext) when constructing
-/// auth events or `/<hash>` URLs.
+/// Blossom indexes by this value, so callers must hash the
+/// post-encryption bytes — never the plaintext — when building auth
+/// events or `/<hash>` URLs.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -130,7 +113,6 @@ mod tests {
     fn tampered_ciphertext_fails_authentication() {
         let pt = b"secret".to_vec();
         let mut ct = encrypt_for_upload(&pt, &key()).unwrap();
-        // Flip a bit in the AEAD payload (after the nonce).
         let last = ct.len() - 1;
         ct[last] ^= 0x01;
         let err = decrypt_after_download(&ct, &key()).unwrap_err();

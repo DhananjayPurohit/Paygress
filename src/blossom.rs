@@ -1,22 +1,12 @@
-// Blossom client (Unit 6 of the 12-month plan,
-// docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
+// Blossom client — the BUD-01/02/04 subset needed for warm-standby
+// checkpoint storage: PUT /upload, GET /<sha256>, DELETE /<sha256>.
 //
-// In-tree implementation of the BUD-01 / BUD-02 / BUD-04 subset
-// Paygress needs for warm-standby checkpoint storage:
-//   - PUT /upload  (BUD-02): upload a blob; server returns
-//     `{ url, sha256, size, type, uploaded }`.
-//   - GET /<sha256> (BUD-01): fetch by hash.
-//   - DELETE /<sha256> (BUD-04): remove a blob (auth required).
+// Auth is a NIP-98-style kind-24242 Nostr event, base64-JSON in
+// `Authorization: Nostr <b64>`, tagged with the operation (`t`), the
+// post-encryption content hash (`x`) and an `expiration`.
 //
-// Auth: NIP-98-style Nostr event of kind 24242, base64-encoded
-// JSON in `Authorization: Nostr <b64>`. Tags:
-//   - ["t", "upload"|"delete"|"get"] — operation.
-//   - ["x", "<sha256>"] — content hash (post-encryption).
-//   - ["expiration", "<unix_ts>"] — short-lived (60s default).
-//
-// Encryption is client-side and orthogonal: callers encrypt before
-// `put` and decrypt after `get`, using `crate::blossom_crypto`.
-// The Blossom server only ever sees ciphertext.
+// Callers encrypt before `put` and decrypt after `get` via
+// `crate::blossom_crypto`, so the server only ever sees ciphertext.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -27,8 +17,7 @@ use serde::Deserialize;
 const AUTH_KIND: u16 = 24242;
 const DEFAULT_AUTH_TTL_SECS: u64 = 60;
 
-/// Operation tagged in the auth event's `t` tag. Mirrors the
-/// Blossom spec wording.
+/// Operation named in the auth event's `t` tag.
 #[derive(Debug, Clone, Copy)]
 pub enum BlossomOp {
     Upload,
@@ -46,9 +35,7 @@ impl BlossomOp {
     }
 }
 
-/// Minimal client. Holds a long-lived `reqwest::Client`, the target
-/// Blossom server URL, and the Nostr `Keys` used to sign auth
-/// events. One client per (server, identity) pair.
+/// One client per (server, identity) pair.
 pub struct BlossomClient {
     http: HttpClient,
     server: String,
@@ -56,7 +43,7 @@ pub struct BlossomClient {
     auth_ttl_secs: u64,
 }
 
-/// Response shape from `PUT /upload` (BUD-02 §3).
+/// `PUT /upload` response (BUD-02 §3).
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadResponse {
     pub url: String,
@@ -78,15 +65,13 @@ impl BlossomClient {
         }
     }
 
-    /// Override the auth-event TTL. Most callers don't need this.
     pub fn with_auth_ttl(mut self, secs: u64) -> Self {
         self.auth_ttl_secs = secs;
         self
     }
 
-    /// Upload `bytes` (already-encrypted ciphertext). Returns the
-    /// server's response; the `sha256` field is what callers should
-    /// persist as the checkpoint's content address.
+    /// Upload already-encrypted ciphertext. The response's `sha256`
+    /// is the checkpoint's content address.
     pub async fn put(&self, bytes: Vec<u8>) -> Result<UploadResponse> {
         let hash = crate::blossom_crypto::sha256_hex(&bytes);
         let auth = self.build_auth_header(BlossomOp::Upload, &hash).await?;
@@ -113,8 +98,8 @@ impl BlossomClient {
         Ok(parsed)
     }
 
-    /// Fetch by hash. Returns the wire-format bytes (still
-    /// encrypted — caller decrypts via `blossom_crypto`).
+    /// Fetch by hash. Bytes are still encrypted; the caller decrypts
+    /// via `blossom_crypto`.
     pub async fn get(&self, sha256: &str) -> Result<Vec<u8>> {
         let url = format!("{}/{}", self.server, sha256);
         let resp = self
@@ -129,7 +114,6 @@ impl BlossomClient {
         Ok(resp.bytes().await?.to_vec())
     }
 
-    /// Delete by hash. Auth-required.
     pub async fn delete(&self, sha256: &str) -> Result<()> {
         let auth = self.build_auth_header(BlossomOp::Delete, sha256).await?;
         let url = format!("{}/{}", self.server, sha256);
@@ -146,8 +130,7 @@ impl BlossomClient {
         Ok(())
     }
 
-    /// Build the `Authorization: Nostr <base64>` header value. Pure
-    /// (no I/O), so unit-testable.
+    /// Build the `Authorization: Nostr <base64>` header value.
     pub async fn build_auth_header(&self, op: BlossomOp, x_hash: &str) -> Result<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?

@@ -1,29 +1,14 @@
-// Provider Name Generation
-//
-// Derives a 3-word human-readable name for a provider from its Nostr
-// public key.  Format: {Adjective}{Middle}{Noun} — e.g. "SwiftGoldenOwl",
-// "AncientSilverNarwhal", "BraveCrimsonFalcon".
-//
-// Derivation uses three independent 8-byte windows of the 32-byte
-// secp256k1 public key to index into three word lists:
-//
-//   adj  = ADJECTIVES[ bytes[0..8]  as u64  % len ]
-//   mid  = MIDDLES   [ bytes[8..16] as u64  % len ]
-//   noun = NOUNS     [ bytes[16..24] as u64 % len ]
-//
-// Properties:
-//   - Deterministic: same key always → same name (idempotent bootstrap).
-//   - Collision-resistant: 150 × 100 × 150 = 2,250,000 combinations;
-//     birthday collision probability stays below 1% until ~2,100
-//     simultaneous providers on the network.
-//   - No dependencies beyond std.
+// Derives a deterministic `{Adjective}{Middle}{Noun}` provider name
+// (e.g. "SwiftGoldenOwl") from three 8-byte windows of the provider's
+// Nostr public key, so bootstrap is idempotent. ~2.1M combinations
+// keeps the birthday collision probability under 1% up to roughly
+// 2,100 simultaneous providers.
 
-/// Derives a 3-word provider name from the raw bytes of a Nostr public key
-/// (32-byte x-only secp256k1 coordinate).
+/// Derive a provider name from a 32-byte x-only secp256k1 pubkey.
 ///
 /// # Panics
-/// Panics if `pubkey_bytes` is shorter than 24 bytes.  A valid Nostr
-/// public key is always 32 bytes so this never fires in production.
+/// If `pubkey_bytes` is shorter than 24 bytes. A valid Nostr public
+/// key is always 32, so this never fires in production.
 pub fn derive_provider_name(pubkey_bytes: &[u8]) -> String {
     assert!(
         pubkey_bytes.len() >= 24,
@@ -41,13 +26,8 @@ pub fn derive_provider_name(pubkey_bytes: &[u8]) -> String {
     format!("{}{}{}", adj, mid, noun)
 }
 
-// ─── Word lists ───────────────────────────────────────────────────────────────
-//
-// Rules:
-//  - Each word is PascalCase so concatenation is readable: "SwiftGoldenOwl".
-//  - No word appears in more than one list.
-//  - Adjectives describe character/quality; Middles are colours/materials/
-//    nature-phenomena; Nouns are animals or striking natural features.
+// Word lists. Every word is PascalCase so concatenation reads
+// cleanly, and no word appears in two lists (a test enforces this).
 
 const ADJECTIVES: &[&str] = &[
     "Ancient",
@@ -199,7 +179,7 @@ const ADJECTIVES: &[&str] = &[
     "Sinister",
     "Frail",
     "Nimble",
-]; // 152 — intentional: prime-ish length helps uniform distribution
+];
 
 const MIDDLES: &[&str] = &[
     "Amber", "Birch", "Black", "Blue", "Bronze", "Cedar", "Cerulean", "Charcoal", "Cinder",
@@ -212,7 +192,7 @@ const MIDDLES: &[&str] = &[
     "Salt", "Sand", "Sandy", "Scarlet", "Silk", "Silver", "Sky", "Slate", "Smoky", "Snow", "Soot",
     "Steel", "Stone", "Storm", "Teal", "Thorn", "Tide", "Twilight", "Umber", "Vale", "Velvet",
     "Violet", "Wave", "White", "Wind", "Yellow", "Ash", "Silt", "Flax", "Brine",
-]; // 100
+];
 
 const NOUNS: &[&str] = &[
     // Animals
@@ -358,7 +338,7 @@ const NOUNS: &[&str] = &[
     "Vortex",
     "Zenith",
     "Zephyr",
-]; // 141
+];
 
 #[cfg(test)]
 mod tests {
@@ -383,12 +363,10 @@ mod tests {
     fn output_is_three_capitalised_words() {
         let key = [0x42_u8; 32];
         let name = derive_provider_name(&key);
-        // Each word is PascalCase — starts with uppercase, rest lowercase-or-mixed.
-        // The simplest check: name is non-empty, no spaces, no hyphens.
         assert!(!name.is_empty());
         assert!(!name.contains(' '));
         assert!(!name.contains('-'));
-        // All three words present: the adj/mid/noun are each at least 3 chars.
+        // Each of the three words is at least 3 chars.
         assert!(name.len() >= 9);
     }
 

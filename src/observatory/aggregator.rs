@@ -11,62 +11,51 @@ use crate::nostr::{HeartbeatContent, IsolationLevel, PodSpec, ProviderOfferConte
 use crate::reputation::{score_provider, CompletionReceipt, ConsumerProfile, SybilHeuristics};
 use crate::stake::{stake_rank, StakeStatus};
 
-/// Wire format for the snapshot. Versioned from day one so the
-/// static frontend can branch on schema bumps without breaking old
-/// archives.
+/// Snapshot schema version, so the static frontend can branch on
+/// bumps without breaking old archives.
 pub const SNAPSHOT_VERSION: u8 = 1;
 
-/// Receipt window: receipts older than this are aged out of the
-/// rolling-window score. 30 days per the plan's R10.
+/// Receipts older than this age out of the rolling-window score.
 pub const RECEIPT_WINDOW_SECS: u64 = 30 * 24 * 3600;
 
-/// Inputs to a single aggregator run. The caller (binary entry
-/// point) is responsible for I/O — fetching offers/heartbeats/
-/// receipts from Nostr, fetching stake statuses from Esplora,
-/// loading consumer first-seen times. Once those are in hand, the
-/// snapshot is a pure function of them.
+/// Inputs to one aggregator run. The caller owns all the I/O
+/// (Nostr, Esplora, consumer first-seen times); given these, the
+/// snapshot is a pure function.
 pub struct AggregatorInput {
     pub offers: Vec<ProviderOfferContent>,
     pub heartbeats: Vec<HeartbeatContent>,
     pub receipts: Vec<CompletionReceipt>,
     pub consumers: HashMap<String, ConsumerProfile>,
-    /// Pre-computed by the binary entry point against Esplora,
-    /// keyed by `provider_npub`. Letting the caller pass these in
-    /// keeps `compute_snapshot` pure and lets two independent
-    /// runs reproduce as long as they pass the same data.
+    /// Pre-computed against Esplora by the caller, keyed by
+    /// `provider_npub`, so `compute_snapshot` stays pure.
     pub stake_statuses: HashMap<String, StakeStatus>,
-    /// 5 anchor providers (Paygress-team-run) flagged in the UI.
+    /// Paygress-team-run providers, flagged in the UI.
     pub anchor_providers: HashSet<String>,
 }
 
-/// Top-level snapshot the static frontend reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u8,
     pub generated_at: u64,
-    /// Receipts older than `now - RECEIPT_WINDOW_SECS` were
-    /// excluded. Stamped here so consumers can verify reproducibility.
+    /// Stamped so readers can verify reproducibility.
     pub receipt_window_secs: u64,
     /// Sorted by `npub` for byte-identical reproducibility.
     pub providers: Vec<ProviderSummary>,
 }
 
-/// One provider's row in the snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSummary {
     pub npub: String,
     pub hostname: String,
-    /// Coarse jurisdiction. Only present if the offer opted in
-    /// (`location.is_some()`). The plan guarantees no involuntary
-    /// geo surfacing.
+    /// Present only when the offer opted in; geo is never surfaced
+    /// involuntarily.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jurisdiction: Option<String>,
-    /// Sybil-resistant score from the receipt set restricted to
-    /// the rolling window. See `paygress::reputation`.
+    /// Sybil-resistant score over the windowed receipts.
     pub score: f32,
-    /// Last seen (most recent heartbeat across the input set).
+    /// Most recent heartbeat across the input set.
     pub last_seen_unix: Option<u64>,
-    /// `Some` only if the offer carried a stake proof AND the
+    /// `Some` only when the offer carried a stake proof and its
     /// pre-computed `StakeStatus` was `Valid`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stake: Option<StakeSummary>,
@@ -75,29 +64,25 @@ pub struct ProviderSummary {
     pub isolation_level: IsolationLevel,
 }
 
-/// What we render about a provider's stake when it verifies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StakeSummary {
     pub effective_sats: u64,
     pub locktime_unix: u64,
-    /// log(sats × locked_seconds), used for staked-tier ordering.
+    /// log(sats × locked_seconds), for staked-tier ordering.
     pub rank: f64,
 }
 
-/// Compute the snapshot. Pure: no clock, no network, no filesystem.
+/// Pure: no clock, no network, no filesystem.
 pub fn compute_snapshot(input: &AggregatorInput, now: u64) -> Snapshot {
     let heuristics = SybilHeuristics::default();
     let receipt_floor = now.saturating_sub(RECEIPT_WINDOW_SECS);
 
-    // Filter receipts to the rolling window once; reused across
-    // every provider.
     let windowed: Vec<&CompletionReceipt> = input
         .receipts
         .iter()
         .filter(|r| r.completed_at >= receipt_floor)
         .collect();
 
-    // Most-recent heartbeat per provider, across the input set.
     let mut last_seen: HashMap<&str, u64> = HashMap::new();
     for hb in &input.heartbeats {
         let cur = last_seen.entry(hb.provider_npub.as_str()).or_insert(0);
@@ -106,8 +91,8 @@ pub fn compute_snapshot(input: &AggregatorInput, now: u64) -> Snapshot {
         }
     }
 
-    // Build per-provider rows. Use a BTreeMap so iteration order is
-    // deterministic by npub — the reproducibility property.
+    // BTreeMap: iteration ordered by npub, which is what makes the
+    // output reproducible.
     let mut by_npub: BTreeMap<&str, &ProviderOfferContent> = BTreeMap::new();
     for offer in &input.offers {
         by_npub.insert(offer.provider_npub.as_str(), offer);
@@ -115,12 +100,8 @@ pub fn compute_snapshot(input: &AggregatorInput, now: u64) -> Snapshot {
 
     let mut providers = Vec::with_capacity(by_npub.len());
     for (npub, offer) in by_npub {
-        // Score: pass closures that always-accept signatures and
-        // payment proofs. Real aggregator wires these to nostr-sdk
-        // Schnorr verification + cdk mint-key checks; for the pure
-        // snapshot path we trust the caller to have pre-filtered
-        // bad receipts (they would be dropped during the
-        // Nostr-crawl step).
+        // Always-accept verifiers: bad receipts are dropped during
+        // the Nostr crawl, before they reach this pure path.
         let receipts_owned: Vec<CompletionReceipt> =
             windowed.iter().map(|r| (*r).clone()).collect();
         let score = score_provider(
@@ -154,7 +135,7 @@ pub fn compute_snapshot(input: &AggregatorInput, now: u64) -> Snapshot {
             stake,
             anchor: input.anchor_providers.contains(npub),
             specs: offer.specs.clone(),
-            isolation_level: offer.isolation_level.clone(),
+            isolation_level: offer.isolation_level,
         });
     }
 
@@ -298,7 +279,7 @@ mod tests {
             "C".to_string(),
             ConsumerProfile {
                 npub: "C".to_string(),
-                first_seen: now - 365 * 24 * 3600, // very old, passes history gate
+                first_seen: now - 365 * 24 * 3600, // passes the history gate
             },
         );
         let input = AggregatorInput {
@@ -310,8 +291,7 @@ mod tests {
             anchor_providers: HashSet::new(),
         };
         let snap = compute_snapshot(&input, now);
-        // One windowed receipt from one consumer at one provider →
-        // capped to max_share = 0.20 by the Sybil cap.
+        // One consumer, one provider → capped to max_share = 0.20.
         assert!((snap.providers[0].score - 0.20).abs() < 1e-6);
     }
 
@@ -372,7 +352,6 @@ mod tests {
             .collect();
         assert!(by["npubStaked"].stake.is_some());
         assert!(by["npubSpent"].stake.is_none());
-        // Stake rank > 0 for a valid lock.
         assert!(by["npubStaked"].stake.as_ref().unwrap().rank > 0.0);
     }
 
