@@ -141,6 +141,7 @@ pub struct SetupArgs {
 ///   - Fresh `nsec` (independent Nostr identity per provider)
 ///   - vmid range: [1000 + i*1000, 1999 + i*1000) — non-overlapping
 ///   - cashu_wallet_db_path: ./paygress-<name>-<i>.sqlite
+///   - workload_state_path: ./paygress-<name>-<i>-workloads.json
 ///   - provider_name: "<name>-<i>"
 ///
 /// Plus a systemd template unit (printed, not installed) the
@@ -379,6 +380,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         ssh_port_start: None,
         ssh_port_end: None,
         cashu_wallet_db_path: "./paygress-cashu-wallet.sqlite".to_string(),
+        workload_state_path: "./paygress-workloads.json".to_string(),
         lightning_address: args.lightning_address.clone(),
         http_bind_addr: None,
     };
@@ -548,6 +550,7 @@ fn build_multi_config(
         // one wallet's localstore (cdk's per-process write lock
         // would serialize all redemptions otherwise).
         cashu_wallet_db_path: format!("./paygress-{}.sqlite", provider_name),
+        workload_state_path: format!("./paygress-{}-workloads.json", provider_name),
         http_bind_addr: None,
         lightning_address: args.lightning_address.clone(),
     }
