@@ -2,7 +2,6 @@
 
 pub mod batch;
 pub mod bootstrap;
-pub mod ci;
 pub mod deploy;
 pub mod exec;
 pub mod identity;

@@ -1,36 +1,20 @@
-// Paygress Library
+// Paygress library.
 //
-// Exports modules for use in binaries.
+// Two payment paths share one CDK SQLite wallet
+// (`/var/lib/paygress/cashu-wallet.sqlite`):
 //
-// Architecture — two payment paths, one shared wallet, one sweep:
+//   Nostr-DM (default) — client sends a Cashu token over NIP-17;
+//   `ProviderService` redeems it via NUT-03 and provisions on the
+//   configured `ComputeBackend`.
 //
-// Path A — Nostr-DM (default, always compiled):
-//   Client sends Cashu token via encrypted Nostr DM (NIP-17).
-//   `ProviderService` → `CdkRedeemer` swaps the token at the mint via
-//   NUT-03, storing proofs in the shared CDK wallet
-//   (`/var/lib/paygress/cashu-wallet.sqlite`). Backend is
-//   `ProxmoxClient` / `LxdBackend` / `DockerBackend` / `KvmBackend`.
+//   HTTP + ngx_l402 (activated by `http_bind_addr`) — ngx_l402 redeems
+//   at the nginx layer, then forwards to the axum backend in
+//   `provider_http`.
 //
-// Path B — HTTP + ngx_l402 (always compiled, activated by `http_bind_addr`):
-//   Client hits nginx; ngx_l402 redeems the Cashu token into the same
-//   shared SQLite wallet (`cashu-wallet.sqlite`), then forwards the
-//   authenticated request to the axum backend in `src/provider_http.rs`.
-//   Bootstrap auto-generates the ngx_l402 Docker Compose config (Step 8).
-//
-// Lightning sweep (both paths):
-//   ngx_l402 mounts `/var/lib/paygress` as its data volume and runs a
-//   periodic melt loop (`CASHU_REDEMPTION_INTERVAL_SECS`) that converts
-//   ALL accumulated proofs — from both Path A and Path B — into Lightning
-//   payments sent to `LNURL_ADDRESS` (= `lightning_address` in config).
-//   The wallet secret is derived deterministically from the Nostr private
-//   key (`derive_seed_from_nostr_key`), ensuring both sides always open
-//   the same wallet.
-//
-// Legacy K8s pipeline (gated behind `kubernetes` Cargo feature):
-//   nginx + ngx_l402 → `PodProvisioningService`. Kept compilable for
-//   existing K8s users (`--features kubernetes`). Not in the default build.
+// ngx_l402 melts accumulated proofs from both paths to Lightning. Its
+// wallet seed is derived from the provider's Nostr key, so both sides
+// open the same wallet.
 
-// Core modules — always compiled.
 pub mod blossom;
 pub mod blossom_crypto;
 pub mod cashu;
@@ -44,7 +28,6 @@ pub mod stake;
 pub mod templates;
 pub mod volume_encryption;
 
-// Proxmox / LXD canonical control plane — always compiled.
 pub mod compute;
 pub mod discovery;
 pub mod docker;
@@ -52,16 +35,10 @@ pub mod kvm;
 pub mod luks;
 pub mod lxd;
 pub mod provider;
-pub mod provider_http; // HTTP+ngx_l402 interface for Proxmox/LXD/KVM providers
+pub mod provider_http;
 pub mod proxmox;
 
-// Legacy K8s pipeline — feature-gated behind `kubernetes`.
-#[cfg(feature = "kubernetes")]
-pub mod pod_provisioning;
-#[cfg(feature = "kubernetes")]
-pub mod sidecar_service;
-
-// Re-export public types and functions (always-compiled surface).
+// Re-exports.
 pub use compute::{ComputeBackend, ContainerConfig, NodeStatus};
 pub use discovery::DiscoveryClient;
 pub use lxd::LxdBackend;

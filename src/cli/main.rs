@@ -8,7 +8,7 @@ mod commands;
 mod exec_client;
 
 use commands::{
-    batch, bootstrap, ci, deploy, exec, list, mcp, provider, spawn, status, system, topup, wallet,
+    batch, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system, topup, wallet,
 };
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
@@ -56,11 +56,6 @@ enum Commands {
     /// Run a shell command inside a spawned agent-sandbox workload
     /// via its baked-in HTTP exec server. Returns stdout/stderr/exit.
     Exec(exec::ExecArgs),
-
-    /// Run CI jobs on rented compute. `ci runner` attaches a leased
-    /// workload to a GitHub repo as an ephemeral self-hosted Actions
-    /// runner that takes exactly one job.
-    Ci(ci::CiArgs),
 
     /// Local token utilities. `wallet mint` mints a fresh token from
     /// a testnut-style mint — the funding source for unattended flows
@@ -112,7 +107,6 @@ async fn main() {
         Commands::Batch(args) => batch::execute(args, cli.verbose).await,
         Commands::Mcp(args) => mcp::execute(args, cli.verbose).await,
         Commands::Exec(args) => exec::execute(args, cli.verbose).await,
-        Commands::Ci(args) => ci::execute(args, cli.verbose).await,
         Commands::Wallet(args) => wallet::execute(args).await,
 
         // Provider
