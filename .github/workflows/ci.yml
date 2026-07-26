@@ -1,26 +1,140 @@
 name: CI
 
+# Heavy jobs (test, clippy) run on Paygress-provisioned compute: the
+# `spawn-runners` job mints an ecash token, rents a workload from the
+# CI provider, and attaches it to this repo as an ephemeral JIT
+# Actions runner (one job, then it deregisters and the box powers
+# itself off, releasing the lease's compute). Dogfooding with teeth —
+# every push is a real spawn paid over the real protocol.
+#
+# Fork PRs never touch self-hosted runners: they run on the hosted
+# duplicates at the bottom. If the provider is down, spawn-runners
+# fails loud; fix the provider (or re-run) rather than papering over
+# it — outages are exactly the signal dogfooding exists to surface.
+#
+# Repo configuration this workflow expects:
+#   secrets.CI_RUNNER_PAT      fine-grained PAT, Administration: RW
+#                              (GITHUB_TOKEN cannot mint JIT runners)
+#   vars.PAYGRESS_PROVIDER     provider name or ID (e.g. CIRunner)
+#   vars.PAYGRESS_CI_MINT      testnut-style mint URL the provider
+#                              whitelists (fake LN auto-pays quotes)
+#   vars.PAYGRESS_CI_SATS      token size per runner; sats ≈
+#                              tier msat/s × expected seconds / 1000
+
 on:
   push:
     branches: [main]
   pull_request:
 
+# Read-only job tokens. Jobs on paygress runners execute on rented,
+# potentially third-party compute: the box operator can read the
+# job's GITHUB_TOKEN, so it must be worth nothing. The CI_RUNNER_PAT
+# never reaches rented compute at all — it is consumed inside the
+# GitHub-hosted spawn-runners job and exchanged for a single-use JIT
+# registration; only that blob lands on the runner box.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# `github.run_id`-scoped runner labels keep concurrent workflows from
+# stealing each other's single-job JIT runners.
 jobs:
-  test:
-    name: Test
+  spawn-runners:
+    name: Spawn paygress runner (${{ matrix.target }})
+    # Same-repo pushes and PRs only — fork PRs use the hosted jobs.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [test, clippy]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev sshpass
+      # Built from the checkout (not crates.io) so the workflow always
+      # uses this branch's CLI — new flags are usable the same PR they
+      # land in. rust-cache keeps this to a warm incremental build.
+      - name: Build paygress-cli
+        run: cargo build --bin paygress-cli
+      - name: Mint CI token
+        run: |
+          TOKEN=$(./target/debug/paygress-cli wallet mint \
+            --mint "${{ vars.PAYGRESS_CI_MINT }}" \
+            --amount "${{ vars.PAYGRESS_CI_SATS }}")
+          echo "::add-mask::$TOKEN"
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      # PAYGRESS_CI_IMAGE names a prebaked image on the provider
+      # (runner + rust toolchain preinstalled — cuts ~3 min of
+      # provisioning). Unset, it falls back to a stock image that the
+      # provisioning script sets up from scratch. The runner powers
+      # itself off when its one job ends, releasing the lease's
+      # compute early.
+      - name: Rent runner
+        run: |
+          ./target/debug/paygress-cli ci runner \
+            --repo "${{ github.repository }}" \
+            --provider "${{ vars.PAYGRESS_PROVIDER }}" \
+            --tier "${{ vars.PAYGRESS_CI_TIER || 'ci' }}" \
+            --token "$TOKEN" \
+            --image "${{ vars.PAYGRESS_CI_IMAGE || 'ubuntu:24.04' }}" \
+            --labels "self-hosted,paygress,run-${{ github.run_id }}-${{ matrix.target }}" \
+            --skip-docker \
+            --github-token "${{ secrets.CI_RUNNER_PAT }}"
+
+  test:
+    name: Test
+    needs: spawn-runners
+    runs-on: [self-hosted, paygress, "run-${{ github.run_id }}-test"]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # No-ops on the prebaked image; installs from scratch on a
+      # stock one. The workload runs as root: no sudo.
+      - name: Install system dependencies
+        run: |
+          command -v cc >/dev/null || \
+            (apt-get update && apt-get install -y build-essential pkg-config libssl-dev)
+      - name: Install Rust
+        run: |
+          [ -x "$HOME/.cargo/bin/cargo" ] || \
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
       - name: cargo test --all-features
         run: cargo test --all-features
+
+  clippy:
+    name: Clippy (advisory)
+    needs: spawn-runners
+    runs-on: [self-hosted, paygress, "run-${{ github.run_id }}-clippy"]
+    timeout-minutes: 90
+    # Clippy runs in advisory mode for now: warnings are reported in the
+    # build log but do NOT fail the job. The 12-month plan calls for
+    # `-D warnings` as the eventual state; see
+    # docs/solutions/patterns/critical-patterns.md for the staging.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          command -v cc >/dev/null || \
+            (apt-get update && apt-get install -y build-essential pkg-config libssl-dev)
+      - name: Install Rust
+        run: |
+          [ -x "$HOME/.cargo/bin/cargo" ] || \
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain stable \
+              --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" component add clippy 2>/dev/null || true
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy (advisory)
+        run: cargo clippy --all-targets --all-features
 
   fmt:
     name: Rustfmt
@@ -33,21 +147,29 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy (advisory)
+  # ---- Hosted fallbacks for fork PRs only -------------------------
+  # Outside contributions still get full CI without ever landing on a
+  # self-hosted runner (untrusted code + self-hosted = classic
+  # foot-gun; ephemeral single-job runners narrow it, this eliminates
+  # it).
+
+  test-fork:
+    name: Test (fork, hosted)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
-    # Clippy runs in advisory mode for now: warnings are reported in the
-    # build log but do NOT fail the job. The 12-month plan
-    # (docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md) calls
-    # for `-D warnings` as the eventual state. Tightening is staged:
-    #   1. Unit 7 feature-gates the K8s pipeline behind `kubernetes`,
-    #      removing ~half the existing dead-code warnings from default
-    #      builds automatically.
-    #   2. A follow-up PR cleans the remaining warnings on the
-    #      Nostr-DM canonical control plane.
-    #   3. Once warnings are at zero, this job switches to
-    #      `cargo clippy ... -- -D warnings` and is renamed to "Clippy".
-    # See docs/solutions/patterns/critical-patterns.md for the rationale.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: cargo test --all-features
+        run: cargo test --all-features
+
+  clippy-fork:
+    name: Clippy (fork, hosted, advisory)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
