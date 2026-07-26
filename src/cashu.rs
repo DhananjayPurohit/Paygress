@@ -498,13 +498,15 @@ pub async fn mint_fresh_token(
         anyhow::bail!("cannot mint a zero-value token");
     }
 
-    let db = cdk_redb::wallet::WalletRedbDatabase::new(db_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to open ephemeral wallet db at {}: {}",
-            db_path.display(),
-            e
-        )
-    })?;
+    let db = cdk_sqlite::WalletSqliteDatabase::new(db_path.to_path_buf())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open ephemeral wallet db at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
     let db: Arc<dyn WalletDatabase<Err = DbError> + Send + Sync> = Arc::new(db);
 
     let mut seed = [0u8; 64];

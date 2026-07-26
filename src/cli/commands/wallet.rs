@@ -51,7 +51,7 @@ async fn run_mint(args: MintArgs) -> Result<()> {
     // best-effort removal regardless of outcome.
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
-        "paygress-wallet-mint-{}.redb",
+        "paygress-wallet-mint-{}.sqlite",
         uuid::Uuid::new_v4()
     ));
 
