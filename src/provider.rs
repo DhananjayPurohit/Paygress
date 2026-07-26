@@ -354,6 +354,14 @@ impl ProviderService {
         // consistent proof history across restarts. Uses cdk-sqlite so the same
         // database file (and same seed) can be shared with ngx_l402, enabling it
         // to sweep Nostr-DM path ecash to Lightning alongside HTTP-path ecash.
+        // A provider upgrading across the redb → SQLite switch still has
+        // the old path in its config; refuse it with an explanation
+        // rather than letting the SQLite driver report "file is not a
+        // database".
+        crate::cashu::ensure_not_legacy_redb_wallet(std::path::Path::new(
+            &config.cashu_wallet_db_path,
+        ))?;
+
         let wallet_db = cdk_sqlite::WalletSqliteDatabase::new(std::path::PathBuf::from(
             &config.cashu_wallet_db_path,
         ))

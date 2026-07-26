@@ -40,7 +40,42 @@ const MSAT_PER_SAT: u64 = 1000;
 // `kubernetes` for the legacy K8s pipeline.
 static CASHU_DB: OnceLock<Arc<cdk_sqlite::WalletSqliteDatabase>> = OnceLock::new();
 
+/// redb's file header. Paygress stored the CDK wallet in redb until the
+/// switch to cdk-sqlite; the magic is what lets us recognize one of
+/// those files instead of handing it to a SQLite driver that reports
+/// only "file is not a database".
+const REDB_MAGIC: &[u8] = b"redb\x1a\x0a\xa9\x0d\x0a";
+
+/// Name a legacy redb wallet for what it is.
+///
+/// The wallet moved from redb to SQLite; a config still pointing at the
+/// old file gets "file is not a database" from the SQLite driver, which
+/// says neither what happened nor what to change. No migration is
+/// offered — there is nothing deployed to migrate — just a legible
+/// error.
+pub fn ensure_not_legacy_redb_wallet(db_path: &Path) -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(db_path) else {
+        // Missing file is the normal first-run case: the driver creates it.
+        return Ok(());
+    };
+    let mut header = [0u8; REDB_MAGIC.len()];
+    if file.read_exact(&mut header).is_err() || header != REDB_MAGIC {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "the cashu wallet at {} is a redb database; this version stores the \
+         wallet in SQLite. Point `cashu_wallet_db_path` at a new file, e.g. {}",
+        db_path.display(),
+        db_path.with_extension("sqlite").display(),
+    )
+}
+
 pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
+    ensure_not_legacy_redb_wallet(Path::new(db_path)).map_err(|e| e.to_string())?;
+
     match cdk_sqlite::WalletSqliteDatabase::new(std::path::PathBuf::from(db_path)).await {
         Ok(db) => {
             tracing::debug!("Cashu database initialized at: {}", db_path);
@@ -320,6 +355,61 @@ pub fn resolve_wallet_seed(nostr_private_key: &str) -> Result<[u8; 64], String> 
     }
     let mnemonic = mnemonic_from_nostr_key(nostr_private_key)?;
     derive_wallet_seed(&mnemonic)
+}
+
+#[cfg(test)]
+mod legacy_wallet_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "paygress-redb-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        p
+    }
+
+    #[test]
+    fn missing_file_is_fine() {
+        // First run: the SQLite driver creates the file itself.
+        let p = temp_path("absent.sqlite");
+        let _ = std::fs::remove_file(&p);
+        assert!(ensure_not_legacy_redb_wallet(&p).is_ok());
+    }
+
+    #[test]
+    fn redb_wallet_is_rejected_with_guidance() {
+        // Verbatim first bytes of a real paygress redb wallet.
+        let p = temp_path("legacy.redb");
+        std::fs::write(&p, b"redb\x1a\x0a\xa9\x0d\x0a\x03\x00\x00\x00").unwrap();
+
+        let err = ensure_not_legacy_redb_wallet(&p)
+            .expect_err("a redb wallet must not be opened as SQLite")
+            .to_string();
+        // Must name the format and the path to set instead.
+        assert!(err.contains("redb database"), "got: {}", err);
+        assert!(err.contains("legacy.sqlite"), "got: {}", err);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sqlite_and_short_files_pass_through() {
+        // A real SQLite wallet, and a file too short to hold the magic,
+        // both belong to the driver rather than this check.
+        let sqlite = temp_path("real.sqlite");
+        std::fs::write(&sqlite, b"SQLite format 3\x00rest").unwrap();
+        assert!(ensure_not_legacy_redb_wallet(&sqlite).is_ok());
+
+        let tiny = temp_path("tiny.sqlite");
+        std::fs::write(&tiny, b"ab").unwrap();
+        assert!(ensure_not_legacy_redb_wallet(&tiny).is_ok());
+
+        let _ = std::fs::remove_file(&sqlite);
+        let _ = std::fs::remove_file(&tiny);
+    }
 }
 
 #[cfg(test)]
