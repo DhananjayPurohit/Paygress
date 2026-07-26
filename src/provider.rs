@@ -115,6 +115,18 @@ pub struct ProviderConfig {
     #[serde(default = "default_cashu_wallet_db_path")]
     pub cashu_wallet_db_path: String,
 
+    /// Where the active-workload table is mirrored to disk.
+    ///
+    /// `active_workloads` is the only record that a lease exists — the
+    /// backend knows a container is running but not who paid for it or
+    /// when it expires. Held purely in memory, a restart forgets every
+    /// lease: the containers keep running, no cleanup ever reclaims
+    /// them, and their vmids stay allocated forever (`find_available_id`
+    /// reads live backend state). Persisting it makes a restart — the
+    /// most ordinary operator action there is — non-destructive.
+    #[serde(default = "default_workload_state_path")]
+    pub workload_state_path: String,
+
     /// Bind address for the optional HTTP+ngx_l402 interface.
     ///
     /// When set the provider listens for HTTP spawn/topup requests **in
@@ -142,6 +154,72 @@ pub struct ProviderConfig {
 
 fn default_cashu_wallet_db_path() -> String {
     "./paygress-cashu-wallet.sqlite".to_string()
+}
+
+fn default_workload_state_path() -> String {
+    "./paygress-workloads.json".to_string()
+}
+
+/// Mirror the active-workload table to disk.
+///
+/// Written whole on every mutation — the table is bounded by the vmid
+/// range (~1000 entries) and mutates only on spawn, topup, and cleanup,
+/// so rewriting it costs less than tracking deltas would.
+///
+/// Writes to a sibling temp file and renames, because a truncated
+/// state file is worse than a slightly stale one: the loader would
+/// treat every workload past the truncation point as never having
+/// existed. `rename` within a directory is atomic on POSIX.
+///
+/// Failures are logged, never propagated: losing the mirror degrades a
+/// future restart, but refusing to serve a paid-for spawn because a
+/// bookkeeping file is unwritable would be worse.
+fn persist_workloads(workloads: &HashMap<u32, WorkloadInfo>, path: &str) {
+    let tmp = format!("{}.tmp", path);
+    let encoded = match serde_json::to_vec_pretty(workloads) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("failed to encode workload state: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&tmp, &encoded) {
+        error!("failed to write workload state to {}: {}", tmp, e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        error!("failed to install workload state at {}: {}", path, e);
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Read the mirrored workload table back.
+///
+/// A missing file is the normal first-run case. A corrupt one is
+/// reported and treated as empty rather than fatal — a provider that
+/// refuses to boot over unreadable bookkeeping is worse than one that
+/// boots having forgotten some leases, which is exactly the pre-
+/// persistence behavior.
+fn load_workloads(path: &str) -> HashMap<u32, WorkloadInfo> {
+    let raw = match std::fs::read(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            warn!("failed to read workload state from {}: {}", path, e);
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_slice(&raw) {
+        Ok(w) => w,
+        Err(e) => {
+            error!(
+                "workload state at {} is unreadable ({}); starting with an empty table. \
+                 Containers it referenced will need manual cleanup.",
+                path, e
+            );
+            HashMap::new()
+        }
+    }
 }
 
 impl Default for ProviderConfig {
@@ -182,6 +260,7 @@ impl Default for ProviderConfig {
             ssh_port_start: None,
             ssh_port_end: None,
             cashu_wallet_db_path: default_cashu_wallet_db_path(),
+            workload_state_path: default_workload_state_path(),
             http_bind_addr: None,
             lightning_address: None,
         }
@@ -189,7 +268,7 @@ impl Default for ProviderConfig {
 }
 
 /// Active workload tracking
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadInfo {
     pub vmid: u32,
     pub workload_type: String, // "lxc" or "vm"
@@ -399,6 +478,84 @@ impl ProviderService {
         })
     }
 
+    /// Reload leases from disk and reconcile them against the backend.
+    ///
+    /// Without this a restart forgets every lease: containers keep
+    /// running with nothing to reclaim them and their vmids stay
+    /// allocated. Reconciliation matters as much as the reload — the
+    /// backend is the authority on what actually exists, and a
+    /// container deleted while the provider was down (operator
+    /// cleanup, host reboot, `lxc delete`) would otherwise be tracked
+    /// forever and re-announced as capacity that isn't there.
+    ///
+    /// Restored workloads re-enter the state machine as `Provisioning`
+    /// rather than `Live`: the first observation tick promotes them,
+    /// which is the same path a fresh spawn takes.
+    async fn restore_workloads(&self) {
+        let persisted = load_workloads(&self.config.workload_state_path);
+        if persisted.is_empty() {
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut restored = HashMap::new();
+        let mut dropped = 0usize;
+        for (vmid, workload) in persisted {
+            match self.backend.get_container_status(vmid).await {
+                Ok(ContainerStatus::Absent) => {
+                    info!(
+                        "workload {} no longer exists on the backend; dropping",
+                        vmid
+                    );
+                    dropped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    // Keep it: an unreachable backend must not be read
+                    // as "the container is gone". The cleanup sweep
+                    // will delete it at expiry either way.
+                    warn!(
+                        "could not verify workload {} ({}); keeping it tracked",
+                        vmid, e
+                    );
+                }
+                Ok(_) => {}
+            }
+
+            self.state_machine.lock().await.track(DurableWorkload {
+                workload_id: vmid,
+                provider_npub: self.nostr.get_service_public_key(),
+                state: WorkloadState::Provisioning { since: now },
+                replication: workload.replication.clone(),
+                restart_policy: workload.restart_policy,
+                state_uri: workload.state_uri.clone(),
+                created_at: workload.created_at,
+                expires_at: workload.expires_at,
+            });
+            restored.insert(vmid, workload);
+        }
+
+        let expired = restored.values().filter(|w| w.expires_at <= now).count();
+        info!(
+            "restored {} workload(s) from {} ({} dropped as missing, {} already expired and \
+             due for cleanup)",
+            restored.len(),
+            self.config.workload_state_path,
+            dropped,
+            expired,
+        );
+
+        let mut lock = self.active_workloads.lock().await;
+        *lock = restored;
+        // Write back immediately so the dropped entries don't linger
+        // in the file until the next spawn or sweep.
+        persist_workloads(&lock, &self.config.workload_state_path);
+    }
+
     /// Get the provider's public key (npub)
     pub fn get_npub(&self) -> String {
         self.nostr.get_service_public_key()
@@ -428,6 +585,8 @@ impl ProviderService {
         info!("🚀 Starting Paygress Provider Service");
         info!("Provider: {}", self.config.provider_name);
         info!("NPUB: {}", self.get_npub());
+
+        self.restore_workloads().await;
 
         // Publish initial offer
         self.publish_offer().await?;
@@ -928,6 +1087,7 @@ impl ProviderService {
                 self.state_machine.lock().await.untrack(workload_id);
                 let mut wl = self.active_workloads.lock().await;
                 wl.remove(&workload_id);
+                persist_workloads(&wl, &self.config.workload_state_path);
             }
         }
     }
@@ -980,6 +1140,12 @@ impl ProviderService {
                         }
                         Err(e) => error!("Failed to cleanup workload {}: {}", vmid, e),
                     }
+
+                    // Persist per workload rather than once per sweep:
+                    // a crash midway through a multi-workload cleanup
+                    // would otherwise resurrect entries whose
+                    // containers are already deleted.
+                    persist_workloads(&workloads, &self.config.workload_state_path);
                 }
             }
             drop(workloads);
@@ -1652,7 +1818,11 @@ async fn handle_spawn_request(
         consumer_workload_id: request.workload_id.clone().filter(|s| !s.is_empty()),
     };
 
-    workloads.lock().await.insert(id, workload.clone());
+    {
+        let mut lock = workloads.lock().await;
+        lock.insert(id, workload.clone());
+        persist_workloads(&lock, &config.workload_state_path);
+    }
 
     // Register the workload with the state machine (Unit 5 wiring).
     // Starts in `Provisioning`; the orchestrator promotes it to
@@ -1925,7 +2095,11 @@ async fn handle_topup_request(
         match lock.get_mut(&vmid) {
             Some(w) if w.owner_npub == requester_pubkey => {
                 w.expires_at = w.expires_at.saturating_add(extension_secs);
-                w.expires_at
+                let extended = w.expires_at;
+                // The consumer has already paid for this extension;
+                // a restart must not roll it back to the old expiry.
+                persist_workloads(&lock, &config.workload_state_path);
+                extended
             }
             _ => {
                 // Vanished or ownership changed between snapshots.
@@ -2347,6 +2521,100 @@ fn schedule_standby_promotion(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod workload_persistence_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "paygress-workload-state-{}-{}.json",
+            std::process::id(),
+            name
+        ));
+        p.to_string_lossy().into_owned()
+    }
+
+    fn workload(vmid: u32, expires_at: u64) -> WorkloadInfo {
+        WorkloadInfo {
+            vmid,
+            workload_type: "lxc".to_string(),
+            spec_id: "ci".to_string(),
+            created_at: 1000,
+            expires_at,
+            owner_npub: "npub1consumer".to_string(),
+            replication: Default::default(),
+            restart_policy: Default::default(),
+            state_uri: None,
+            consumer_workload_id: None,
+        }
+    }
+
+    #[test]
+    fn missing_state_file_loads_empty() {
+        let p = temp_path("absent");
+        let _ = std::fs::remove_file(&p);
+        assert!(load_workloads(&p).is_empty());
+    }
+
+    #[test]
+    fn round_trips_the_fields_cleanup_depends_on() {
+        let p = temp_path("roundtrip");
+        let mut map = HashMap::new();
+        map.insert(2000, workload(2000, 1234567890));
+        map.insert(2001, workload(2001, 1234567999));
+        persist_workloads(&map, &p);
+
+        let loaded = load_workloads(&p);
+        assert_eq!(loaded.len(), 2);
+        // expires_at drives the cleanup sweep and owner_npub gates
+        // topup; losing either would strand or misassign a lease.
+        assert_eq!(loaded[&2000].expires_at, 1234567890);
+        assert_eq!(loaded[&2001].expires_at, 1234567999);
+        assert_eq!(loaded[&2000].owner_npub, "npub1consumer");
+        assert_eq!(loaded[&2000].spec_id, "ci");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn corrupt_state_degrades_to_empty_rather_than_failing() {
+        // A provider that refuses to boot over unreadable bookkeeping
+        // is worse than one that boots having forgotten leases.
+        let p = temp_path("corrupt");
+        std::fs::write(&p, b"{ this is not json").unwrap();
+        assert!(load_workloads(&p).is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_leaves_no_temp_file_behind() {
+        // The temp+rename dance must not litter: a stale `.tmp`
+        // sitting next to the state file would confuse an operator
+        // reading the directory.
+        let p = temp_path("tmpfile");
+        let map = HashMap::from([(2000, workload(2000, 42))]);
+        persist_workloads(&map, &p);
+        assert!(!std::path::Path::new(&format!("{}.tmp", p)).exists());
+        assert!(std::path::Path::new(&p).exists());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rewrite_replaces_rather_than_merges() {
+        // Cleanup removes entries by rewriting the whole table; if a
+        // rewrite merged, deleted workloads would resurrect on restart.
+        let p = temp_path("replace");
+        persist_workloads(&HashMap::from([(2000, workload(2000, 1))]), &p);
+        persist_workloads(&HashMap::from([(2001, workload(2001, 2))]), &p);
+
+        let loaded = load_workloads(&p);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key(&2001));
+        let _ = std::fs::remove_file(&p);
+    }
 }
 
 #[cfg(test)]
