@@ -1,43 +1,65 @@
 name: CI
 
-# Heavy jobs (test, clippy) run on Paygress-provisioned compute: the
-# `spawn-runners` job mints an ecash token, rents a workload from the
-# CI provider, and attaches it to this repo as an ephemeral JIT
-# Actions runner (one job, then it deregisters and the box powers
-# itself off, releasing the lease's compute). Dogfooding with teeth —
-# every push is a real spawn paid over the real protocol.
+# The heavy job runs on Paygress-provisioned compute: `spawn-runner`
+# mints an ecash token, rents a workload from the CI provider, and
+# attaches it to this repo as an ephemeral JIT Actions runner (one job,
+# then it deregisters and the box powers itself off, releasing the
+# lease's compute). Dogfooding with teeth — every push is a real spawn
+# paid over the real protocol.
 #
-# Fork PRs never touch self-hosted runners, and a repo without the
-# paygress config below runs everything hosted — both use the hosted
-# jobs at the bottom. A *configured* provider that is down still
-# fails loudly: outages are the signal dogfooding exists to surface,
-# whereas "not set up yet" is not a failure.
+# `fmt` and `check-default` are hosted and unconditional. The test
+# suite takes one of two mutually exclusive paths, never both:
+#
+#   configured repo + same-repo push/PR -> spawn-runner -> checks
+#   fork PR, or no PAYGRESS_PROVIDER    -> checks-hosted
+#
+# Fork PRs never touch self-hosted runners (untrusted code on rented
+# compute we then trust is the classic foot-gun; ephemeral single-job
+# runners narrow it, this eliminates it). Repos with no paygress config
+# — a fresh fork, someone's clone — fall back to hosted rather than
+# failing on a provider they were never set up to reach. Both paths run
+# the identical step list from .github/actions/rust-checks.
+#
+# If the provider is down in a configured repo, spawn-runner fails loud
+# and `ci-gate` goes red; fix the provider (or re-run) rather than
+# papering over it — outages are exactly the signal dogfooding exists to
+# surface.
 #
 # Repo configuration this workflow expects:
 #   secrets.CI_RUNNER_PAT      fine-grained PAT, Administration: RW
 #                              (GITHUB_TOKEN cannot mint JIT runners)
-#   vars.PAYGRESS_PROVIDER     provider name or ID (e.g. CIRunner)
+#   vars.PAYGRESS_PROVIDER     provider name or ID (e.g. CIRunner).
+#                              Empty/unset switches the repo to the
+#                              hosted path — it is the config sentinel.
 #   vars.PAYGRESS_CI_MINT      testnut-style mint URL the provider
 #                              whitelists (fake LN auto-pays quotes)
-#   vars.PAYGRESS_CI_SATS      token size per runner; sats ≈
-#                              tier msat/s × expected seconds / 1000
+#   vars.PAYGRESS_CI_SATS      token size for the runner; sats ≈
+#                              tier msat/s × expected seconds / 1000.
+#                              NOTE: one box now runs the test suite and
+#                              clippy back to back, so size this for
+#                              both, not for a single cargo invocation.
+#                              Clippy reuses the dependency artifacts
+#                              cargo test just produced, so budget a few
+#                              extra minutes, not double. Total spend
+#                              still roughly halves versus the previous
+#                              box-per-check layout.
 
 on:
   push:
     branches: [main]
   pull_request:
 
-# Read-only job tokens. Jobs on paygress runners execute on rented,
-# potentially third-party compute: the box operator can read the
-# job's GITHUB_TOKEN, so it must be worth nothing. The CI_RUNNER_PAT
-# never reaches rented compute at all — it is consumed inside the
-# GitHub-hosted spawn-runners job and exchanged for a single-use JIT
+# Read-only job tokens. The checks job executes on rented, potentially
+# third-party compute: the box operator can read that job's
+# GITHUB_TOKEN, so it must be worth nothing. The CI_RUNNER_PAT never
+# reaches rented compute at all — it is consumed inside the
+# GitHub-hosted spawn-runner job and exchanged for a single-use JIT
 # registration; only that blob lands on the runner box.
 permissions:
   contents: read
 
-# Superseded pushes cancel: every spawn costs a lease, and an
-# abandoned run's box stays rented until expiry.
+# Superseded pushes cancel: every spawn costs a lease, and an abandoned
+# run's box stays rented until expiry.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -45,37 +67,99 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Line tables keep file:line in backtraces while dropping the rest of
+  # the debug info: less to codegen, far less to link across sixteen
+  # test binaries, and a much smaller cargo cache to ship to and from a
+  # rented box. Workflow-wide on purpose — a profile mismatch between
+  # jobs would change artifact fingerprints and void the shared cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # Rented boxes sit behind whatever egress the provider has. A retry is
+  # cheaper than re-running the whole workflow (and re-paying for it).
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
 
-# `github.run_id`-scoped runner labels keep concurrent workflows from
-# stealing each other's single-job JIT runners.
 jobs:
-  spawn-runners:
-    name: Spawn paygress runner (${{ matrix.target }})
-    # Same-repo pushes and PRs only — fork PRs use the hosted jobs.
-    # Needs the paygress config to exist. An unconfigured repo (fresh
-    # clone, or before the PAT is issued) falls back to hosted runners
-    # rather than failing — a missing variable is a configuration
-    # state, not a provider outage. A configured provider that is
-    # *down* still fails loudly, which is the signal worth having.
+  # Hosted and unconditional — it runs in every configuration, so
+  # `ci-gate` can demand it unconditionally.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # The crate ships `default = []`; the test job runs `--all-features`,
+  # which turns on `kubernetes` and compiles modules the default build
+  # never sees. Without this job nothing in CI ever compiles the feature
+  # set `cargo install paygress-cli` actually gets, and a kubernetes-only
+  # symbol leaking into ungated code would reach users green.
+  #
+  # Hosted and unconditional, like fmt: it costs nothing, it runs in
+  # parallel with the spawn, and it keeps a compile-only gate off paid
+  # compute — a rented box would have to build the whole dependency
+  # graph a second time in check mode to answer the same question.
+  # `--all-targets` pulls in the tests/ targets too; the `paygress` bin
+  # drops out on its own (unmet required-features).
+  check-default:
+    name: Compile gate (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-default
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config libssl-dev
+      - name: cargo check --all-targets
+        run: cargo check --locked --all-targets
+
+  # `github.run_id`-scoped runner labels keep concurrent workflows from
+  # stealing each other's single-job JIT runners.
+  spawn-runner:
+    name: Spawn paygress runner
+    # Configured repo, and same-repo push or PR. This is the only `if:`
+    # on the paygress path — `checks` inherits the skip through
+    # `needs:`, which keeps the condition in exactly one place.
     if: >-
       vars.PAYGRESS_PROVIDER != '' &&
       (github.event_name == 'push' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [test, clippy]
+    # Provider response is capped at --timeout-secs, then SSH
+    # provisioning. Anything past 20 min is hung, and a hung spawn holds
+    # the concurrency group.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The one writer of the `ci` cache, and only from main: PR
+      # branches would each push a variant no other branch can read,
+      # while main's entry is visible to every PR. The rented box
+      # restores this entry — see .github/actions/rust-checks.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev sshpass
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            pkg-config libssl-dev sshpass
       # Built from the checkout (not crates.io) so the workflow always
       # uses this branch's CLI — new flags are usable the same PR they
       # land in. rust-cache keeps this to a warm incremental build.
       - name: Build paygress-cli
-        run: cargo build --bin paygress-cli
+        run: cargo build --locked --bin paygress-cli
       - name: Mint CI token
         run: |
           TOKEN=$(./target/debug/paygress-cli wallet mint \
@@ -89,8 +173,8 @@ jobs:
       # (runner + rust toolchain preinstalled — cuts ~3 min of
       # provisioning). Unset, it falls back to a stock image that the
       # provisioning script sets up from scratch. The runner powers
-      # itself off when its one job ends, releasing the lease's
-      # compute early.
+      # itself off when its one job ends, releasing the lease's compute
+      # early.
       - name: Rent runner
         env:
           GITHUB_TOKEN: ${{ secrets.CI_RUNNER_PAT }}
@@ -101,13 +185,20 @@ jobs:
             --tier "${{ vars.PAYGRESS_CI_TIER || 'ci' }}" \
             --token "$TOKEN" \
             --image "${{ vars.PAYGRESS_CI_IMAGE || 'ubuntu:24.04' }}" \
-            --labels "self-hosted,paygress,run-${{ github.run_id }}-${{ matrix.target }}" \
+            --labels "self-hosted,paygress,run-${{ github.run_id }}" \
             --skip-docker
 
-  test:
-    name: Test
-    needs: spawn-runners
-    runs-on: [self-hosted, paygress, "run-${{ github.run_id }}-test"]
+  # One rented box runs the test suite and clippy. A JIT registration
+  # accepts exactly one job, so "test on one runner, clippy on another"
+  # means two leases — and the second box would rebuild the entire
+  # dependency graph the first one just built, since cargo clippy swaps
+  # the compiler only for workspace crates and shares dependency
+  # artifacts with cargo test. Sharing the box costs a couple of minutes
+  # of wall clock and saves half the sats.
+  checks:
+    name: Checks (paygress runner)
+    needs: spawn-runner
+    runs-on: [self-hosted, paygress, "run-${{ github.run_id }}"]
     timeout-minutes: 90
     steps:
       # persist-credentials: false — the job token would otherwise sit
@@ -115,133 +206,56 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # No-ops on the prebaked image; installs from scratch on a
-      # stock one. The workload runs as root: no sudo.
-      - name: Install system dependencies
-        run: |
-          command -v cc >/dev/null || \
-            (apt-get update && apt-get install -y build-essential pkg-config libssl-dev)
-      - name: Install Rust
-        run: |
-          [ -x "$HOME/.cargo/bin/cargo" ] || \
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      # save-if: false — restore-only. A cache written from rented
-      # compute is a persistence channel that outlives the "one job,
-      # then gone" runner: poisoned build scripts and proc-macros
-      # would be restored (and executed) by later jobs.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-checks
         with:
-          save-if: false
-      - name: cargo test --all-features
-        run: cargo test --all-features
+          rented: "true"
 
-  clippy:
-    name: Clippy (advisory)
-    needs: spawn-runners
-    runs-on: [self-hosted, paygress, "run-${{ github.run_id }}-clippy"]
-    timeout-minutes: 90
-    # Clippy runs in advisory mode for now: warnings are reported in the
-    # build log but do NOT fail the job. The 12-month plan calls for
-    # `-D warnings` as the eventual state; see
-    # docs/solutions/patterns/critical-patterns.md for the staging.
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install system dependencies
-        run: |
-          command -v cc >/dev/null || \
-            (apt-get update && apt-get install -y build-essential pkg-config libssl-dev)
-      - name: Install Rust
-        run: |
-          [ -x "$HOME/.cargo/bin/cargo" ] || \
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --profile minimal --default-toolchain stable \
-              --component clippy
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" component add clippy 2>/dev/null || true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: false
-      - name: cargo clippy (advisory)
-        run: cargo clippy --all-targets --all-features
-
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-  # ---- Hosted fallbacks for fork PRs only -------------------------
-  # Outside contributions still get full CI without ever landing on a
-  # self-hosted runner (untrusted code + self-hosted = classic
-  # foot-gun; ephemeral single-job runners narrow it, this eliminates
-  # it).
-
-  # Hosted fallback: fork PRs (never trust them on self-hosted) and
-  # repos with no paygress config yet.
-  test-hosted:
-    name: Test (hosted)
+  # Hosted fallback: fork PRs, and repos with no paygress config. The
+  # two clauses are in that order deliberately — the provider check is
+  # evaluated first so an unconfigured fork still lands here exactly
+  # once (the condition is an OR, the job runs once either way).
+  # Together with spawn-runner's condition this is an exact complement:
+  # precisely one of the two paths runs on every event.
+  checks-hosted:
+    name: Checks (hosted)
     if: >-
       vars.PAYGRESS_PROVIDER == '' ||
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
-      - name: cargo test --all-features
-        run: cargo test --all-features
-
-  clippy-hosted:
-    name: Clippy (hosted, advisory)
-    if: >-
-      vars.PAYGRESS_PROVIDER == '' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
-      - name: cargo clippy (advisory)
-        run: cargo clippy --all-targets --all-features
+      - uses: ./.github/actions/rust-checks
 
   # The single required check. Without it, a provider outage skips
-  # `test` — and a skipped required check reads as green, i.e. the
-  # tests silently never ran. Exactly one of the two test paths runs
-  # per event (paygress when configured, hosted otherwise), so the
-  # gate asserts that one of them actually passed.
+  # `checks` — and a skipped required check reads as green, i.e. the
+  # tests silently never ran. Skipped counts as failure here; only the
+  # path that was never supposed to run may be skipped.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [fmt, test, clippy, test-hosted, clippy-hosted]
+    needs: [fmt, check-default, checks, checks-hosted]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Require tests to have actually run
+      - name: Require the checks to have actually run
+        env:
+          FMT: ${{ needs.fmt.result }}
+          DEFAULT: ${{ needs.check-default.result }}
+          PAYGRESS: ${{ needs.checks.result }}
+          HOSTED: ${{ needs.checks-hosted.result }}
         run: |
-          fmt='${{ needs.fmt.result }}'
-          paygress='${{ needs.test.result }}'
-          hosted='${{ needs.test-hosted.result }}'
-          echo "fmt=$fmt test(paygress)=$paygress test(hosted)=$hosted"
-          [ "$fmt" = success ] || { echo "::error::rustfmt did not pass"; exit 1; }
-          if [ "$paygress" = success ] || [ "$hosted" = success ]; then
+          echo "fmt=$FMT check-default=$DEFAULT checks=$PAYGRESS checks-hosted=$HOSTED"
+          # These two are unconditional, so anything but success —
+          # including skipped or cancelled — is a failure.
+          [ "$FMT" = success ] || { echo "::error::rustfmt did not pass"; exit 1; }
+          [ "$DEFAULT" = success ] || { echo "::error::default-feature compile gate did not pass"; exit 1; }
+          # Exactly one of the two test paths runs per event, so one
+          # success is the most that can ever be observed.
+          if [ "$PAYGRESS" = success ] || [ "$HOSTED" = success ]; then
             echo "test suite ran and passed"
           else
-            echo "::error::no test job succeeded (provider outage or test failure)"
+            echo "::error::no test job succeeded (provider outage, build failure, or test failure)"
             exit 1
           fi
