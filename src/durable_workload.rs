@@ -310,6 +310,26 @@ fn workload_state_since(state: &WorkloadState) -> Option<u64> {
     }
 }
 
+/// Whether losing heartbeat quorum should push this workload toward
+/// eviction.
+///
+/// Quorum here is a **provider-level** signal: `send_heartbeat`
+/// publishes one heartbeat for the whole provider and records an
+/// observation per accepting relay, so "quorum lost" means *the
+/// provider could not reach enough relays*, not that any particular
+/// container is unhealthy.
+///
+/// That signal is only actionable for warm-standby: a standby needs
+/// it to take over, and the single-writer invariant depends on the
+/// primary evicting itself before the revocation is published. For
+/// every other workload there is no standby to promote — the
+/// consumer paid for wall-clock time, and a relay hiccup on the
+/// provider's side is not their problem. Evicting them would tear
+/// down healthy, paid-for containers during a network blip.
+fn failover_eligible(workload: &DurableWorkload) -> bool {
+    matches!(workload.replication, ReplicationMode::WarmStandby { .. })
+}
+
 fn advance(
     workload: &mut DurableWorkload,
     now: u64,
@@ -330,7 +350,7 @@ fn advance(
             if quorum_alive {
                 // refresh
                 workload.state = WorkloadState::Live { since };
-            } else if now.saturating_sub(since) >= cfg.t1_secs {
+            } else if failover_eligible(workload) && now.saturating_sub(since) >= cfg.t1_secs {
                 workload.state = WorkloadState::Suspect { since: now };
                 events.push(StateMachineEvent::EnteredSuspect {
                     workload_id: workload.workload_id,

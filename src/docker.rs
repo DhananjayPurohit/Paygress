@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use crate::compute::{ComputeBackend, ContainerConfig, NodeStatus};
+use crate::compute::{ComputeBackend, ContainerConfig, ContainerStatus, NodeStatus};
 use crate::luks::{create_encrypted_volume, destroy_encrypted_volume};
 
 /// Docker backend. Stateless wrapper around the `docker` CLI.
@@ -243,6 +243,23 @@ impl ComputeBackend for DockerBackend {
             disk_used: 0,
             disk_total: 0,
         })
+    }
+
+    async fn get_container_status(&self, id: u32) -> Result<ContainerStatus> {
+        let name = Self::name_for(id);
+        let output = self
+            .docker(&["inspect", "-f", "{{.State.Running}}", &name])
+            .await?;
+        if !output.status.success() {
+            // `inspect` fails only when there is no such container.
+            return Ok(ContainerStatus::Absent);
+        }
+        Ok(
+            match String::from_utf8_lossy(&output.stdout).trim().to_string() {
+                s if s == "true" => ContainerStatus::Running,
+                _ => ContainerStatus::Stopped,
+            },
+        )
     }
 
     async fn get_container_ip(&self, id: u32) -> Result<Option<String>> {

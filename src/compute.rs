@@ -102,4 +102,27 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Get public IP of the container/VM
     async fn get_container_ip(&self, id: u32) -> Result<Option<String>>;
+
+    /// Whether the workload is still running.
+    ///
+    /// Distinguishes "the tenant's box is alive" from "the tenant's
+    /// box already terminated itself" — a CI runner powers off when
+    /// its single job ends. Callers use it to avoid destroying a
+    /// healthy container on an ambiguous signal.
+    ///
+    /// Defaults to `Running` so a backend that cannot answer never
+    /// causes a destructive action to be taken on its behalf.
+    async fn get_container_status(&self, _id: u32) -> Result<ContainerStatus> {
+        Ok(ContainerStatus::Running)
+    }
+}
+
+/// Coarse run state of a workload. Deliberately three-valued: an
+/// unreachable backend must not be mistaken for a stopped workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerStatus {
+    Running,
+    Stopped,
+    /// The backend answered, but the workload is not in its list.
+    Absent,
 }
