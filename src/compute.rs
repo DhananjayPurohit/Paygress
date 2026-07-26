@@ -52,15 +52,15 @@ pub struct NodeStatus {
 /// One published port mapping. Docker translates this to
 /// `-p host_port:container_port`; LXD/Proxmox ignore it and expose
 /// only SSH via `ContainerConfig::host_port`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortMapping {
     pub host_port: u16,
     pub container_port: u16,
     /// "tcp" | "udp"
-    pub protocol: &'static str,
+    pub protocol: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerConfig {
     pub id: u32,
     pub name: String,
@@ -85,6 +85,11 @@ pub struct ContainerConfig {
     /// Docker backend builds a LUKS-on-loop file instead of a plain
     /// named volume; the key is fed to cryptsetup over stdin and
     /// never written to disk. No-op when `data_path` is `None`.
+    ///
+    /// `serde(skip)`: this is consumer key material. It stays in
+    /// memory for the life of the process and is never written to
+    /// provider-side state.
+    #[serde(skip)]
     pub volume_encryption_key: Option<[u8; 32]>,
 }
 

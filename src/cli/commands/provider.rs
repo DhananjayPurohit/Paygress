@@ -69,6 +69,11 @@ pub struct SetupArgs {
     #[arg(long, default_value = "pve")]
     pub node: String,
 
+    /// Skip TLS verification against the Proxmox API (needed for its
+    /// default self-signed certificate).
+    #[arg(long)]
+    pub accept_invalid_certs: bool,
+
     /// Storage pool name
     #[arg(long, default_value = "local-lvm")]
     pub storage: String,
@@ -282,6 +287,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         proxmox_token_id: args.token_id.unwrap_or_default(),
         proxmox_token_secret: args.token_secret.unwrap_or_default(),
         proxmox_node: args.node,
+        proxmox_accept_invalid_certs: args.accept_invalid_certs,
         proxmox_storage: args.storage,
         proxmox_template: args.template,
         proxmox_bridge: args.bridge,
@@ -306,6 +312,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         ssh_port_end: None,
         cashu_wallet_db_path: "./paygress-cashu-wallet.sqlite".to_string(),
         workload_state_path: "./paygress-workloads.json".to_string(),
+        standby_state_path: "./paygress-standby-slots.json".to_string(),
         lightning_address: args.lightning_address.clone(),
         http_bind_addr: None,
     };
@@ -355,6 +362,7 @@ async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()> {
         &config.proxmox_token_id,
         &config.proxmox_token_secret,
         &config.proxmox_node,
+        config.proxmox_accept_invalid_certs,
     ) {
         Ok(client) => match client.get_node_status().await {
             Ok(status) => {
@@ -444,6 +452,7 @@ fn build_multi_config(
         proxmox_token_id: String::new(),
         proxmox_token_secret: String::new(),
         proxmox_node: "pve".to_string(),
+        proxmox_accept_invalid_certs: false,
         proxmox_storage: "local-lvm".to_string(),
         proxmox_template: "local:vztmpl/ubuntu-22.04-standard.tar.zst".to_string(),
         proxmox_bridge: "vmbr0".to_string(),
@@ -470,6 +479,7 @@ fn build_multi_config(
         // would otherwise serialize all redemptions.
         cashu_wallet_db_path: format!("./paygress-{}.sqlite", provider_name),
         workload_state_path: format!("./paygress-{}-workloads.json", provider_name),
+        standby_state_path: format!("./paygress-{}-standby-slots.json", provider_name),
         http_bind_addr: None,
         lightning_address: args.lightning_address.clone(),
     }

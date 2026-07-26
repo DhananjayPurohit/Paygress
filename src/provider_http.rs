@@ -87,8 +87,13 @@ pub(crate) async fn run_provider_http_interface(
 fn extract_cashu_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(s) = auth.to_str() {
-            if s.len() > 6 && s[..6].eq_ignore_ascii_case("cashu ") {
-                return Some(s[6..].trim().to_string());
+            // `get(..6)` rather than `s[..6]`: the header is caller-
+            // supplied and a multi-byte codepoint straddling byte 6
+            // would panic on a direct slice.
+            if let Some(prefix) = s.get(..6) {
+                if prefix.eq_ignore_ascii_case("cashu ") {
+                    return Some(s[6..].trim().to_string());
+                }
             }
         }
     }

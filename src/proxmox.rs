@@ -94,10 +94,25 @@ impl ProxmoxClient {
     /// * `api_url` — e.g. `https://192.168.1.100:8006/api2/json`
     /// * `token_id` — e.g. `root@pam!paygress`
     /// * `node` — Proxmox node name, e.g. `pve`
-    pub fn new(api_url: &str, token_id: &str, token_secret: &str, node: &str) -> Result<Self> {
+    /// * `accept_invalid_certs` — disables TLS verification. Proxmox
+    ///   ships self-signed certs, so operators often need this, but it
+    ///   is opt-in: silently trusting any certificate would expose the
+    ///   API token to anyone on the path.
+    pub fn new(
+        api_url: &str,
+        token_id: &str,
+        token_secret: &str,
+        node: &str,
+        accept_invalid_certs: bool,
+    ) -> Result<Self> {
+        if accept_invalid_certs {
+            tracing::warn!(
+                "Proxmox TLS verification is disabled; the API token is exposed to \
+                 anyone who can intercept the connection"
+            );
+        }
         let client = Client::builder()
-            // Proxmox ships self-signed certs by default.
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(accept_invalid_certs)
             .build()
             .context("Failed to create HTTP client")?;
 

@@ -256,7 +256,7 @@ mod tests {
             template_ports: vec![crate::compute::PortMapping {
                 host_port: 17777,
                 container_port: 7777,
-                protocol: "tcp",
+                protocol: "tcp".to_string(),
             }],
             template_env: {
                 let mut m = std::collections::HashMap::new();

@@ -29,7 +29,7 @@ const STANDBY_PROMOTION_DELAY_SECS: u64 = 30;
 /// A standby slot reserved for a warm-standby workload. The consumer's spawn
 /// request was paid for and acknowledged, but no container exists yet — the
 /// standby is armed and waiting for a `LeaseRevocation` from the primary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StandbySlot {
     pub workload_id: String,
     pub primary_npub: String,

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::compute::{run_checked, ComputeBackend, ContainerConfig, NodeStatus};
+use crate::compute::{run_checked, ComputeBackend, ContainerConfig, ContainerStatus, NodeStatus};
 
 const VM_ROOT: &str = "/var/lib/paygress/vm";
 
@@ -326,6 +326,27 @@ impl ComputeBackend for KvmBackend {
         Ok(())
     }
 
+    /// A dead qemu leaves its directory (and therefore its id, which
+    /// `find_available_id` derives from the directory listing) behind.
+    /// Without this the workload reports `Running` forever and the id
+    /// is never reclaimed, so liveness is read from the process, not
+    /// from the directory existing.
+    async fn get_container_status(&self, id: u32) -> Result<ContainerStatus> {
+        if !self.vm_dir(id).exists() {
+            return Ok(ContainerStatus::Absent);
+        }
+        let Some(pid) = self.read_pid(id).await else {
+            return Ok(ContainerStatus::Stopped);
+        };
+        // `/proc/<pid>` is the cheapest liveness check on the Linux
+        // hosts providers run on, and needs no signal permissions.
+        if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+            Ok(ContainerStatus::Running)
+        } else {
+            Ok(ContainerStatus::Stopped)
+        }
+    }
+
     async fn stop_container(&self, id: u32) -> Result<()> {
         if let Some(pid) = self.read_pid(id).await {
             // SIGTERM makes qemu press the guest's ACPI power button.
@@ -392,7 +413,7 @@ mod tests {
             template_ports: vec![PortMapping {
                 host_port: 18789,
                 container_port: 18789,
-                protocol: "tcp",
+                protocol: "tcp".to_string(),
             }],
             template_env: Default::default(),
             extra_runtime_args: vec![],

@@ -26,6 +26,12 @@ pub struct ProviderConfig {
     pub proxmox_token_id: String,
     pub proxmox_token_secret: String,
     pub proxmox_node: String,
+
+    /// Disable TLS verification against the Proxmox API. Needed for the
+    /// self-signed cert Proxmox ships with; leaving it off means the
+    /// API token is only sent to a verified host.
+    #[serde(default)]
+    pub proxmox_accept_invalid_certs: bool,
     pub proxmox_storage: String,
     pub proxmox_template: String,
     pub proxmox_bridge: String,
@@ -70,6 +76,11 @@ pub struct ProviderConfig {
     #[serde(default = "default_workload_state_path")]
     pub workload_state_path: String,
 
+    /// Where reserved standby slots are mirrored. Defaults alongside
+    /// `workload_state_path`.
+    #[serde(default = "default_standby_state_path")]
+    pub standby_state_path: String,
+
     /// Bind address for the optional HTTP+ngx_l402 interface, e.g.
     /// `"0.0.0.0:8080"` — the port `nginx/conf.d/paygress-l402.conf` proxies to.
     /// Omit to run Nostr-DM only.
@@ -86,6 +97,10 @@ fn default_cashu_wallet_db_path() -> String {
     "./paygress-cashu-wallet.sqlite".to_string()
 }
 
+fn default_standby_state_path() -> String {
+    "./paygress-standby-slots.json".to_string()
+}
+
 fn default_workload_state_path() -> String {
     "./paygress-workloads.json".to_string()
 }
@@ -98,6 +113,7 @@ impl Default for ProviderConfig {
             proxmox_token_id: "root@pam!paygress".to_string(),
             proxmox_token_secret: String::new(),
             proxmox_node: "pve".to_string(),
+            proxmox_accept_invalid_certs: false,
             proxmox_storage: "local-lvm".to_string(),
             proxmox_template: "local:vztmpl/ubuntu-22.04-standard.tar.zst".to_string(),
             proxmox_bridge: "vmbr0".to_string(),
@@ -129,6 +145,7 @@ impl Default for ProviderConfig {
             ssh_port_end: None,
             cashu_wallet_db_path: default_cashu_wallet_db_path(),
             workload_state_path: default_workload_state_path(),
+            standby_state_path: default_standby_state_path(),
             http_bind_addr: None,
             lightning_address: None,
         }

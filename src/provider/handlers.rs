@@ -402,7 +402,7 @@ async fn build_spawn_plan(
                 .map(|(i, p)| PortMapping {
                     host_port: host_port.saturating_add(1 + i as u16),
                     container_port: p.container_port,
-                    protocol: "tcp",
+                    protocol: "tcp".to_string(),
                 })
                 .collect()
         })
@@ -564,10 +564,11 @@ async fn reserve_standby_slot(
         "Reserved standby slot for workload_id={} (index {}/{}, expires at {})",
         workload_id, index, count, slot.expires_at
     );
-    deps.standby_slots
-        .lock()
-        .await
-        .insert(workload_id.clone(), slot);
+    {
+        let mut slots = deps.standby_slots.lock().await;
+        slots.insert(workload_id.clone(), slot);
+        super::persistence::persist_standby_slots(&slots, &deps.config.standby_state_path);
+    }
 
     // Reuse AccessDetailsContent's shape with a distinguishing instructions
     // block; a dedicated content type would be a wire-schema bump for one edge

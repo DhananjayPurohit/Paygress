@@ -37,7 +37,7 @@ use crate::nostr::{
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 
 use handlers::{handle_spawn_request, handle_status_request, handle_topup_request, HandlerDeps};
-use persistence::{load_workloads, persist_workloads};
+use persistence::{load_standby_slots, load_workloads, persist_workloads};
 use standby::{
     primary_is_silent, schedule_standby_promotion, STANDBY_HEARTBEAT_SILENCE_SECS,
     STANDBY_WATCHDOG_INTERVAL_SECS,
@@ -78,6 +78,7 @@ impl ProviderService {
                     &config.proxmox_token_id,
                     &config.proxmox_token_secret,
                     &config.proxmox_node,
+                    config.proxmox_accept_invalid_certs,
                 )?;
                 Arc::new(ProxmoxBackend::new(
                     client,
@@ -153,6 +154,27 @@ impl ProviderService {
     ///
     /// Restored workloads re-enter the state machine as `Provisioning`, the
     /// same path a fresh spawn takes.
+    /// Reload standby reservations. Unlike workloads there is nothing on the
+    /// backend to reconcile against — a slot is a promise, not a container —
+    /// so expired ones are simply dropped.
+    async fn restore_standby_slots(&self, now: u64) {
+        let persisted = load_standby_slots(&self.config.standby_state_path);
+        if persisted.is_empty() {
+            return;
+        }
+        let total = persisted.len();
+        let live: std::collections::HashMap<String, StandbySlot> = persisted
+            .into_iter()
+            .filter(|(_, slot)| slot.expires_at > now)
+            .collect();
+        info!(
+            "restored {} standby slot(s) ({} dropped as expired)",
+            live.len(),
+            total - live.len()
+        );
+        *self.standby_slots.lock().await = live;
+    }
+
     async fn restore_workloads(&self) {
         let persisted = load_workloads(&self.config.workload_state_path);
         if persisted.is_empty() {
@@ -241,6 +263,11 @@ impl ProviderService {
         info!("NPUB: {}", self.get_npub());
 
         self.restore_workloads().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.restore_standby_slots(now).await;
         self.publish_offer().await?;
 
         // `pending()` keeps the select! branch dormant when the HTTP interface
@@ -678,6 +705,7 @@ impl ProviderService {
             .filter(|(_, slot)| slot.expires_at <= now)
             .map(|(workload_id, _)| workload_id.clone())
             .collect();
+        let any_expired = !expired.is_empty();
         for workload_id in expired {
             if let Some(slot) = slots.remove(&workload_id) {
                 info!(
@@ -690,6 +718,10 @@ impl ProviderService {
                 );
             }
         }
+        if !any_expired {
+            return;
+        }
+        persistence::persist_standby_slots(&slots, &self.config.standby_state_path);
     }
 
     /// Promote ourselves when a primary stops heartbeating.

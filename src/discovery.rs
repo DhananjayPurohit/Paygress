@@ -164,7 +164,9 @@ impl DiscoveryClient {
                 // on two machines. Make the user disambiguate.
                 let ids: Vec<String> = name_matches
                     .iter()
-                    .map(|p| format!("  {}", &p.npub[..16]))
+                    // npub comes off the wire; slice by chars so a short
+                    // or non-ASCII value can't panic here.
+                    .map(|p| format!("  {}", p.npub.chars().take(16).collect::<String>()))
                     .collect();
                 anyhow::bail!(
                     "multiple providers share the name '{}'; use the provider ID instead:\n{}",
@@ -400,11 +402,14 @@ impl DiscoveryClient {
     }
 }
 
+/// Truncate by characters, not bytes. These strings come off the wire
+/// (provider names, mint hostnames) and may be non-ASCII, where a byte
+/// slice can land mid-codepoint and panic.
 fn truncate_str(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else {
-        &s[..max_len - 2]
+    let keep = max_len.saturating_sub(2);
+    match s.char_indices().nth(keep) {
+        Some((byte_idx, _)) if s.chars().count() > max_len => &s[..byte_idx],
+        _ => s,
     }
 }
 
@@ -448,17 +453,44 @@ fn format_mints_column(mints: &[String], col: usize) -> String {
 }
 
 fn truncate_owned(s: String, max: usize) -> String {
-    if s.len() <= max {
-        s
-    } else {
-        format!("{}..", &s[..max.saturating_sub(2)])
+    if s.chars().count() <= max {
+        return s;
     }
+    let keep = max.saturating_sub(2);
+    let cut = s
+        .char_indices()
+        .nth(keep)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}..", &s[..cut])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nostr::PodSpec;
+
+    // These strings arrive from Nostr offers, so a byte slice landing
+    // mid-codepoint is a remote panic, not a display bug.
+    #[test]
+    fn truncation_does_not_split_multibyte_characters() {
+        let s = "日本語のプロバイダー名です";
+        assert!(truncate_str(s, 5).chars().count() <= 5);
+        assert!(truncate_owned(s.to_string(), 5).chars().count() <= 5 + 2);
+        // Emoji are 4 bytes each — the worst case for byte slicing.
+        let emoji = "🚀🚀🚀🚀🚀🚀";
+        assert!(truncate_str(emoji, 3).chars().count() <= 3);
+        assert!(!truncate_owned(emoji.to_string(), 3).is_empty());
+    }
+
+    #[test]
+    fn truncation_leaves_short_strings_alone() {
+        assert_eq!(truncate_str("abc", 10), "abc");
+        assert_eq!(truncate_owned("abc".to_string(), 10), "abc");
+        // max < 2 must not underflow.
+        assert!(truncate_str("abcdef", 1).chars().count() <= 1);
+        assert!(!truncate_owned("abcdef".to_string(), 1).is_empty());
+    }
 
     #[test]
     fn mint_label_keeps_mint_subdomain() {
