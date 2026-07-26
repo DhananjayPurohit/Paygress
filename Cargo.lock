@@ -448,6 +448,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dee39a0ee5b4095224a0cfc6bf4cc1baf0f9624b96b367e53b66d974e51d953"
 
 [[package]]
+name = "bitcoin-payment-instructions"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29f5b43b0e8338cd36ce7940bd6b8a007d54f1cbe25314ec3fbba566f870b085"
+dependencies = [
+ "bitcoin",
+ "lightning",
+ "lightning-invoice",
+]
+
+[[package]]
 name = "bitcoin-units"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -542,9 +553,9 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cashu"
-version = "0.14.3"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d61193273b0162fa16e74712d3d5cd2c02f13ddd8bf43a545c068feabd330895"
+checksum = "92e035322b7e279fc37a110e5fffdcf987fa5414caea1d0576cedb3b3611cbbb"
 dependencies = [
  "bitcoin",
  "cbor-diag",
@@ -552,7 +563,6 @@ dependencies = [
  "lightning",
  "lightning-invoice",
  "once_cell",
- "regex",
  "serde",
  "serde_json",
  "serde_with",
@@ -560,6 +570,7 @@ dependencies = [
  "strum_macros",
  "thiserror 2.0.18",
  "tracing",
+ "unicode-normalization",
  "url",
  "uuid",
  "web-time",
@@ -608,14 +619,15 @@ dependencies = [
 
 [[package]]
 name = "cdk"
-version = "0.14.3"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ad7dd8cef748cd57fdf83666c390c680f88cef79d3440e2f871c7da14dcb10"
+checksum = "89e19bcd47376859753f86adf4c2f661419ce619c777f92ac0a4e7c0594d4901"
 dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
  "bitcoin",
+ "bitcoin-payment-instructions",
  "cbor-diag",
  "cdk-common",
  "cdk-signatory",
@@ -623,10 +635,10 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "gloo-timers",
+ "jsonwebtoken",
  "lightning",
  "lightning-invoice",
  "regex",
- "reqwest 0.12.28",
  "ring",
  "rustls",
  "serde",
@@ -634,7 +646,6 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "url",
@@ -645,26 +656,30 @@ dependencies = [
 
 [[package]]
 name = "cdk-common"
-version = "0.14.3"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a5427677f3b056fc6f799be8bd836ae35bad6e4123c99e3dd12972b1147c339"
+checksum = "7cb4f7239c3ed8ce35d8928324cf73147c802eb4f7cc42ef71827954cda96ac3"
 dependencies = [
  "anyhow",
  "async-trait",
  "bitcoin",
  "cashu",
  "cbor-diag",
+ "cdk-http-client",
  "ciborium",
  "futures",
  "getrandom 0.2.17",
+ "jsonwebtoken",
  "lightning",
  "lightning-invoice",
  "parking_lot",
+ "paste",
  "serde",
  "serde_json",
  "serde_with",
  "thiserror 2.0.18",
  "tokio",
+ "tonic",
  "tracing",
  "url",
  "uuid",
@@ -674,10 +689,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "cdk-signatory"
-version = "0.14.3"
+name = "cdk-http-client"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f75f6d5f56de42d8948b442bc4092a2e59f9d4372fd6a17a575c374bf87cdc6a"
+checksum = "e6089ad04be877f3642729ab01a97b62e90a1ebafaac19583444fd72ffb2d25f"
+dependencies = [
+ "futures",
+ "futures-channel",
+ "js-sys",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "cdk-signatory"
+version = "0.17.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bed36ee68cff3260fca23fa485b2c9b31f2a15f6c045f62588c5db006c8964a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -697,9 +734,9 @@ dependencies = [
 
 [[package]]
 name = "cdk-sql-common"
-version = "0.14.3"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74d5b94369ea3ef93e4396b3db541090fd188e15affda9119b15d1b7dcd885a2"
+checksum = "9ed515d34378fa51a5531882ea7c774f1f7af69bd4f50958c120c96f9159ac2f"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -716,15 +753,16 @@ dependencies = [
 
 [[package]]
 name = "cdk-sqlite"
-version = "0.14.3"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e21b94615f42a150d8b4303e4a97e58db55febcf3cec1544360c47a09a54047c"
+checksum = "f96798d170b82f860daa83b2fc8f997151e6b77eb9f37c2ff4a92a7b5d650033"
 dependencies = [
  "async-trait",
  "bitcoin",
  "cdk-common",
  "cdk-sql-common",
  "lightning-invoice",
+ "paste",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1130,6 +1168,9 @@ name = "dnssec-prover"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec4f825369fc7134da70ca4040fddc8e03b80a46d249ae38d9c1c39b7b4476bf"
+dependencies = [
+ "bitcoin_hashes",
+]
 
 [[package]]
 name = "dotenv"
@@ -2139,6 +2180,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64 0.22.1",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
 name = "k8s-openapi"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2297,9 +2353,9 @@ dependencies = [
 
 [[package]]
 name = "lightning"
-version = "0.1.8"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ffe63f56b10d214be1ade8698ee80af82d981237cae3e581e7a631f5f4959f3"
+checksum = "63a1ab99a13ab3343a9b4d1d25c455bf72322819fc5a5f05c5182e704528a583"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -2307,15 +2363,16 @@ dependencies = [
  "hashbrown 0.13.2",
  "libm",
  "lightning-invoice",
+ "lightning-macros",
  "lightning-types",
  "possiblyrandom",
 ]
 
 [[package]]
 name = "lightning-invoice"
-version = "0.33.2"
+version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11209f386879b97198b2bfc9e9c1e5d42870825c6bd4376f17f95357244d6600"
+checksum = "47d83bd798e04ab9eecc8bbef1fa17d3808859bcdc0406bd16c55d51c8834444"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -2324,10 +2381,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightning-types"
-version = "0.2.0"
+name = "lightning-macros"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2cd84d4e71472035903e43caded8ecc123066ce466329ccd5ae537a8d5488c7"
+checksum = "d4c717494cdc2c8bb85bee7113031248f5f6c64f8802b33c1c9e2d98e594aa71"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "lightning-types"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c211dfcff95ca308247da8b1e0e81604bc9e568239967cd2c34572558511e869"
 dependencies = [
  "bitcoin",
 ]
@@ -3832,6 +3900,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
+name = "simple_asn1"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4197,6 +4277,26 @@ dependencies = [
  "pin-project-lite",
  "slab",
  "tokio",
+]
+
+[[package]]
+name = "tonic"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "percent-encoding",
+ "pin-project",
+ "sync_wrapper 1.0.2",
+ "tokio-stream",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

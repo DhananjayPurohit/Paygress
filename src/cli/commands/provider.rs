@@ -111,7 +111,7 @@ pub struct SetupArgs {
     /// Whitelisted Cashu mints (comma-separated). Defaults to
     /// `testnut.cashu.space` — the testnet mint paygress's
     /// integration paths exercise (`tests/cashu_redemption.rs`,
-    /// `tests/cli_deploy.rs`). The bundled cdk 0.14 wallet supports
+    /// `tests/cli_deploy.rs`). The bundled cdk wallet supports
     /// v2 keyset IDs in code, so mainnet mints (e.g.
     /// `https://mint.minibits.cash/Bitcoin`) are expected to work
     /// for receive+swap, but that flow has not been verified

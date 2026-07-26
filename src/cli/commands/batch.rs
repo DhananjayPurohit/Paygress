@@ -54,7 +54,7 @@ pub struct BatchArgs {
     /// value before fanning out spawns.
     ///
     /// Caveat: exercised end-to-end against `testnut.cashu.space`
-    /// only. The bundled cdk 0.14 wallet supports v2 (66-char)
+    /// only. The bundled cdk wallet supports v2 (66-char)
     /// keyset IDs in code, so mainnet mints (e.g.
     /// `mint.minibits.cash`) are expected to work, but that path
     /// has not been verified against a live mainnet mint yet.

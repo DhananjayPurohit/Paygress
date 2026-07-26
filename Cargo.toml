@@ -60,8 +60,8 @@ rand = "0.8"
 
 # Cashu dependencies — cdk-sqlite matches ngx_l402's backend so both
 # processes share the same wallet database file for Lightning sweep.
-cdk-sqlite = { version = "0.14.1", features = ["wallet"] }
-cdk = { version = "0.14", default-features = false, features = ["wallet"] }
+cdk-sqlite = { version = "0.17.3", features = ["wallet"] }
+cdk = { version = "0.17.3", default-features = false, features = ["wallet"] }
 # BIP39 mnemonic -> 64-byte seed (Cashu/NUT-13). Must match ngx_l402_core's
 # derivation so the shared wallet opens identically in both processes.
 bip39 = { version = "2.1.0", features = ["unicode-normalization"] }
