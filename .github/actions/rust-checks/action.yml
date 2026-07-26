@@ -1,0 +1,105 @@
+name: Rust checks
+description: >
+  Toolchain, cache, test suite, clippy. One definition shared by the
+  paygress-rented job and the hosted fallback, so the two paths cannot
+  drift apart — a fork PR is held to exactly the same bar as a same-repo
+  push, by construction. The default-feature compile gate lives in its
+  own hosted job (see the `check-default` job in ci.yml); it is cheap
+  enough that it does not belong on paid compute.
+
+inputs:
+  rented:
+    description: >
+      "true" when running on paygress-rented compute: the workload runs
+      as root (no sudo), rustup is bootstrapped by hand, and the cargo
+      cache is restore-only.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # ---- toolchain -------------------------------------------------
+    - name: Install build dependencies (hosted)
+      if: inputs.rented != 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config libssl-dev
+
+    # A prebaked provider image already carries a compiler; skip the apt
+    # round trip when it does. No sudo — the workload runs as root.
+    - name: Install build dependencies (rented)
+      if: inputs.rented == 'true'
+      shell: bash
+      run: |
+        if command -v cc >/dev/null && command -v pkg-config >/dev/null; then
+          echo "toolchain already present on this image"
+          exit 0
+        fi
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y build-essential pkg-config libssl-dev
+
+    - name: Install Rust (hosted)
+      if: inputs.rented != 'true'
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Install Rust (rented)
+      if: inputs.rented == 'true'
+      shell: bash
+      run: |
+        if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain stable --component clippy
+        fi
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        # No-op after a fresh install; the branch that matters is a
+        # prebaked image whose toolchain predates the clippy component.
+        "$HOME/.cargo/bin/rustup" component add clippy
+
+    # ---- cache -----------------------------------------------------
+    # `shared-key` pins one cache entry for the whole workflow instead
+    # of the per-job default: the hosted spawn-runner job populates it
+    # on main, and the rented box restores it, so the paid compute
+    # starts with the dependency graph already compiled rather than
+    # building ~400 crates from cold. The key still carries the rustc
+    # version, host triple, and Cargo.lock hash, so a mismatched box
+    # misses (and rebuilds) instead of restoring something wrong.
+    #
+    # save-if is false on rented compute, always. A cache written from a
+    # box we do not control is a persistence channel that outlives the
+    # "one job, then gone" runner: a poisoned build script or
+    # proc-macro would be restored — and executed — by every later job.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ci
+        save-if: ${{ inputs.rented != 'true' && github.ref == 'refs/heads/main' }}
+
+    # ---- checks ----------------------------------------------------
+    # One invocation covers everything: lib unit tests, the unit tests
+    # inside all three bin targets (including `paygress`, which only
+    # exists with `kubernetes`), every tests/ integration target, and
+    # doc tests. Features are additive here — no `cfg(not(feature))`
+    # anywhere — so --all-features is a strict superset of the default
+    # run. Do NOT add `--all-targets`: it silently drops doc tests.
+    # --no-fail-fast because the box is paid for either way; one broken
+    # target should not hide the state of the other fifteen.
+    - name: cargo test (all features)
+      shell: bash
+      run: cargo test --locked --all-features --no-fail-fast
+
+    # Advisory: warnings are reported, not enforced (no `-D warnings`),
+    # so this only fails on a genuine compile error. `always()` so a red
+    # test run still produces lint output instead of swallowing it.
+    #
+    # Clippy lints workspace crates through RUSTC_WORKSPACE_WRAPPER and
+    # builds dependencies with plain rustc, so it reuses everything
+    # `cargo test` just compiled — running it here costs the local
+    # crate, not another full dependency graph.
+    - name: cargo clippy (advisory)
+      if: always()
+      shell: bash
+      run: cargo clippy --locked --all-targets --all-features
