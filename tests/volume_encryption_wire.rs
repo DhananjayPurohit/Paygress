@@ -1,9 +1,6 @@
-// Wire-format pin for `EncryptedSpawnPodRequest.volume_encryption`.
-//
-// This file freezes the JSON shape so a future serde drift breaks
-// the test rather than silently changing what providers receive on
-// the wire. New fields on `VolumeEncryption` MUST go through a
-// schema-version bump (and update the v1 fixture in this file).
+// Freezes the JSON shape of `EncryptedSpawnPodRequest.volume_encryption`,
+// so serde drift breaks a test rather than what providers receive. New
+// `VolumeEncryption` fields MUST go through a schema-version bump.
 
 use paygress::nostr::{EncryptedSpawnPodRequest, VolumeEncryption};
 use paygress::volume_encryption::derive_volume_key;
@@ -29,7 +26,7 @@ fn unspecified_volume_encryption_is_skipped_on_wire() {
     let json = serde_json::to_string(&req).unwrap();
     assert!(
         !json.contains("volume_encryption"),
-        "volume_encryption=None must be skipped (skip_serializing_if) so old providers see no schema change; got {json}"
+        "volume_encryption=None must be skipped so old providers see no schema change; got {json}"
     );
 }
 
@@ -49,8 +46,6 @@ fn v1_round_trip_preserves_key() {
 
 #[test]
 fn v0_back_compat_no_field_present() {
-    // A pre-volume-encryption client serializes without the field at
-    // all. Provider deserialization must succeed and treat it as None.
     let v0_json = r#"{
         "cashu_token": "cashuA-old",
         "pod_spec_id": "basic",
@@ -64,11 +59,8 @@ fn v0_back_compat_no_field_present() {
 
 #[test]
 fn unknown_algorithm_round_trips_so_provider_can_reject_it_explicitly() {
-    // A future client that picks `xchacha20-poly1305` and ships it
-    // to a today-provider must still deserialize successfully — the
-    // provider then rejects with a structured error rather than a
-    // serde failure. (The reject-path itself lives in the provider
-    // when LUKS plumbing lands; here we just pin the wire shape.)
+    // Deserialization must succeed so the provider can reject with a
+    // structured error rather than a serde failure.
     let mut req = base_request();
     req.volume_encryption = Some(VolumeEncryption {
         version: 7,
@@ -109,9 +101,8 @@ fn decoded_key_rejects_invalid_base64() {
 
 #[test]
 fn kdf_matches_v1_helper_end_to_end() {
-    // The CLI derives the key, encodes with v1(), and ships it. The
-    // provider decodes with decoded_key(). End-to-end equality is the
-    // whole point — pin it.
+    // The CLI derives and encodes with v1(); the provider decodes with
+    // decoded_key(). Their equality is the whole contract.
     let nsec = [0x99u8; 32];
     let workload_id = "deadbeef-cafe";
     let key = derive_volume_key(&nsec, workload_id);

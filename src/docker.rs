@@ -1,7 +1,7 @@
 // Docker compute backend. Shells out to the `docker` CLI.
 //
-// No state is persisted: the container's existence on the host IS
-// the state, and `find_available_id` scans for `paygress-<n>`.
+// No state is persisted: the container's existence on the host IS the state,
+// and `find_available_id` scans for `paygress-<n>`.
 
 use std::process::Stdio;
 
@@ -16,8 +16,7 @@ use crate::compute::{
 use crate::luks::{create_encrypted_volume, destroy_encrypted_volume};
 
 pub struct DockerBackend {
-    /// Docker network to attach containers to; `None` = the host's
-    /// default `bridge`.
+    /// `None` = the host's default `bridge`.
     network: Option<String>,
 }
 
@@ -113,11 +112,9 @@ impl ComputeBackend for DockerBackend {
             args.push(arg.clone());
         }
 
-        // Persistent state volume, vmid-scoped so two instances of a
-        // template don't share state. Encrypted: a LUKS-on-loop file
-        // whose ext4 mountpoint is bind-mounted in, so the host
-        // operator's post-eviction `tar` yields only ciphertext.
-        // Plain: a Docker named volume (the historical default).
+        // vmid-scoped so two instances of a template don't share state. The
+        // encrypted form bind-mounts the ext4 mountpoint of a LUKS-on-loop
+        // file, so a host operator's post-eviction `tar` yields ciphertext.
         if let Some(path) = &config.data_path {
             match config.volume_encryption_key.as_ref() {
                 Some(key) => {
@@ -137,7 +134,7 @@ impl ComputeBackend for DockerBackend {
         }
 
         // Image must be last: docker treats anything after it as the
-        // container's CMD, which we don't override.
+        // container's CMD.
         args.push(config.image.clone());
 
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -165,8 +162,7 @@ impl ComputeBackend for DockerBackend {
     }
 
     async fn stop_container(&self, id: u32) -> Result<()> {
-        // Best-effort: an already-gone container must not fail the
-        // cleanup loop.
+        // Best-effort: an already-gone container must not fail the cleanup loop.
         let _ = self.docker(&["stop", &container_name(id)]).await;
         Ok(())
     }
@@ -174,18 +170,14 @@ impl ComputeBackend for DockerBackend {
     async fn delete_container(&self, id: u32) -> Result<()> {
         let name = container_name(id);
         let _ = self.docker(&["rm", "-f", &name]).await;
-        // Remove both possible volume backings so a re-spawn at the
-        // same id can't inherit stale state: the plain named volume
-        // and the LUKS-on-loop volume. `destroy_encrypted_volume` is
-        // idempotent and its luksErase is the load-bearing step — it
-        // overwrites the keyslots so the ciphertext stays unreadable
-        // even if the operator copied the file first.
+        // Remove both volume backings so a re-spawn at the same id can't
+        // inherit stale state. `destroy_encrypted_volume`'s luksErase is the
+        // load-bearing step: it overwrites the keyslots so the ciphertext stays
+        // unreadable even if the operator copied the file first.
         let volume = format!("{}-data", name);
         let _ = self.docker(&["volume", "rm", "-f", &volume]).await;
         if let Err(e) = destroy_encrypted_volume(id).await {
-            // Never propagate: cleanup_loop relies on this being
-            // best-effort, and the helper re-cleans on the next
-            // delete at the same id.
+            // Never propagate: cleanup_loop relies on this being best-effort.
             tracing::warn!("destroy_encrypted_volume(id={}) non-fatal: {}", id, e);
         }
         Ok(())
@@ -241,8 +233,8 @@ mod tests {
 
     #[test]
     fn run_args_include_all_pieces() {
-        // Mirrors the argv construction in `create_container`; we
-        // can't shell out to docker from a unit test.
+        // Mirrors the argv construction in `create_container`; we can't shell
+        // out to docker from a unit test.
         let cfg = ContainerConfig {
             id: 42,
             name: "paygress-42".to_string(),

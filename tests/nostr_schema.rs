@@ -1,18 +1,6 @@
-//! Schema round-trip tests for the offer/heartbeat payloads
-//! introduced/extended in Unit 4 of the 12-month plan
-//! (docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
-//!
-//! These tests pin the wire format we publish on Nostr so that:
-//! - Old (v0) payloads from providers running 0.1.x continue to
-//!   parse on consumers running this revision
-//!   (`#[serde(default)]` fields).
-//! - New v1 payloads round-trip cleanly.
-//! - Unknown future fields are tolerated by today's parser
-//!   (forward-compatibility).
-//!
-//! These are pure schema tests — they do not stand up a relay or
-//! exercise the publish path. Live-relay integration tests are out
-//! of scope here.
+//! Pins the offer/heartbeat wire format published on Nostr: v0 payloads
+//! from 0.1.x providers keep parsing via `#[serde(default)]`, v1 payloads
+//! round-trip, and unknown future fields are tolerated.
 
 use paygress::nostr::{
     CapacityInfo, HeartbeatContent, IsolationLevel, PodSpec, ProviderOfferContent, SCHEMA_VERSION,
@@ -77,8 +65,7 @@ fn heartbeat_v1_roundtrip() {
 
 #[test]
 fn offer_v0_payload_defaults_to_v1_schema() {
-    // A pre-Unit-4 publisher emits no `version` and no
-    // `isolation_level`. Today's parser must accept it.
+    // A pre-Unit-4 publisher emits no `version` and no `isolation_level`.
     let v0_json = serde_json::json!({
         "provider_npub": "npub1old",
         "hostname": "old.example",

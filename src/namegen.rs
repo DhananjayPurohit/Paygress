@@ -1,14 +1,10 @@
-// Derives a deterministic `{Adjective}{Middle}{Noun}` provider name
-// (e.g. "SwiftGoldenOwl") from three 8-byte windows of the provider's
-// Nostr public key, so bootstrap is idempotent. ~2.1M combinations
-// keeps the birthday collision probability under 1% up to roughly
-// 2,100 simultaneous providers.
+// Deterministic `{Adjective}{Middle}{Noun}` provider name (e.g.
+// "SwiftGoldenOwl") from three 8-byte windows of the provider's Nostr
+// public key, so bootstrap is idempotent. ~2.1M combinations keeps the
+// birthday collision probability under 1% up to ~2,100 providers.
 
-/// Derive a provider name from a 32-byte x-only secp256k1 pubkey.
-///
 /// # Panics
-/// If `pubkey_bytes` is shorter than 24 bytes. A valid Nostr public
-/// key is always 32, so this never fires in production.
+/// If `pubkey_bytes` is shorter than 24 bytes; a Nostr pubkey is always 32.
 pub fn derive_provider_name(pubkey_bytes: &[u8]) -> String {
     assert!(
         pubkey_bytes.len() >= 24,
@@ -26,8 +22,7 @@ pub fn derive_provider_name(pubkey_bytes: &[u8]) -> String {
     format!("{}{}{}", adj, mid, noun)
 }
 
-// Word lists. Every word is PascalCase so concatenation reads
-// cleanly, and no word appears in two lists (a test enforces this).
+// PascalCase so concatenation reads cleanly; no word appears in two lists.
 
 const ADJECTIVES: &[&str] = &[
     "Ancient",
@@ -366,8 +361,7 @@ mod tests {
         assert!(!name.is_empty());
         assert!(!name.contains(' '));
         assert!(!name.contains('-'));
-        // Each of the three words is at least 3 chars.
-        assert!(name.len() >= 9);
+        assert!(name.len() >= 9, "three words of >=3 chars each");
     }
 
     #[test]

@@ -44,9 +44,8 @@ pub fn ensure_not_legacy_redb_wallet(db_path: &Path) -> anyhow::Result<()> {
     )
 }
 
-/// Errors from the Nostr-DM redemption path. Structured rather than
-/// `anyhow::Error` so callers can map cdk failure modes onto specific Nostr
-/// error responses without string matching.
+/// Errors from the Nostr-DM redemption path, mapped onto specific Nostr error
+/// responses by the caller.
 #[derive(Debug, thiserror::Error)]
 pub enum RedeemError {
     #[error("token could not be parsed: {0}")]
@@ -79,8 +78,7 @@ pub trait MintRedeemer: Send + Sync {
     async fn redeem(&self, token_str: &str) -> Result<u64, RedeemError>;
 }
 
-/// Extract the mint URL from a token without redeeming it, so the consumer CLI
-/// can check it against the provider's whitelist before sending.
+/// Mint URL of a token, without redeeming it.
 pub fn token_mint_url(token_str: &str) -> Result<String, RedeemError> {
     let token = Token::from_str(token_str).map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
     token
@@ -89,9 +87,8 @@ pub fn token_mint_url(token_str: &str) -> Result<String, RedeemError> {
         .map_err(|e| RedeemError::InvalidToken(format!("token has no mint URL: {}", e)))
 }
 
-/// Parse the token, enforce the per-provider mint whitelist, then delegate to
-/// the redeemer. The whitelist check happens **before** any mint contact so a
-/// token pointed at an attacker-controlled mint never causes a network call.
+/// The whitelist check happens **before** any mint contact, so a token pointed
+/// at an attacker-controlled mint never causes a network call.
 pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
     redeemer: &R,
     whitelisted_mints: &[String],
@@ -117,10 +114,9 @@ pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
     redeemer.redeem(token_str).await
 }
 
-/// Production redeemer backed by `cdk::wallet::Wallet`: one lazily-created
-/// wallet per `(mint_url, unit)`, all sharing a single SQLite `WalletDatabase`.
-/// `seed` drives cdk's deterministic blinding-factor derivation; see
-/// [`resolve_wallet_seed`].
+/// One lazily-created `cdk` wallet per `(mint_url, unit)`, all sharing a single
+/// SQLite `WalletDatabase`. `seed` drives cdk's deterministic blinding-factor
+/// derivation; see [`resolve_wallet_seed`].
 pub struct CdkRedeemer {
     localstore: Arc<dyn WalletDatabase<DbError> + Send + Sync>,
     seed: [u8; 64],
@@ -215,8 +211,7 @@ fn map_cdk_error(e: cdk::Error) -> RedeemError {
                 .to_string(),
         ),
         E::UnsupportedUnit => RedeemError::UnsupportedUnit("rejected by mint".to_string()),
-        // cdk has no distinct Network variant, so sniff the message: callers
-        // use Network to tell the consumer "retry later".
+        // cdk has no distinct Network variant, so sniff the message.
         other => match other.to_string() {
             s if s.contains("HTTP") || s.contains("network") || s.contains("connection") => {
                 RedeemError::Network(s)
@@ -226,18 +221,17 @@ fn map_cdk_error(e: cdk::Error) -> RedeemError {
     }
 }
 
-/// Derive the 64-byte Cashu wallet seed from a BIP39 mnemonic per NUT-13, with
-/// an empty passphrase. Byte-identical to ngx_l402's `derive_wallet_seed`, so
-/// both processes open the *same* wallet from the same mnemonic.
+/// NUT-13 seed derivation with an empty passphrase. Byte-identical to
+/// ngx_l402's `derive_wallet_seed`, so both processes open the *same* wallet.
 pub fn derive_wallet_seed(mnemonic: &str) -> Result<[u8; 64], String> {
     let parsed = bip39::Mnemonic::parse(mnemonic.trim())
         .map_err(|e| format!("invalid BIP39 mnemonic: {}", e))?;
     Ok(parsed.to_seed_normalized(""))
 }
 
-/// Derive a deterministic BIP39 mnemonic from the provider's Nostr private key,
-/// so the wallet follows the provider identity. `bootstrap` writes this same
-/// phrase into ngx_l402's `CASHU_WALLET_MNEMONIC`.
+/// Deterministic BIP39 mnemonic from the provider's Nostr private key, so the
+/// wallet follows the provider identity. `bootstrap` writes this same phrase
+/// into ngx_l402's `CASHU_WALLET_MNEMONIC`.
 pub fn mnemonic_from_nostr_key(nostr_private_key: &str) -> Result<String, String> {
     use cdk::secp256k1::hashes::{sha256, Hash};
     let h = sha256::Hash::hash(
@@ -249,8 +243,7 @@ pub fn mnemonic_from_nostr_key(nostr_private_key: &str) -> Result<String, String
         .map_err(|e| format!("mnemonic from entropy: {}", e))
 }
 
-/// Resolve the 64-byte wallet seed, preferring an explicit
-/// `CASHU_WALLET_MNEMONIC` (what ngx_l402 uses for the shared wallet) and
+/// Prefers `CASHU_WALLET_MNEMONIC` (what ngx_l402 uses for the shared wallet),
 /// falling back to the Nostr-key-derived mnemonic.
 pub fn resolve_wallet_seed(nostr_private_key: &str) -> Result<[u8; 64], String> {
     if let Ok(env_mnemonic) = std::env::var("CASHU_WALLET_MNEMONIC") {
@@ -286,7 +279,6 @@ mod legacy_wallet_tests {
 
     #[test]
     fn redb_wallet_is_rejected_with_guidance() {
-        // Verbatim first bytes of a real paygress redb wallet.
         let p = temp_path("legacy.redb");
         std::fs::write(&p, b"redb\x1a\x0a\xa9\x0d\x0a\x03\x00\x00\x00").unwrap();
 
@@ -318,8 +310,7 @@ mod legacy_wallet_tests {
 mod wallet_seed_tests {
     use super::*;
 
-    // Canonical BIP39 vector (all-zero 128-bit entropy), empty passphrase —
-    // the same golden vector pinned in ngx_l402_core.
+    // The same golden BIP39 vector pinned in ngx_l402_core.
     const VECTOR_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const VECTOR_SEED_HEX: &str = "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
 
@@ -346,12 +337,9 @@ mod wallet_seed_tests {
     }
 }
 
-/// Split one Cashu token into `n` tokens of approximately equal face value via
-/// an ephemeral wallet at `db_path`. The first `n-1` shards get `received / n`;
-/// the last absorbs the remainder so the totals reconcile exactly.
-///
-/// The localstore at `db_path` is left behind; callers wanting ephemeral
-/// semantics must remove it.
+/// Split one Cashu token into `n` tokens via a wallet at `db_path`. The first
+/// `n-1` shards get `received / n`; the last absorbs the remainder so the
+/// totals reconcile exactly. `db_path` is left behind for the caller to remove.
 pub async fn split_token_into_n(
     token_str: &str,
     n: usize,
@@ -403,7 +391,6 @@ pub async fn split_token_into_n(
     // Ephemeral wallet, so a random seed is fine.
     let mut seed = [0u8; 64];
     rand::thread_rng().fill_bytes(&mut seed);
-
     let wallet = Wallet::new(&mint_url.to_string(), unit, db, seed, None)
         .map_err(|e| anyhow::anyhow!("wallet construction failed: {}", e))?;
 
@@ -444,8 +431,7 @@ pub async fn split_token_into_n(
     Ok(tokens)
 }
 
-/// Mint a fresh token worth `amount_sats` from `mint_url` using an ephemeral
-/// wallet at `db_path`.
+/// Mint a fresh token worth `amount_sats` via an ephemeral wallet at `db_path`.
 ///
 /// Only works against a testnut-style mint whose fake Lightning backend
 /// auto-pays quotes. A real mint leaves the quote `Unpaid` until the bolt11
@@ -518,9 +504,8 @@ pub async fn mint_fresh_token(
         .await
         .map_err(|e| anyhow::anyhow!("minting proofs failed: {}", e))?;
 
-    // Wrap the proofs directly rather than round-tripping through
-    // `prepare_send`, which would re-swap at the mint and can shave fees off
-    // the face value.
+    // Wrap the proofs directly: `prepare_send` would re-swap at the mint and
+    // can shave fees off the face value.
     let parsed_url = MintUrl::from_str(mint_url)
         .map_err(|e| anyhow::anyhow!("invalid mint URL {}: {}", mint_url, e))?;
     let token = Token::new(parsed_url, proofs, None, CurrencyUnit::Sat);

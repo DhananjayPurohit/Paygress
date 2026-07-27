@@ -1,10 +1,6 @@
 //! Wire-format regression tests for `EncryptedSpawnPodRequest`'s
-//! new `replication` field (Unit 5 wire-through).
-//!
-//! Old clients sending pre-this-PR requests MUST keep being parsed
-//! by the new provider; new clients setting `replication` MUST
-//! populate the state machine correctly. The runtime population
-//! path is exercised live in `src/provider.rs::handle_spawn_request`.
+//! `replication` field, plus the `warm_standby_role` routing matrix that
+//! makes one request land at N+1 providers and have each pick its path.
 
 use paygress::durable_workload::ReplicationMode;
 use paygress::nostr::EncryptedSpawnPodRequest;
@@ -43,9 +39,8 @@ fn warm_standby_carries_primary_and_workload_id() {
 
 #[test]
 fn primary_npub_and_workload_id_skipped_when_unset() {
-    // Old clients (and non-replicated spawns) don't set these.
-    // skip_serializing_if keeps them off the wire so the schema
-    // looks unchanged.
+    // Old clients and non-replicated spawns don't set these, so the schema
+    // must look unchanged to them.
     let mut v = sample_v1_warm_standby();
     v.primary_npub = None;
     v.workload_id = None;
@@ -69,22 +64,17 @@ fn warm_standby_round_trip() {
 
 #[test]
 fn none_replication_skipped_on_wire() {
-    // Default replication path: stay off the wire so old providers
-    // see no schema change at all. Same back-compat shape as
-    // template_slug.
     let mut v = sample_v1_warm_standby();
     v.replication = None;
     let json = serde_json::to_string(&v).unwrap();
     assert!(
         !json.contains("replication"),
-        "skip_serializing_if respected — None replication stays off the wire so non-replicated spawns look identical to old clients"
+        "None replication must stay off the wire so non-replicated spawns look identical to old clients"
     );
 }
 
 #[test]
 fn old_v0_request_without_replication_parses() {
-    // Exactly what a pre-this-PR client emits. Must still parse on
-    // the new code path.
     let v0 = serde_json::json!({
         "cashu_token": "tok",
         "pod_spec_id": "basic",
@@ -110,13 +100,8 @@ fn checkpointed_round_trip() {
     ));
 }
 
-// ==================== warm_standby_role tests ====================
-//
-// Role-routing is what makes the same EncryptedSpawnPodRequest land
-// at N+1 providers and have each pick the right path. Pin the
-// matrix so the convention (primary_npub identifies the primary;
-// standby_providers list contains only standbys) doesn't drift.
-
+// Convention: primary_npub names the primary; standby_providers holds
+// only standbys.
 use paygress::nostr::{warm_standby_role, WarmStandbyRole};
 
 #[test]

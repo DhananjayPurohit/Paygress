@@ -1,6 +1,3 @@
-// Helpers shared across the CLI commands: local Nostr identity,
-// relay lists, password generation, spinners, isolation-level parsing.
-
 use anyhow::Result;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -29,6 +26,16 @@ pub fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// One token per line; blank lines and `#` comments ignored.
+pub fn parse_token_lines(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
         .collect()
 }
 
@@ -92,8 +99,6 @@ pub fn generate_password(len: usize) -> String {
         .collect()
 }
 
-/// clap value-parser for `--isolation-level`, shared by `list`,
-/// `spawn`, and `batch`.
 pub fn parse_isolation_level(s: &str) -> std::result::Result<IsolationLevel, String> {
     IsolationLevel::from_slug(s).ok_or_else(|| {
         format!(
@@ -104,7 +109,6 @@ pub fn parse_isolation_level(s: &str) -> std::result::Result<IsolationLevel, Str
     })
 }
 
-/// Start a steady-ticking spinner in the CLI's house style.
 pub fn spinner(msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(

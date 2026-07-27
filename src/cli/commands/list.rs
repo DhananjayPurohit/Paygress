@@ -23,8 +23,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub capability: Option<String>,
 
-    /// Minimum isolation tier: shared-kernel, dedicated-host, or
-    /// attested-research-tier. Stricter tiers also match.
+    /// Minimum isolation tier (stricter tiers also match)
     #[arg(long, value_parser = parse_isolation_level)]
     pub isolation_level: Option<paygress::nostr::IsolationLevel>,
 

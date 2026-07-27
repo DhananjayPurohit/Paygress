@@ -1,19 +1,11 @@
-// Local end-to-end test for the template-spawn integration
-// (docker side only — bypasses Cashu redemption and Nostr DM round-
-// trip, which require either a working real-mint flow or a full
-// provider stack).
-//
-// What it does: construct a `ContainerConfig` exactly as the real
-// `handle_spawn_request` would (image / ports / env from the
-// template registry, host port from a synthetic SSH base), then
-// run `DockerBackend::create_container`. If the container comes
-// up healthy, the template-spawn integration is wired correctly.
+// Docker-side check of the template-spawn integration: builds a
+// `ContainerConfig` the way `handle_spawn_request` does and runs
+// `DockerBackend::create_container`. Cashu redemption and the Nostr DM
+// round-trip are bypassed.
 //
 // Usage:
 //   cargo run --release --example spawn_template_local -- \
 //     <slug> [<host-port-base>]
-// Example:
-//   cargo run --release --example spawn_template_local -- nostr-relay 35000
 
 use std::collections::HashMap;
 use std::env;

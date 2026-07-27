@@ -3,8 +3,8 @@
 //
 // ngx_l402 returns 402 without a valid Cashu token, redeems the token at the
 // mint, and forwards the request with the token still in the Authorization
-// header. These handlers MUST NOT call the mint again — the token is already
-// spent — so they only decode its face value via `extract_token_value`.
+// header. These handlers MUST NOT contact the mint again — the token is
+// already spent — so they only decode its face value via `extract_token_value`.
 
 use anyhow::Result;
 use axum::{
@@ -29,8 +29,7 @@ use crate::provider::{
     generate_password, parse_pod_npub, ProviderConfig, ProviderStats, WorkloadInfo,
 };
 
-/// State shared with the Nostr-DM handler in `provider`. Arc-wrapped fields
-/// keep it cheap to clone into axum's `State<_>` extractor.
+/// State shared with the Nostr-DM handler in `provider`.
 ///
 /// There is deliberately no `redeemer` field: ngx_l402 has already redeemed the
 /// token, so mint interaction here would double-spend.
@@ -87,9 +86,9 @@ pub(crate) async fn run_provider_http_interface(
 fn extract_cashu_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(s) = auth.to_str() {
-            // `get(..6)` rather than `s[..6]`: the header is caller-
-            // supplied and a multi-byte codepoint straddling byte 6
-            // would panic on a direct slice.
+            // `get(..6)` rather than `s[..6]`: the header is caller-supplied
+            // and a multi-byte codepoint straddling byte 6 would panic on a
+            // direct slice.
             if let Some(prefix) = s.get(..6) {
                 if prefix.eq_ignore_ascii_case("cashu ") {
                     return Some(s[6..].trim().to_string());
@@ -105,8 +104,7 @@ fn extract_cashu_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Header token, falling back to the request body for direct calls that bypass
-/// nginx.
+/// Header token, falling back to the body for calls that bypass nginx.
 fn payment_token(headers: &HeaderMap, body_token: Option<String>) -> Option<String> {
     extract_cashu_token(headers).or_else(|| body_token.filter(|t| !t.is_empty()))
 }
@@ -123,7 +121,7 @@ fn payment_required_response() -> Response {
 }
 
 /// Face value of an already-redeemed token, in msats. `Err` holds the response
-/// to return verbatim.
+/// to return verbatim. Never contacts the mint.
 async fn decode_payment_msats(token: &str, endpoint: &str) -> Result<u64, Response> {
     extract_token_value(token).await.map_err(|e| {
         error!(
@@ -181,7 +179,6 @@ async fn spawn_pod(
         Err(resp) => return resp,
     };
 
-    // Fall back to the first spec when `pod_spec_id` is absent or unknown.
     let spec = match state
         .config
         .specs
@@ -246,21 +243,16 @@ async fn spawn_pod(
     };
 
     let password = generate_password();
-    let host_port = match state.config.ssh_port_start {
-        Some(start) => start + (id - state.config.vmid_range_start) as u16,
-        None => 30000 + (id % 10000) as u16,
-    };
-
-    let image = request
-        .pod_image
-        .as_deref()
-        .unwrap_or("ubuntu:22.04")
-        .to_string();
+    let host_port = state.config.ssh_host_port(id);
 
     let container_config = ContainerConfig {
         id,
         name: format!("paygress-{}", id),
-        image,
+        image: request
+            .pod_image
+            .as_deref()
+            .unwrap_or("ubuntu:22.04")
+            .to_string(),
         cpu_cores: (spec.cpu_millicores / 1000).max(1) as u32,
         memory_mb: spec.memory_mb as u32,
         storage_gb: 10,
@@ -286,8 +278,8 @@ async fn spawn_pod(
             .into_response();
     }
 
-    // Register in the shared tracking tables so cleanup_loop,
-    // orchestrator_loop, and the Nostr DM handler all see the same state.
+    // Register in the shared tables so cleanup_loop, orchestrator_loop and the
+    // Nostr DM handler all see the same state.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -463,8 +455,8 @@ async fn topup_pod(
             .into_response();
     }
 
-    // Re-lock and re-check existence: cleanup_loop may have removed the
-    // workload since the snapshot above.
+    // Re-check existence: cleanup_loop may have removed the workload since the
+    // snapshot above.
     let new_expires_at = {
         let mut lock = state.active_workloads.lock().await;
         match lock.get_mut(&vmid) {

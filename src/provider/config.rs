@@ -8,12 +8,11 @@ pub enum BackendType {
     #[default]
     Proxmox,
     LXD,
-    /// Requires the `docker` CLI on the host. The killer templates use real
-    /// public Docker images that LXD cannot run natively.
+    /// Requires the `docker` CLI. Templates use public Docker images that LXD
+    /// cannot run natively.
     Docker,
-    /// One VM per spawn, each with its own kernel, so no co-tenant container
-    /// escape. Requires `/dev/kvm` and `qemu-system-x86_64`. Publishes
-    /// `IsolationLevel::DedicatedHost`; does not serve Docker templates.
+    /// One VM per spawn, each with its own kernel. Requires `/dev/kvm` and
+    /// `qemu-system-x86_64`; does not serve Docker templates.
     Kvm,
 }
 
@@ -28,8 +27,8 @@ pub struct ProviderConfig {
     pub proxmox_node: String,
 
     /// Disable TLS verification against the Proxmox API. Needed for the
-    /// self-signed cert Proxmox ships with; leaving it off means the
-    /// API token is only sent to a verified host.
+    /// self-signed cert Proxmox ships with; leaving it off means the API token
+    /// is only sent to a verified host.
     #[serde(default)]
     pub proxmox_accept_invalid_certs: bool,
     pub proxmox_storage: String,
@@ -62,35 +61,43 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub ssh_port_end: Option<u16>,
 
-    /// Shared CDK SQLite wallet. Both redemption paths write here, and ngx_l402
-    /// opens the same file (`CASHU_DB_PATH`) to melt the proceeds to Lightning.
+    /// Shared CDK SQLite wallet. ngx_l402 opens the same file (`CASHU_DB_PATH`)
+    /// to melt the proceeds to Lightning.
     #[serde(default = "default_cashu_wallet_db_path")]
     pub cashu_wallet_db_path: String,
 
-    /// Where the active-workload table is mirrored to disk.
-    ///
-    /// `active_workloads` is the only record that a lease exists — the backend
-    /// knows a container is running but not who paid for it or when it expires.
-    /// Held purely in memory, a restart forgets every lease: the containers keep
-    /// running, nothing reclaims them, and their vmids stay allocated forever.
+    /// Where the active-workload table is mirrored to disk. It is the only
+    /// record that a lease exists — the backend knows a container is running
+    /// but not who paid for it or when it expires. Held purely in memory, a
+    /// restart leaks every container and its vmid.
     #[serde(default = "default_workload_state_path")]
     pub workload_state_path: String,
 
-    /// Where reserved standby slots are mirrored. Defaults alongside
-    /// `workload_state_path`.
+    /// Where reserved standby slots are mirrored.
     #[serde(default = "default_standby_state_path")]
     pub standby_state_path: String,
 
-    /// Bind address for the optional HTTP+ngx_l402 interface, e.g.
-    /// `"0.0.0.0:8080"` — the port `nginx/conf.d/paygress-l402.conf` proxies to.
-    /// Omit to run Nostr-DM only.
+    /// Bind address for the optional HTTP+ngx_l402 interface, the port
+    /// `nginx/conf.d/paygress-l402.conf` proxies to. Omit to run Nostr-DM only.
     #[serde(default)]
     pub http_bind_addr: Option<String>,
 
     /// Lightning address (`user@domain`) where ngx_l402 sweeps accumulated
-    /// ecash. Bootstrap writes it as `LNURL_ADDRESS` in `/etc/paygress/.env`.
+    /// ecash. Written as `LNURL_ADDRESS` in `/etc/paygress/.env`.
     #[serde(default)]
     pub lightning_address: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Host port forwarded to the workload's SSH. Derived rather than stored,
+    /// so the spawn reply, the status reply and the HTTP interface all name the
+    /// same port for a given vmid.
+    pub(crate) fn ssh_host_port(&self, vmid: u32) -> u16 {
+        match self.ssh_port_start {
+            Some(start) => start + (vmid - self.vmid_range_start) as u16,
+            None => 30000 + (vmid % 10000) as u16,
+        }
+    }
 }
 
 fn default_cashu_wallet_db_path() -> String {

@@ -1,9 +1,7 @@
-// `paygress-cli batch` — fan out N pods in parallel for map-reduce
-// shards, CI matrices, and embarrassingly-parallel workloads.
+// `paygress-cli batch` — fan out N pods in parallel.
 //
-// Writes per-shard subdirs at <output>/shard-<i>/ for the caller's
-// downstream scp/ssh script, plus <output>/shards.json describing every
-// shard's access details. Exits non-zero if any shard failed.
+// Writes per-shard subdirs at <output>/shard-<i>/ plus
+// <output>/shards.json. Exits non-zero if any shard failed.
 
 use std::path::PathBuf;
 
@@ -24,18 +22,15 @@ pub struct BatchArgs {
     #[arg(long)]
     pub provider: String,
 
-    /// Comma-separated Cashu tokens, one per shard. Each is redeemed
-    /// independently; one shard's failure does not cancel the others.
+    /// Comma-separated Cashu tokens, one per shard
     #[arg(long, conflicts_with_all = ["tokens_file", "split_token"])]
     pub tokens: Option<String>,
 
-    /// Path to a file with one Cashu token per line. Lines starting
-    /// with `#` and blank lines are ignored.
+    /// File with one Cashu token per line (`#` comments and blanks ignored)
     #[arg(long, conflicts_with_all = ["tokens", "split_token"])]
     pub tokens_file: Option<PathBuf>,
 
-    /// One large Cashu token to split into `--shards` tokens of roughly
-    /// equal face value before fanning out.
+    /// One large Cashu token to split into `--shards` tokens before fanning out
     #[arg(long)]
     pub split_token: Option<String>,
 
@@ -43,7 +38,7 @@ pub struct BatchArgs {
     #[arg(long, requires = "split_token")]
     pub shards: Option<usize>,
 
-    /// Tier on the provider's offer.
+    /// Tier on the provider's offer
     #[arg(short, long, default_value = "basic")]
     pub tier: String,
 
@@ -55,33 +50,28 @@ pub struct BatchArgs {
     #[arg(long, default_value = "./paygress-batch")]
     pub output: PathBuf,
 
-    /// Per-shard spawn timeout (seconds).
+    /// Per-shard spawn timeout (seconds)
     #[arg(long, default_value_t = 120)]
     pub timeout_secs: u64,
 
-    /// Container image. Ignored when the provider resolves the template
-    /// slug (the default path).
+    /// Container image; ignored when the provider resolves the template slug
     #[arg(long, default_value = "ubuntu:22.04")]
     pub image: String,
 
-    /// Your Nostr private key (nsec). Falls back to
-    /// `~/.paygress/identity` if not provided.
+    /// Your Nostr private key (nsec) — uses ~/.paygress/identity if unset
     #[arg(long)]
     pub nostr_key: Option<String>,
 
-    /// Custom Nostr relays (comma-separated). Falls back to the
-    /// CLI's default relay list.
+    /// Custom Nostr relays (comma-separated)
     #[arg(long)]
     pub relays: Option<String>,
 
-    /// Minimum isolation tier, applied to every shard. Checked once,
-    /// before any Cashu token is sent.
+    /// Minimum isolation tier, applied to every shard
     #[arg(long, value_parser = parse_isolation_level)]
     pub isolation_level: Option<IsolationLevel>,
 }
 
-/// Per-shard status in the JSON manifest. The serialized names are a
-/// stable contract — downstream scripts match on them.
+/// Serialized names are a stable contract — scripts match on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShardStatus {
@@ -108,7 +98,7 @@ impl ShardStatus {
     }
 }
 
-/// Per-shard entry in the JSON manifest. Stable schema.
+/// Stable schema.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardManifestEntry {
     pub index: usize,
@@ -134,9 +124,8 @@ pub struct ShardManifest {
     pub shards: Vec<ShardManifestEntry>,
 }
 
-/// Parse the static token list from --tokens or --tokens-file.
-/// `--split-token` needs a mint round-trip and lives in
-/// [`materialize_tokens`].
+/// The static token list from --tokens or --tokens-file; `--split-token`
+/// needs a mint round-trip and lives in [`materialize_tokens`].
 pub fn parse_tokens(args: &BatchArgs) -> Result<Vec<String>> {
     if let Some(s) = &args.tokens {
         let v = crate::util::split_csv(s);
@@ -148,11 +137,7 @@ pub fn parse_tokens(args: &BatchArgs) -> Result<Vec<String>> {
     if let Some(p) = &args.tokens_file {
         let content = std::fs::read_to_string(p)
             .with_context(|| format!("failed to read tokens file {}", p.display()))?;
-        let v: Vec<String> = content
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect();
+        let v = crate::util::parse_token_lines(&content);
         if v.is_empty() {
             anyhow::bail!(
                 "token file {} contains no tokens (after stripping comments + blank lines)",
@@ -164,8 +149,8 @@ pub fn parse_tokens(args: &BatchArgs) -> Result<Vec<String>> {
     anyhow::bail!("one of --tokens, --tokens-file, or --split-token is required");
 }
 
-/// Resolve the final per-shard token list, performing the ephemeral
-/// wallet round-trip when `--split-token` was supplied.
+/// Performs the ephemeral wallet round-trip when `--split-token` was
+/// supplied, otherwise defers to [`parse_tokens`].
 pub async fn materialize_tokens(args: &BatchArgs) -> Result<Vec<String>> {
     let Some(big_token) = &args.split_token else {
         return parse_tokens(args);
@@ -178,8 +163,7 @@ pub async fn materialize_tokens(args: &BatchArgs) -> Result<Vec<String>> {
         anyhow::bail!("--shards must be >= 1");
     }
 
-    // Unique filename so concurrent batch invocations on the same
-    // machine don't collide.
+    // Unique filename so concurrent batch invocations don't collide.
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
         "paygress-batch-split-{}.sqlite",
@@ -187,13 +171,11 @@ pub async fn materialize_tokens(args: &BatchArgs) -> Result<Vec<String>> {
     ));
 
     let result = paygress::cashu::split_token_into_n(big_token, n, &db_path).await;
-    // Always remove the temp wallet: it may have eaten the input
-    // token's proofs and we don't want them lingering on disk.
+    // Always remove the temp wallet — it holds the input token's proofs.
     let _ = std::fs::remove_file(&db_path);
     result
 }
 
-/// Transport settings shared by every shard of a fan-out.
 pub struct FanOutConfig {
     pub provider: String,
     pub tier: String,
@@ -217,9 +199,8 @@ pub enum ShardResult {
     JoinError(String),
 }
 
-/// Spawn one pod per token, concurrently. Each shard opens its own
-/// relay connection — fine at map-reduce batch sizes (tens, not
-/// thousands). Results are unordered; the caller sorts by index.
+/// One pod per token, concurrently; each shard opens its own relay
+/// connection. Results are unordered — the caller sorts by index.
 pub async fn fan_out_spawns(cfg: &FanOutConfig, tokens: Vec<String>) -> Vec<ShardResult> {
     let mut handles = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.into_iter().enumerate() {
@@ -321,7 +302,7 @@ fn manifest_entry_status_only(
     }
 }
 
-fn manifest_entry(args: &BatchArgs, result: ShardResult) -> ShardManifestEntry {
+fn manifest_entry(cfg: &FanOutConfig, result: ShardResult) -> ShardManifestEntry {
     let spawn = match result {
         ShardResult::Done(s) => *s,
         // The index is lost with the task, so a joined-panic shard
@@ -339,7 +320,7 @@ fn manifest_entry(args: &BatchArgs, result: ShardResult) -> ShardManifestEntry {
 
     match outcome {
         Ok(NostrSpawnOutcome::Success(access)) => {
-            manifest_entry_from_success(index, &args.provider, &ssh_user, &ssh_pass, access)
+            manifest_entry_from_success(index, &cfg.provider, &ssh_user, &ssh_pass, access)
         }
         Ok(NostrSpawnOutcome::ProviderError(err)) => {
             manifest_entry_from_error(index, ShardStatus::ProviderError, err)
@@ -354,7 +335,7 @@ fn manifest_entry(args: &BatchArgs, result: ShardResult) -> ShardManifestEntry {
             ShardStatus::Timeout,
             Some(format!(
                 "no response within {}s; token may have been spent",
-                args.timeout_secs
+                cfg.timeout_secs
             )),
         ),
         Ok(NostrSpawnOutcome::UnknownResponse(s)) => manifest_entry_status_only(
@@ -368,9 +349,8 @@ fn manifest_entry(args: &BatchArgs, result: ShardResult) -> ShardManifestEntry {
     }
 }
 
-/// Create every shard subdir up front so a downstream script can start
-/// writing without racing the coordinator. Failed shards get an empty
-/// subdir rather than none.
+/// Created up front so downstream scripts don't race the coordinator;
+/// failed shards get an empty subdir rather than none.
 fn scaffold_output_dirs(output: &std::path::Path, shards: usize) -> Result<()> {
     std::fs::create_dir_all(output)
         .with_context(|| format!("failed to create output dir {}", output.display()))?;
@@ -385,32 +365,44 @@ fn scaffold_output_dirs(output: &std::path::Path, shards: usize) -> Result<()> {
 pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
     let tokens = materialize_tokens(&args).await?;
     let n = tokens.len();
+    let BatchArgs {
+        provider,
+        tier,
+        template,
+        image,
+        output,
+        timeout_secs,
+        isolation_level,
+        nostr_key,
+        relays,
+        ..
+    } = args;
     let cfg = FanOutConfig {
-        provider: args.provider.clone(),
-        tier: args.tier.clone(),
-        template: args.template.clone(),
-        image: args.image.clone(),
-        timeout_secs: args.timeout_secs,
-        isolation_level: args.isolation_level,
-        relays: parse_relays(args.relays.clone()),
-        nostr_key: get_or_create_identity(args.nostr_key.clone())?,
+        provider: provider.clone(),
+        tier: tier.clone(),
+        template: template.clone(),
+        image,
+        timeout_secs,
+        isolation_level,
+        relays: parse_relays(relays),
+        nostr_key: get_or_create_identity(nostr_key)?,
     };
 
     println!("{}", "Paygress Batch Coordinator".blue().bold());
     println!("{}", "-".repeat(50).blue());
-    println!("  Provider:    {}", args.provider.cyan());
-    println!("  Template:    {}", args.template.cyan());
-    println!("  Tier:        {}", args.tier);
+    println!("  Provider:    {}", provider.cyan());
+    println!("  Template:    {}", template.cyan());
+    println!("  Tier:        {}", tier);
     println!("  Shards:      {}", n);
-    println!("  Output dir:  {}", args.output.display());
+    println!("  Output dir:  {}", output.display());
     println!();
 
-    scaffold_output_dirs(&args.output, n)?;
+    scaffold_output_dirs(&output, n)?;
 
     let mut entries: Vec<ShardManifestEntry> = fan_out_spawns(&cfg, tokens)
         .await
         .into_iter()
-        .map(|r| manifest_entry(&args, r))
+        .map(|r| manifest_entry(&cfg, r))
         .collect();
     // Stable order so the JSON manifest matches the shard index.
     entries.sort_by_key(|e| e.index);
@@ -420,15 +412,15 @@ pub async fn execute(args: BatchArgs, _verbose: bool) -> Result<()> {
         .filter(|e| e.status == ShardStatus::Spawned)
         .count();
     let manifest = ShardManifest {
-        provider_npub: args.provider,
-        template: args.template,
-        tier: args.tier,
+        provider_npub: provider,
+        template,
+        tier,
         shard_count: n,
         spawned_count,
         shards: entries,
     };
 
-    let manifest_path = args.output.join("shards.json");
+    let manifest_path = output.join("shards.json");
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
 

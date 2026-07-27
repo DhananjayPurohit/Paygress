@@ -69,8 +69,7 @@ async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> R
     Ok(())
 }
 
-/// Typed outcome of a Nostr status round-trip, shared by the CLI
-/// pretty-printer and the MCP server.
+/// Shared by the CLI pretty-printer and the MCP server.
 #[derive(Debug, Clone)]
 pub enum NostrStatusOutcome {
     Success(paygress::nostr::StatusResponseContent),
@@ -79,8 +78,7 @@ pub enum NostrStatusOutcome {
     Timeout,
 }
 
-/// Dispatch one Nostr status request and wait for the provider's
-/// reply. No stdout I/O — pure round-trip plus structured outcome.
+/// No stdout I/O — pure round-trip plus structured outcome.
 pub async fn nostr_status_round_trip(
     pod_id: &str,
     provider_npub: &str,
