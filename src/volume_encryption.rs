@@ -1,10 +1,9 @@
-// Consumer-side derivation of the LUKS volume key the provider
-// receives in `EncryptedSpawnPodRequest.volume_encryption.key_b64`.
+// Consumer-side derivation of the LUKS volume key sent as
+// `EncryptedSpawnPodRequest.volume_encryption.key_b64`.
 //
-// Determinism is the load-bearing property: the consumer recomputes
-// the same key on every respawn from material they already hold
-// (the nsec in `~/.paygress/identity` plus the workload id printed
-// at spawn), so no separate key vault is needed.
+// Determinism is the load-bearing property: the consumer recomputes the same key
+// on every respawn from material they already hold (the nsec in
+// `~/.paygress/identity` plus the workload id), so no key vault is needed.
 
 use sha2::{Digest, Sha256};
 

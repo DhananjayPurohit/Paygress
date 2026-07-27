@@ -1,6 +1,5 @@
-// `paygress-cli exec` — run a shell command inside a spawned
-// agent-sandbox workload. Shares `cli::exec_client` with the MCP
-// `run_command` tool so both behave identically.
+// Shares `cli::exec_client` with the MCP `run_command` tool so both behave
+// identically.
 
 use std::time::Duration;
 

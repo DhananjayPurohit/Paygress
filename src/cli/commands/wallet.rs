@@ -1,10 +1,6 @@
-// `paygress-cli wallet` — local token utilities.
-//
-// `wallet mint` prints the serialized token and nothing else to stdout,
-// so callers can compose it; progress goes to stderr:
-//
-//   paygress-cli spawn --token "$(paygress-cli wallet mint \
-//     --mint https://testnut.cashu.space --amount 1000)" ...
+// `wallet mint` prints the serialized token and nothing else to stdout, so
+// callers can compose it (`--token "$(paygress-cli wallet mint ...)"`);
+// progress goes to stderr.
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};

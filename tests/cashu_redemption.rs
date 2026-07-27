@@ -1,14 +1,12 @@
-//! Cashu mint redemption on the Nostr-DM provider path, exercised through
-//! an injected `MintRedeemer` so no real mint is contacted.
+//! Cashu mint redemption on the Nostr-DM provider path, exercised through an
+//! injected `MintRedeemer` so no real mint is contacted.
 //!
 //! Stubbing the mint's HTTP API with `wiremock` is not viable: cdk's swap
-//! protocol needs cryptographically-valid blinded signatures, which can't
-//! be synthesized without the mint's private keys. The trait seam covers
-//! the same logic (whitelist enforcement, error mapping, replay detection)
-//! without coupling to cdk's wire format.
+//! protocol needs cryptographically-valid blinded signatures, which cannot be
+//! synthesized without the mint's private keys.
 //!
-//! See `docs/solutions/patterns/critical-patterns.md` for the historical
-//! footgun this closes.
+//! See `docs/solutions/patterns/critical-patterns.md` for the historical footgun
+//! this closes.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,32 +17,11 @@ use tokio::sync::Mutex;
 
 use paygress::cashu::{validate_and_redeem, MintRedeemer, RedeemError};
 
+mod common;
+use common::synthetic_cashu_token as make_token;
+
 const WHITELISTED_MINT: &str = "https://testnut.cashu.space";
 const OTHER_MINT: &str = "https://attacker.example";
-
-/// Synthetic Cashu V3 token. Proof signatures are dummy hex: no local crypto
-/// verification happens before `Wallet::receive` would hit the mint, and these
-/// tests never reach the wallet.
-fn make_token(mint_url: &str, amount_sat: u64, secret: &str) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
-    let body = serde_json::json!({
-        "token": [{
-            "mint": mint_url,
-            "proofs": [{
-                "amount": amount_sat,
-                "secret": secret,
-                "C": "023be53e8c60530eea9b3943fda1a2ce71c7b3f0cf0dc6d846fa765aaf779fa81d",
-                "id": "009a1f293253e41e",
-            }],
-        }],
-        "unit": "sat",
-    });
-
-    let json = serde_json::to_string(&body).expect("synthetic token body");
-    format!("cashuA{}", URL_SAFE_NO_PAD.encode(json.as_bytes()))
-}
 
 /// Records redeemed token strings, so replay detection can be modelled both
 /// in-provider and cross-provider (via a shared `Arc`).

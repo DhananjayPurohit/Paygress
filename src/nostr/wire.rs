@@ -41,8 +41,8 @@ pub struct TemplateAccessPort {
     pub container_port: u16,
     /// `tcp`, `http`, `ws`, `bitcoin-rpc`, ...
     pub protocol: String,
-    /// Role label from the template definition (`relay-ws`, `rpc`, ...) so
-    /// clients can route by role rather than guessing port-by-port.
+    /// Role label from the template definition (`relay-ws`, `rpc`, ...); clients
+    /// route by role rather than guessing port-by-port.
     pub label: String,
 }
 
@@ -218,12 +218,11 @@ pub struct CapacityInfo {
     pub storage_gb_available: u64,
 }
 
-/// Isolation level a provider promises. `#[serde(default)]` on the fields that
-/// carry it so v0 offers parse cleanly.
+/// Isolation level a provider promises. Carried as a kebab-case slug on the
+/// wire, `#[serde(default)]` at every use site so v0 offers parse cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum IsolationLevel {
-    /// Default LXC / shared-kernel container.
     #[default]
     SharedKernel,
     /// Whole host dedicated to a single workload (no co-tenants).

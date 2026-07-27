@@ -67,13 +67,12 @@ pub struct ProviderConfig {
     pub cashu_wallet_db_path: String,
 
     /// Where the active-workload table is mirrored to disk. It is the only
-    /// record that a lease exists — the backend knows a container is running
-    /// but not who paid for it or when it expires. Held purely in memory, a
-    /// restart leaks every container and its vmid.
+    /// record that a lease exists — the backend knows a container is running but
+    /// not who paid for it or when it expires. Held purely in memory, a restart
+    /// leaks every container and its vmid.
     #[serde(default = "default_workload_state_path")]
     pub workload_state_path: String,
 
-    /// Where reserved standby slots are mirrored.
     #[serde(default = "default_standby_state_path")]
     pub standby_state_path: String,
 
@@ -160,14 +159,15 @@ impl Default for ProviderConfig {
 }
 
 pub fn load_config(path: &str) -> Result<ProviderConfig> {
-    let content =
-        std::fs::read_to_string(path).context(format!("Failed to read config file: {}", path))?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config file: {}", path))?;
 
     serde_json::from_str(&content).context("Failed to parse provider config")
 }
 
 pub fn save_config(path: &str, config: &ProviderConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, content).context(format!("Failed to write config file: {}", path))?;
+    std::fs::write(path, content)
+        .with_context(|| format!("Failed to write config file: {}", path))?;
     Ok(())
 }
