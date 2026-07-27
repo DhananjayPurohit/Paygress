@@ -8,6 +8,7 @@ use crate::durable_workload::{DurableWorkload, WorkloadState};
 use crate::nostr::{
     AccessDetailsContent, EncryptedSpawnPodRequest, ErrorResponseContent, PodSpec, WarmStandbyRole,
 };
+use crate::provider::config::BackendType;
 use crate::provider::persistence::{persist_standby_slots, persist_workloads, WorkloadInfo};
 use crate::provider::standby::{compute_warm_standby_role, StandbySlot};
 use crate::templates::{TemplateDefinition, TemplateName};
@@ -20,6 +21,29 @@ struct SpawnPlan {
     container_config: ContainerConfig,
     template: Option<TemplateDefinition>,
     host_port: u16,
+}
+
+/// The consumer chose this inside the encrypted spawn request. Honouring it is
+/// what lets an automated caller reach the box at all: the generated password
+/// is only ever returned inside the human-readable `instructions`, which no
+/// program should be parsing.
+///
+/// Rejected unless plain alphanumeric — the KVM backend embeds it in cloud-init
+/// YAML and LXD pipes `root:<password>` to `chpasswd`, so a newline would set
+/// other accounts' passwords.
+fn usable_ssh_password(requested: &str) -> Option<String> {
+    let ok = (12..=64).contains(&requested.len())
+        && requested.chars().all(|c| c.is_ascii_alphanumeric());
+    ok.then(|| requested.to_string())
+}
+
+/// Templates name public Docker images. LXD cannot launch one, and KVM cuts
+/// every VM from one operator-chosen base image and ignores the field
+/// entirely — on both, a template spawn would take the token and hand back a
+/// bare box. Those backends serve a sandbox with the toolchain baked in
+/// instead (`images/ci-sandbox/`).
+fn serves_templates(backend: BackendType) -> bool {
+    matches!(backend, BackendType::Docker | BackendType::Proxmox)
 }
 
 /// Redeem, provision, and reply with access details.
@@ -50,6 +74,22 @@ pub(crate) async fn handle_spawn_request(
             requester_pubkey,
             message_type,
             "not_addressed",
+            err_msg,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Before redemption: accepting a template this backend cannot materialize
+    // would take the token and hand back a bare box instead.
+    if request.template_slug.is_some() && !serves_templates(config.backend_type) {
+        let err_msg = "this provider's backend serves its own image and cannot run templates";
+        warn!("{}", err_msg);
+        send_error(
+            deps,
+            requester_pubkey,
+            message_type,
+            "template_unsupported",
             err_msg,
         )
         .await?;
@@ -227,7 +267,7 @@ async fn build_spawn_plan(
 ) -> Handled<SpawnPlan> {
     let config = &deps.config;
 
-    let password = generate_password();
+    let password = usable_ssh_password(&request.ssh_password).unwrap_or_else(generate_password);
     let host_port = config.ssh_host_port(id);
 
     // Image, ports and env come from the provider's own registry, never from
@@ -546,4 +586,47 @@ async fn send_spawn_access_details(
         .send_access_details_private_message(requester_pubkey, details, message_type)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sane_requested_password_is_honoured() {
+        let requested = "W9ZG2GIUOWiPkYID";
+        assert_eq!(
+            usable_ssh_password(requested).as_deref(),
+            Some(requested),
+            "otherwise the consumer's only copy of the password is wrong"
+        );
+    }
+
+    #[test]
+    fn injection_shaped_passwords_fall_back_to_a_generated_one() {
+        for bad in [
+            "short",
+            "with space1234",
+            // chpasswd reads one account per line.
+            "abcdefghijkl\nroot:hunter2",
+            // cloud-init user-data is YAML.
+            "abcdefghijkl\n  ssh_pwauth: true",
+            "",
+        ] {
+            assert!(
+                usable_ssh_password(bad).is_none(),
+                "`{}` must not reach a backend",
+                bad.escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn only_image_backends_serve_templates() {
+        assert!(serves_templates(BackendType::Docker));
+        assert!(serves_templates(BackendType::Proxmox));
+        // Both would take the token and then fail to launch the image.
+        assert!(!serves_templates(BackendType::LXD));
+        assert!(!serves_templates(BackendType::Kvm));
+    }
 }
