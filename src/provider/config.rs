@@ -85,6 +85,18 @@ pub struct ProviderConfig {
     /// ecash. Written as `LNURL_ADDRESS` in `/etc/paygress/.env`.
     #[serde(default)]
     pub lightning_address: Option<String>,
+
+    /// Base image every KVM overlay is cut from. Unset means stock Ubuntu; a
+    /// provider serving CI points these at an image carrying docker and act
+    /// (`images/ci-sandbox/build.sh`), since the KVM backend has no per-workload
+    /// image to install them into. Ignored by every other backend.
+    #[serde(default)]
+    pub kvm_base_image_path: Option<String>,
+
+    /// Fetched to `kvm_base_image_path` on first spawn when that file is
+    /// missing.
+    #[serde(default)]
+    pub kvm_base_image_url: Option<String>,
 }
 
 impl ProviderConfig {
@@ -154,6 +166,8 @@ impl Default for ProviderConfig {
             standby_state_path: default_standby_state_path(),
             http_bind_addr: None,
             lightning_address: None,
+            kvm_base_image_path: None,
+            kvm_base_image_url: None,
         }
     }
 }

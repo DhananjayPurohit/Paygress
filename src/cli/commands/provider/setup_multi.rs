@@ -227,6 +227,8 @@ fn build_multi_config(
         standby_state_path: format!("./paygress-{}-standby-slots.json", provider_name),
         http_bind_addr: None,
         lightning_address: args.lightning_address.clone(),
+        kvm_base_image_path: None,
+        kvm_base_image_url: None,
     }
 }
 

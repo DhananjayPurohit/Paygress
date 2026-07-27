@@ -99,7 +99,12 @@ impl ProviderService {
                     tracing::error!("KVM backend selected but unavailable: {}", e);
                     anyhow::bail!("KVM backend unavailable: {}", e);
                 }
-                Arc::new(crate::kvm::KvmBackend::new(crate::kvm::KvmConfig::default()))
+                Arc::new(crate::kvm::KvmBackend::new(
+                    crate::kvm::KvmConfig::for_provider(
+                        config.kvm_base_image_path.as_deref(),
+                        config.kvm_base_image_url.as_deref(),
+                    ),
+                ))
             }
         };
 

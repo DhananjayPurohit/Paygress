@@ -49,6 +49,14 @@ pub struct SetupArgs {
     #[arg(long, default_value = "vmbr0")]
     pub bridge: String,
 
+    /// KVM base image every VM overlays (see images/ci-sandbox/build.sh)
+    #[arg(long)]
+    pub kvm_base_image_path: Option<String>,
+
+    /// URL the KVM base image is fetched from when the file is missing
+    #[arg(long)]
+    pub kvm_base_image_url: Option<String>,
+
     /// Nostr private key (nsec format, auto-generated if not provided)
     #[arg(long)]
     pub nostr_key: Option<String>,
@@ -180,6 +188,8 @@ pub(super) async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()>
         standby_state_path: "./paygress-standby-slots.json".to_string(),
         lightning_address: args.lightning_address,
         http_bind_addr: None,
+        kvm_base_image_path: args.kvm_base_image_path,
+        kvm_base_image_url: args.kvm_base_image_url,
     };
 
     save_config(CONFIG_PATH, &config)?;
