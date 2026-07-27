@@ -24,7 +24,6 @@ pub enum TemplateName {
     BitcoinNode,
     AgentSandbox,
     OpenClaw,
-    NgitRunner,
 }
 
 impl TemplateName {
@@ -37,7 +36,6 @@ impl TemplateName {
             Self::BitcoinNode => "bitcoin-node",
             Self::AgentSandbox => "agent-sandbox",
             Self::OpenClaw => "openclaw",
-            Self::NgitRunner => "ngit-runner",
         }
     }
 
@@ -49,12 +47,11 @@ impl TemplateName {
             "bitcoin-node" => Some(Self::BitcoinNode),
             "agent-sandbox" => Some(Self::AgentSandbox),
             "openclaw" => Some(Self::OpenClaw),
-            "ngit-runner" => Some(Self::NgitRunner),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 7] {
+    pub fn all() -> [Self; 6] {
         [
             Self::NostrRelay,
             Self::InferenceEndpoint,
@@ -62,7 +59,6 @@ impl TemplateName {
             Self::BitcoinNode,
             Self::AgentSandbox,
             Self::OpenClaw,
-            Self::NgitRunner,
         ]
     }
 }
@@ -113,7 +109,6 @@ impl TemplateDefinition {
             TemplateName::BitcoinNode => bitcoin_node(),
             TemplateName::AgentSandbox => agent_sandbox(),
             TemplateName::OpenClaw => openclaw(),
-            TemplateName::NgitRunner => ngit_runner(),
         }
     }
 
@@ -306,37 +301,6 @@ fn openclaw() -> TemplateDefinition {
     }
 }
 
-fn ngit_runner() -> TemplateDefinition {
-    let mut env = HashMap::new();
-    // Empty defaults mean "refuse to start" rather than running against
-    // an unintended target.
-    env.insert("NGIT_REPO", "");
-    env.insert("NGIT_COMMIT", "");
-    env.insert("NGIT_PIPELINE_PATH", ".ngit/ci.yml");
-    env.insert("NGIT_STATUS_PORT", "8080");
-    TemplateDefinition {
-        name: TemplateName::NgitRunner,
-        summary: "ngit CI/CD runner — one-shot pipeline executor for Nostr-based git repos. Clones the repo at the requested commit, parses .ngit/ci.yml, runs each step. Result reporting today is exit code + /status HTTP; the follow-up step ships the kind-38401 Nostr-event publish once the ngit-ci bridge daemon and event schema are agreed upon.",
-        // TODO(ngit-runner-image): publish this image from
-        // `images/ngit-runner/`; until then deploys fail at pull.
-        image: "ghcr.io/dhananjaypurohit/paygress-ngit-runner:0.1.0",
-        ports: vec![Port {
-            container_port: 8080,
-            protocol: "http",
-            label: "ngit-runner-status",
-        }],
-        env,
-        compose_path: "templates/ngit-runner/docker-compose.yml",
-        extra_docker_args: &[],
-        data_path: None,
-        tier: "basic",
-        replication: ReplicationMode::None,
-        min_cpu_millicores: 1000,
-        min_memory_mb: 2048,
-        min_storage_gb: 10,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,10 +374,6 @@ mod tests {
             TemplateDefinition::lookup(TemplateName::AgentSandbox).replication,
             ReplicationMode::None
         );
-        assert_eq!(
-            TemplateDefinition::lookup(TemplateName::NgitRunner).replication,
-            ReplicationMode::None
-        );
     }
 
     #[test]
@@ -422,15 +382,6 @@ mod tests {
         let def = TemplateDefinition::lookup(TemplateName::AgentSandbox);
         assert_eq!(def.data_path, Some("/workspace"));
         assert_eq!(def.env.get("WORKSPACE"), Some(&"/workspace"));
-    }
-
-    #[test]
-    fn ngit_runner_is_stateless_and_requires_repo_and_commit() {
-        let def = TemplateDefinition::lookup(TemplateName::NgitRunner);
-        assert_eq!(def.data_path, None, "CI runner must be stateless");
-        assert_eq!(def.env.get("NGIT_REPO"), Some(&""));
-        assert_eq!(def.env.get("NGIT_COMMIT"), Some(&""));
-        assert_eq!(def.env.get("NGIT_PIPELINE_PATH"), Some(&".ngit/ci.yml"));
     }
 }
 
