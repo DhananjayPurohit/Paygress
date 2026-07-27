@@ -1,6 +1,5 @@
-// `paygress-cli deploy` — wrapper around `spawn` that hides
-// reliability, persistence, and replication behind per-template
-// defaults, each overridable by an explicit flag.
+// Wrapper around `spawn` that hides reliability, persistence and replication
+// behind per-template defaults, each overridable by an explicit flag.
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
@@ -64,8 +63,8 @@ impl Template {
 
 pub struct TemplateDefaults {
     pub tier: &'static str,
-    /// Fallback only; the provider normally resolves the real image
-    /// from its registry via the template slug.
+    /// Fallback only; the provider normally resolves the real image from its
+    /// registry via the template slug.
     pub image: &'static str,
     pub replication: ReplicationMode,
     pub summary: &'static str,

@@ -1,19 +1,17 @@
-// Provider-side workload lifecycle: an explicit state machine driven
-// by heartbeats observed across M-of-N Nostr relays.
+// Provider-side workload lifecycle, driven by heartbeats observed across
+// M-of-N Nostr relays.
 //
-// Single-writer invariant: a workload emits `PublishLeaseRevocation`
-// only after its own local state has left `Live`, and a standby
-// cannot promote until it observes that revocation. So at most one
-// provider is `Live` for a workload at any moment.
+// Single-writer invariant: a workload emits `PublishLeaseRevocation` only after
+// its own local state has left `Live`, and a standby cannot promote until it
+// observes that revocation. So at most one provider is `Live` at any moment.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Replication mode chosen by the consumer at spawn. `None`: one container, no
-/// checkpoint, no failover. `WarmStandby`: on eviction the state machine emits
-/// `PublishLeaseRevocation` so the lease can be handed off. `Checkpointed`:
-/// respawn from the latest Blossom checkpoint.
+/// Replication mode chosen by the consumer at spawn. Only `WarmStandby` makes
+/// eviction emit `PublishLeaseRevocation`; `Checkpointed` respawns from the
+/// latest Blossom checkpoint on the same provider.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum ReplicationMode {
@@ -156,7 +154,6 @@ pub enum StateMachineEvent {
     },
 }
 
-/// Tracked workloads keyed by `workload_id`, advanced by `tick`.
 pub struct WorkloadStateMachine {
     config: QuorumConfig,
     workloads: HashMap<u32, DurableWorkload>,
@@ -207,7 +204,7 @@ impl WorkloadStateMachine {
                 if obs.event_timestamp + cfg.stale_secs < now {
                     continue;
                 }
-                live_relays.insert(obs.relay_url.clone());
+                live_relays.insert(obs.relay_url.as_str());
             }
             let quorum_alive = live_relays.len() as u8 >= cfg.m;
 
@@ -256,8 +253,6 @@ impl WorkloadStateMachine {
         }
     }
 
-    /// Controller reports a successful respawn; heartbeats from the new
-    /// container keep the workload in `Live`.
     pub fn notify_respawn_succeeded(&mut self, workload_id: u32, now: u64) {
         if let Some(workload) = self.workloads.get_mut(&workload_id) {
             workload.state = WorkloadState::Live { since: now };
@@ -276,11 +271,6 @@ fn workload_state_since(state: &WorkloadState) -> Option<u64> {
     }
 }
 
-/// Quorum is a **provider-level** signal — "the provider could not reach enough
-/// relays", not "this container is unhealthy". Only warm-standby can act on it
-/// (the standby needs the primary to evict itself first). For everything else
-/// there is no standby to promote, so evicting would tear down healthy,
-/// paid-for containers during a network blip.
 /// Move a workload to `Failed` and announce it. Both must happen together —
 /// a state change with no event leaves the controller unaware.
 fn fail(workload: &mut DurableWorkload, reason: &str, events: &mut Vec<StateMachineEvent>) {
@@ -293,6 +283,11 @@ fn fail(workload: &mut DurableWorkload, reason: &str, events: &mut Vec<StateMach
     });
 }
 
+/// Quorum is a **provider-level** signal — "the provider could not reach enough
+/// relays", not "this container is unhealthy". Only warm-standby can act on it
+/// (the standby needs the primary to evict itself first). For everything else
+/// there is no standby to promote, so evicting would tear down healthy,
+/// paid-for containers during a network blip.
 fn failover_eligible(workload: &DurableWorkload) -> bool {
     matches!(workload.replication, ReplicationMode::WarmStandby { .. })
 }

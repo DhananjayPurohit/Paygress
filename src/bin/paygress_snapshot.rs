@@ -1,13 +1,9 @@
-// `paygress-snapshot` — crawl Nostr for the marketplace's live state
-// and write a single JSON snapshot the static dashboard reads.
+// Crawl Nostr for the marketplace's live state and write the JSON snapshot the
+// static dashboard reads.
 //
-// I/O glue only. Receipts / consumers / stake statuses are left empty:
-// this snapshot is for at-a-glance dashboarding, not the full reputation
-// aggregation, which needs a real receipt corpus.
-//
-// Usage:
-//     cargo run --release --bin paygress-snapshot -- \
-//         [--out snapshot.json] [--relays wss://...,wss://...]
+// Receipts / consumers / stake statuses are left empty: this is at-a-glance
+// dashboarding, not the full reputation aggregation, which needs a real receipt
+// corpus.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

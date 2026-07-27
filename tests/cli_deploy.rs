@@ -1,8 +1,9 @@
-//! Argument validation and help output for `paygress deploy`, driven
-//! through the built `paygress-cli` binary. Spawning against a real
-//! provider + mint is out of scope here.
+//! Argument validation and help output for `paygress deploy`, driven through the
+//! built `paygress-cli` binary.
 
 use std::process::Command;
+
+mod common;
 
 fn paygress_cli() -> Command {
     let exe = env!("CARGO_BIN_EXE_paygress-cli");
@@ -66,27 +67,10 @@ fn deploy_rejects_malformed_cashu_token_before_network() {
 
 #[test]
 fn deploy_requires_provider_until_observatory_lands() {
-    // Valid synthetic V3 token, so we get past `value_parser` and into
-    // the auto-selection check.
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
-    let body = serde_json::json!({
-        "token": [{
-            "mint": "https://testnut.cashu.space",
-            "proofs": [{
-                "amount": 1,
-                "secret": "deploy-test-secret",
-                "C": "023be53e8c60530eea9b3943fda1a2ce71c7b3f0cf0dc6d846fa765aaf779fa81d",
-                "id": "009a1f293253e41e",
-            }],
-        }],
-        "unit": "sat",
-    });
-    let token = format!(
-        "cashuA{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_string(&body).unwrap().as_bytes())
-    );
+    // Valid token, so we get past `value_parser` and into the auto-selection
+    // check.
+    let token =
+        common::synthetic_cashu_token("https://testnut.cashu.space", 1, "deploy-test-secret");
 
     let out = paygress_cli()
         .args(["deploy", "nostr-relay", "--token", &token])

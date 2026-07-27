@@ -1,53 +1,43 @@
-// Scoring logic for signed completion receipts.
-//
-// A receipt only counts when it is co-signed by consumer and
-// provider, bound to a verifiable Cashu spend proof, and survives
-// the Sybil weighting: the consumer needs enough history, and any
-// one consumer-provider pair is capped at 20% of that consumer's
+// Pure scoring math over signed completion receipts. A receipt only counts when
+// it is co-signed by consumer and provider, bound to a verifiable Cashu spend
+// proof, and survives the Sybil weighting: the consumer needs enough history,
+// and any one consumer-provider pair is capped at 20% of that consumer's
 // receipt volume.
-//
-// The Nostr publish path and the provider co-sign flow live
-// elsewhere; this module is pure math over receipts.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Cashu spend proof captured by the provider at redemption and
-/// pasted verbatim into the receipt it co-signs. Aggregators check
-/// it against the mint's published keys before counting the receipt.
+/// Cashu spend proof captured by the provider at redemption and pasted verbatim
+/// into the receipt it co-signs. Aggregators check it against the mint's
+/// published keys before counting the receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentProof {
-    /// URL of the mint that issued the swap.
     pub mint_url: String,
-    /// Mint's signature over the swap response (or a hash thereof —
-    /// exact bytes depend on mint capabilities).
+    /// Mint's signature over the swap response (or a hash thereof — exact bytes
+    /// depend on mint capabilities).
     pub swap_response_signature: String,
 }
 
-/// Co-signed completion receipt. Both parties sign the canonicalized
-/// JSON of `(lease_id, provider_npub, consumer_npub, duration_paid,
-/// duration_delivered, success_flag, payment_proof, version)`;
-/// missing either signature means the receipt does not score.
+/// Co-signed completion receipt. Both parties sign the canonicalized JSON of
+/// `(lease_id, provider_npub, consumer_npub, duration_paid, duration_delivered,
+/// success_flag, payment_proof, version)`; missing either signature means the
+/// receipt does not score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionReceipt {
     pub lease_id: String,
     pub provider_npub: String,
     pub consumer_npub: String,
-    /// Seconds the consumer paid for.
     pub duration_paid: u64,
-    /// Seconds the workload was live, provider-reported and
-    /// cross-checkable against heartbeat history.
+    /// Provider-reported, cross-checkable against heartbeat history.
     pub duration_delivered: u64,
-    /// 1.0 = success, 0.0 = failure. A float so partial credit
-    /// (delivered but with SLA violations) stays expressible.
+    /// 1.0 = success, 0.0 = failure. A float so partial credit (delivered but
+    /// with SLA violations) stays expressible.
     pub success_flag: f32,
     pub payment_proof: PaymentProof,
     pub version: u8,
-    /// Schnorr signature over the canonical content by the
-    /// consumer's Nostr key.
+    /// Schnorr signature over the canonical content by the consumer's Nostr key.
     pub consumer_signature: Option<String>,
-    /// The provider's co-signature over the same content.
     pub provider_co_signature: Option<String>,
     /// Provider-stamped unix time; aggregators window by it.
     pub completed_at: u64,
@@ -58,8 +48,8 @@ pub struct CompletionReceipt {
 pub struct SybilHeuristics {
     /// Receipts from consumers younger than this don't count.
     pub min_consumer_history_secs: u64,
-    /// Share of one consumer's receipts that may point at a single
-    /// provider before the excess is weighted down.
+    /// Share of one consumer's receipts that may point at a single provider
+    /// before the excess is weighted down.
     pub max_same_counterparty_share: f32,
 }
 
@@ -74,17 +64,15 @@ impl Default for SybilHeuristics {
     }
 }
 
-/// Built from the consumer's first-seen Nostr activity.
 #[derive(Debug, Clone)]
 pub struct ConsumerProfile {
     pub npub: String,
-    /// Unix timestamp of the consumer's earliest known activity.
+    /// Unix timestamp of the consumer's earliest known Nostr activity.
     pub first_seen: u64,
 }
 
-/// Cheap structural checks. `false` means the receipt must not
-/// contribute to score; signature verification is a separate,
-/// caller-supplied step.
+/// Cheap structural checks. `false` means the receipt must not contribute to
+/// score; signature verification is a separate, caller-supplied step.
 fn receipt_well_formed(r: &CompletionReceipt) -> bool {
     r.consumer_signature.is_some()
         && r.provider_co_signature.is_some()
@@ -93,14 +81,12 @@ fn receipt_well_formed(r: &CompletionReceipt) -> bool {
         && r.version > 0
 }
 
-/// Sum of weighted success flags from the receipts that survive, in
-/// order: well-formedness, `verify_signatures`,
-/// `verify_payment_proof`, the consumer-history floor, and the
-/// per-consumer Sybil cap.
+/// Sum of weighted success flags from the receipts that survive, in order:
+/// well-formedness, `verify_signatures`, `verify_payment_proof`, the
+/// consumer-history floor, and the per-consumer Sybil cap.
 ///
-/// The two verifiers are closures so tests can stub them; production
-/// wires them to nostr-sdk Schnorr verification and the cdk mint key
-/// store.
+/// The two verifiers are closures so tests can stub them; production wires them
+/// to nostr-sdk Schnorr verification and the cdk mint key store.
 pub fn score_provider<S, P>(
     provider_npub: &str,
     receipts: &[CompletionReceipt],
@@ -222,8 +208,6 @@ mod tests {
 
     #[test]
     fn single_consumer_with_single_provider_is_capped_to_share() {
-        // A lone consumer cannot fully credit a lone provider: 100%
-        // of their receipts still contributes only `max_share`.
         let receipts = vec![signed_receipt("l1", "P", "C", 1.0)];
         let mut consumers = HashMap::new();
         consumers.insert(

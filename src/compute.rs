@@ -13,7 +13,6 @@ pub fn container_name(id: u32) -> String {
     format!("paygress-{}", id)
 }
 
-/// Id encoded in a `paygress-<id>` name, or `None` for anything else.
 pub fn id_from_container_name(name: &str) -> Option<u32> {
     name.strip_prefix("paygress-")?.parse().ok()
 }
@@ -109,8 +108,8 @@ pub trait ComputeBackend: Send + Sync {
     }
 }
 
-/// Deliberately three-valued: an unreachable backend must not be mistaken for
-/// a stopped workload.
+/// Three-valued: an unreachable backend must not be mistaken for a stopped
+/// workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerStatus {
     Running,

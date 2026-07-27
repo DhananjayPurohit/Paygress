@@ -1,8 +1,5 @@
-//! `parse_pod_npub` plus `EncryptedTopUpPodRequest`'s compatibility with
-//! the `#[serde(untagged)]` `PrivateRequest` dispatch.
-//!
-//! Handler-level scenarios (concurrent topups, cleanup races, real cashu
-//! redemption) need a live relay, backend and mint, so they live elsewhere.
+//! `parse_pod_npub` plus `EncryptedTopUpPodRequest`'s compatibility with the
+//! `#[serde(untagged)]` `PrivateRequest` dispatch.
 
 use paygress::nostr::{EncryptedTopUpPodRequest, PrivateRequest};
 use paygress::provider::parse_pod_npub;

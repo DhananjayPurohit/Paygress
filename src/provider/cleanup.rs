@@ -1,5 +1,5 @@
-// Expiry sweep: the only path that reclaims a container once its lease runs
-// out, and the only one that frees the vmid for re-use.
+// Expiry sweep: the only path that reclaims a container once its lease runs out,
+// and the only one that frees the vmid for re-use.
 
 use anyhow::Result;
 use tracing::{error, info, warn};

@@ -1,6 +1,5 @@
-//! State-machine tests for `paygress::durable_workload`: one deterministic
-//! test per transition, plus a proptest for the single-writer invariant.
-//! Multi-provider integration and spawn-from-checkpoint are out of scope.
+//! One deterministic test per `paygress::durable_workload` transition, plus a
+//! proptest for the single-writer invariant.
 
 use proptest::prelude::*;
 
@@ -120,9 +119,7 @@ fn suspect_recovers_to_live_within_t2() {
     sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
     let _ = sm.tick(10, &all_relays(10));
     let _ = sm.tick(200, &[]); // → Suspect
-
-    // Heartbeats resume on M-of-N before T2.
-    let _ = sm.tick(220, &all_relays(220));
+    let _ = sm.tick(220, &all_relays(220)); // heartbeats resume before T2
     assert!(matches!(sm.state_of(1), Some(WorkloadState::Live { .. })));
 }
 

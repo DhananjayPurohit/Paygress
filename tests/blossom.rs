@@ -1,6 +1,5 @@
-//! Exercises the Blossom client against a `wiremock` stub of the HTTP
-//! surface, including the auth header real servers verify. Crypto
-//! round-trips live inline in `src/blossom_crypto.rs`.
+//! Exercises the Blossom client against a `wiremock` stub, including the auth
+//! header real servers verify. Crypto round-trips live in `src/blossom_crypto.rs`.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use nostr_sdk::Keys;
