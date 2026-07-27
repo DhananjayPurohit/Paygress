@@ -251,6 +251,13 @@ impl ProviderService {
             stats: self.stats.clone(),
             state_machine: self.state_machine.clone(),
             provider_npub: self.get_npub(),
+            // Believing the paywall's settled-amount header is only safe when
+            // nothing else can reach the socket.
+            trust_paywall_headers: self
+                .config
+                .http_bind_addr
+                .as_deref()
+                .is_some_and(crate::provider_http::is_loopback_bind),
         }
     }
 

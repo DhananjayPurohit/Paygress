@@ -1,10 +1,14 @@
 // Provider HTTP interface, served behind the `ngx_l402` nginx module and
 // enabled by `http_bind_addr` in the provider config.
 //
-// ngx_l402 returns 402 without a valid Cashu token, redeems the token at the
-// mint, and forwards the request with the token still in the Authorization
-// header. These handlers MUST NOT contact the mint again — the token is
-// already spent — so they only decode its face value via `extract_token_value`.
+// The paywall settles payment and forwards the request. These handlers MUST
+// NOT contact the mint — the instrument is already spent, and a second call
+// would double-spend.
+//
+// Preferred contract: the paywall reports what it settled in
+// `X-Payment-Amount-Msat` and this process never sees an instrument, so any
+// method ngx_l402 supports works here with no code. Decoding a Cashu token is
+// the fallback for paywalls that do not set it yet.
 
 use anyhow::Result;
 use axum::{
@@ -41,6 +45,9 @@ pub(crate) struct ProviderHttpState {
     pub(crate) stats: Arc<Mutex<ProviderStats>>,
     pub(crate) state_machine: Arc<Mutex<WorkloadStateMachine>>,
     pub(crate) provider_npub: String,
+    /// Whether `PAYMENT_AMOUNT_HEADER` may be believed — true only when the
+    /// backend is bound to loopback, so the paywall is the sole caller.
+    pub(crate) trust_paywall_headers: bool,
 }
 
 pub(crate) async fn run_provider_http_interface(
@@ -51,6 +58,21 @@ pub(crate) async fn run_provider_http_interface(
         "🌐 Starting provider HTTP+ngx_l402 interface on {}",
         bind_addr
     );
+
+    if state.trust_paywall_headers {
+        info!(
+            "   settled amounts accepted from the paywall via `{}`",
+            PAYMENT_AMOUNT_HEADER
+        );
+    } else {
+        warn!(
+            "   bound to a non-loopback address, so `{}` is IGNORED and payment \
+             amounts are decoded from the instrument instead. Anyone who can reach \
+             {} directly bypasses the paywall — put nginx in front and bind to \
+             127.0.0.1.",
+            PAYMENT_AMOUNT_HEADER, bind_addr
+        );
+    }
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -120,8 +142,50 @@ fn payment_required_response() -> Response {
         .into_response()
 }
 
+/// Amount the paywall settled, in msats. Payment-method agnostic: whatever
+/// ngx_l402 accepted — L402/Lightning, Cashu, anything it adds later — arrives
+/// here as an integer, so this process never learns what an instrument is.
+pub(crate) const PAYMENT_AMOUNT_HEADER: &str = "x-payment-amount-msat";
+
+/// Read the settled amount the paywall reported.
+///
+/// Only honoured when the backend is bound to loopback. The header is trivially
+/// forgeable, so trusting it from a socket anyone can reach would hand out free
+/// compute; on a non-loopback bind we ignore it and fall back to decoding the
+/// instrument, which at least requires a well-formed token.
+fn settled_amount_msats(headers: &HeaderMap, trust_paywall_headers: bool) -> Option<u64> {
+    if !trust_paywall_headers {
+        return None;
+    }
+    headers
+        .get(PAYMENT_AMOUNT_HEADER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// True when the only thing that can reach this socket is a paywall on the same
+/// host, which is what makes `PAYMENT_AMOUNT_HEADER` safe to believe.
+pub(crate) fn is_loopback_bind(bind_addr: &str) -> bool {
+    let host = match bind_addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => bind_addr,
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 /// Face value of an already-redeemed token, in msats. `Err` holds the response
 /// to return verbatim. Never contacts the mint.
+///
+/// Fallback for paywalls that do not yet report the amount. Prefer
+/// `PAYMENT_AMOUNT_HEADER`: decoding the instrument here is what keeps a Cashu
+/// dependency on this path at all.
 async fn decode_payment_msats(token: &str, endpoint: &str) -> Result<u64, Response> {
     extract_token_value(token).await.map_err(|e| {
         error!(
@@ -155,8 +219,10 @@ async fn get_offers(State(state): State<ProviderHttpState>) -> Json<serde_json::
         "whitelisted_mints": state.config.whitelisted_mints,
         "minimum_duration_seconds": state.config.minimum_duration_seconds,
         "payment_info": {
-            "accepted_tokens": ["cashu"],
-            "header_format": "Authorization: Cashu <token>  OR  X-Cashu: <token>"
+            "settled_by": "paywall",
+            "settled_amount_header": PAYMENT_AMOUNT_HEADER,
+            "fallback_tokens": ["cashu"],
+            "fallback_header_format": "Authorization: Cashu <token>  OR  X-Cashu: <token>"
         }
     }))
 }
@@ -169,14 +235,18 @@ async fn spawn_pod(
 ) -> Response {
     info!("📨 [HTTP] spawn request received");
 
-    let Some(cashu_token) = payment_token(&headers, request.cashu_token) else {
-        warn!("[HTTP] spawn: no Cashu token provided");
-        return payment_required_response();
-    };
-
-    let payment_msats = match decode_payment_msats(&cashu_token, "spawn").await {
-        Ok(v) => v,
-        Err(resp) => return resp,
+    let payment_msats = match settled_amount_msats(&headers, state.trust_paywall_headers) {
+        Some(msats) => msats,
+        None => {
+            let Some(token) = payment_token(&headers, request.cashu_token) else {
+                warn!("[HTTP] spawn: no settled amount and no token provided");
+                return payment_required_response();
+            };
+            match decode_payment_msats(&token, "spawn").await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            }
+        }
     };
 
     let spec = match state
@@ -362,9 +432,11 @@ async fn topup_pod(
 ) -> Response {
     info!("📨 [HTTP] topup request for {}", request.pod_npub);
 
-    let Some(cashu_token) = payment_token(&headers, request.cashu_token) else {
+    let settled = settled_amount_msats(&headers, state.trust_paywall_headers);
+    let token = payment_token(&headers, request.cashu_token);
+    if settled.is_none() && token.is_none() {
         return payment_required_response();
-    };
+    }
 
     let vmid = match parse_pod_npub(&request.pod_npub) {
         Some(v) => v,
@@ -435,9 +507,16 @@ async fn topup_pod(
         }
     };
 
-    let payment_msats = match decode_payment_msats(&cashu_token, "topup").await {
-        Ok(v) => v,
-        Err(resp) => return resp,
+    let payment_msats = match settled {
+        Some(msats) => msats,
+        None => {
+            // `token` is Some here: the pair was checked above.
+            let token = token.unwrap_or_default();
+            match decode_payment_msats(&token, "topup").await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            }
+        }
     };
 
     let extension_secs = payment_msats / spec.rate_msats_per_sec;
@@ -518,4 +597,52 @@ struct TopUpPodRequest {
     pod_npub: String,
     #[serde(default)]
     cashu_token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(amount: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(PAYMENT_AMOUNT_HEADER, amount.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn settled_amount_is_ignored_when_the_bind_is_reachable() {
+        // The header is trivially forgeable. Honouring it on a public bind
+        // would hand out free compute to anyone who can reach the socket.
+        let h = headers_with("900000");
+        assert_eq!(settled_amount_msats(&h, false), None);
+        assert_eq!(settled_amount_msats(&h, true), Some(900_000));
+    }
+
+    #[test]
+    fn malformed_settled_amounts_fall_back_rather_than_pass() {
+        for bad in ["", "abc", "-1", "1.5", "9999999999999999999999"] {
+            let h = headers_with(bad);
+            assert_eq!(settled_amount_msats(&h, true), None, "accepted {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn loopback_binds_are_recognised() {
+        for addr in [
+            "127.0.0.1:8080",
+            "localhost:8080",
+            "[::1]:8080",
+            "127.0.0.1",
+        ] {
+            assert!(is_loopback_bind(addr), "{} should be loopback", addr);
+        }
+        for addr in [
+            "0.0.0.0:8080",
+            "192.168.1.10:8080",
+            "[::]:8080",
+            "example.com:80",
+        ] {
+            assert!(!is_loopback_bind(addr), "{} must not be loopback", addr);
+        }
+    }
 }
