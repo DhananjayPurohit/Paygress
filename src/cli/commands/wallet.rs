@@ -1,13 +1,6 @@
-// `paygress-cli wallet` — local token utilities.
-//
-// `wallet mint` funds unattended flows against a testnut-style mint
-// whose fake Lightning backend auto-pays quotes. It prints exactly one
-// thing to stdout — the serialized token — so callers can compose it:
-//
-//   paygress-cli spawn --token "$(paygress-cli wallet mint \
-//     --mint https://testnut.cashu.space --amount 1000)" ...
-//
-// All progress/diagnostics go to stderr to keep stdout clean.
+// `wallet mint` prints the serialized token and nothing else to stdout, so
+// callers can compose it (`--token "$(paygress-cli wallet mint ...)"`);
+// progress goes to stderr.
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -21,9 +14,7 @@ pub struct WalletArgs {
 
 #[derive(Subcommand)]
 pub enum WalletAction {
-    /// Mint a fresh Cashu token from a mint. Only works unattended
-    /// against testnut-style mints that auto-pay quotes; real mints
-    /// need their bolt11 invoice paid out-of-band and will time out.
+    /// Mint a fresh Cashu token (testnut-style auto-paying mints only)
     Mint(MintArgs),
 }
 
@@ -45,8 +36,7 @@ pub async fn execute(args: WalletArgs) -> Result<()> {
 }
 
 async fn run_mint(args: MintArgs) -> Result<()> {
-    // Unique temp wallet so concurrent invocations don't collide;
-    // removed regardless of outcome.
+    // Unique temp wallet so concurrent invocations don't collide.
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
         "paygress-wallet-mint-{}.sqlite",
@@ -67,7 +57,7 @@ async fn run_mint(args: MintArgs) -> Result<()> {
 
     let token = result?;
     eprintln!("{} minted", "✓".green());
-    // The token is the entire stdout contract — nothing else.
+    // The token is the entire stdout contract.
     println!("{}", token);
     Ok(())
 }

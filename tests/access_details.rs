@@ -1,10 +1,6 @@
-//! Wire-format regression tests for `AccessDetailsContent`'s new
-//! `host_address` + `template_ports` fields.
-//!
-//! Old clients sending pre-this-PR responses MUST keep parsing on
-//! the new code path; new responses MUST round-trip cleanly. The
-//! consumer-facing UX of these fields is exercised live in
-//! `src/cli/commands/spawn.rs` (covered by manual demo).
+//! Wire-format regression tests for `AccessDetailsContent`'s
+//! `host_address` + `template_ports` fields: old responses must keep
+//! parsing, new ones must round-trip.
 
 use paygress::nostr::{AccessDetailsContent, TemplateAccessPort};
 
@@ -46,7 +42,7 @@ fn empty_template_ports_skipped_on_wire() {
     let json = serde_json::to_string(&v).unwrap();
     assert!(
         !json.contains("template_ports"),
-        "skip_serializing_if respected — empty Vec stays off the wire so non-template spawns look identical to old clients"
+        "empty Vec must stay off the wire so non-template spawns look identical to old clients"
     );
 }
 
@@ -63,7 +59,6 @@ fn empty_host_address_skipped_on_wire() {
 
 #[test]
 fn old_v0_response_without_new_fields_parses() {
-    // Exactly what a pre-this-PR provider emits.
     let v0_json = serde_json::json!({
         "pod_npub": "container-1",
         "node_port": 30001,
@@ -81,9 +76,7 @@ fn old_v0_response_without_new_fields_parses() {
 
 #[test]
 fn template_port_label_is_routable() {
-    // Pin the label values produced for each template's first port,
-    // since the consumer SDK uses these to route by role
-    // (e.g. "give me the http port" vs scraping by container_port).
+    // The consumer SDK routes by these labels rather than by container_port.
     use paygress::templates::{TemplateDefinition, TemplateName};
     let relay = TemplateDefinition::lookup(TemplateName::NostrRelay);
     assert_eq!(relay.ports[0].label, "relay-ws");

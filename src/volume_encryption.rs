@@ -1,14 +1,9 @@
-// Consumer-side derivation of the LUKS volume key the provider
-// receives in `EncryptedSpawnPodRequest.volume_encryption.key_b64`.
+// Consumer-side derivation of the LUKS volume key sent as
+// `EncryptedSpawnPodRequest.volume_encryption.key_b64`.
 //
-// Determinism is the load-bearing property: the consumer recomputes
-// the same key on every respawn from material they already hold
-// (the nsec in `~/.paygress/identity` plus the workload id printed
-// at spawn), so no separate key vault is needed.
-//
-// One-shot SHA-256 rather than HKDF because both inputs are already
-// uniform high-entropy material; HKDF's extract step exists for
-// input keying material that isn't.
+// Determinism is the load-bearing property: the consumer recomputes the same key
+// on every respawn from material they already hold (the nsec in
+// `~/.paygress/identity` plus the workload id), so no key vault is needed.
 
 use sha2::{Digest, Sha256};
 
@@ -16,12 +11,9 @@ use sha2::{Digest, Sha256};
 /// a `VolumeEncryption` schema version bump.
 const KDF_DOMAIN_V1: &[u8] = b"paygress-volume-v1\0";
 
-/// Derive the 32-byte volume key from the consumer's raw (not
-/// bech32) secp256k1 secret key and the workload id.
-///
-/// The NUL separators domain-separate the two inputs; `workload_id`
-/// is a UUID and cannot contain a NUL, so no collision across the
-/// boundary is constructible.
+/// Derive the 32-byte volume key from the consumer's raw (not bech32)
+/// secp256k1 secret key and the workload id. The NUL separator domain-separates
+/// the two inputs, so no collision across the boundary is constructible.
 pub fn derive_volume_key(nsec_bytes: &[u8; 32], workload_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(KDF_DOMAIN_V1);
@@ -71,8 +63,6 @@ mod tests {
 
     #[test]
     fn boundary_collision_is_not_constructible() {
-        // A workload id cannot tunnel a NUL to impersonate the
-        // canonical separator.
         let k1 = derive_volume_key(&nsec(0x42), "ab");
         let k2 = derive_volume_key(&nsec(0x42), "a\0b");
         assert_ne!(

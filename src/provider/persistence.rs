@@ -13,21 +13,20 @@ pub struct WorkloadInfo {
     pub expires_at: u64,
     pub owner_npub: String,
 
-    /// `WarmStandby` registers a standby list so the orchestrator emits a
-    /// `LeaseRevocation` on local eviction.
+    /// `WarmStandby` makes the orchestrator emit a `LeaseRevocation` on local
+    /// eviction.
     #[serde(default)]
     pub replication: crate::durable_workload::ReplicationMode,
 
     #[serde(default)]
     pub restart_policy: crate::durable_workload::RestartPolicy,
 
-    /// Blossom URI of the latest checkpoint, included in revocation events so a
-    /// standby can restore from it.
+    /// Blossom URI of the latest checkpoint; a standby restores from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_uri: Option<String>,
 
-    /// Consumer-assigned id from the spawn request, so a published revocation
-    /// carries the same id the standbys keyed their slots by.
+    /// Consumer-assigned id, so a published revocation carries the same id the
+    /// standbys keyed their slots by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_workload_id: Option<String>,
 }
@@ -38,8 +37,8 @@ pub struct WorkloadInfo {
 /// is worse than a stale one: the loader would treat every workload past the
 /// truncation point as never having existed. `rename` is atomic on POSIX.
 ///
-/// Failures are logged, never propagated — refusing to serve a paid-for spawn
-/// because a bookkeeping file is unwritable would be worse than a stale mirror.
+/// Failures are logged, never propagated — refusing a paid-for spawn over an
+/// unwritable bookkeeping file would be worse than a stale mirror.
 pub(crate) fn persist_workloads(workloads: &HashMap<u32, WorkloadInfo>, path: &str) {
     let tmp = format!("{}.tmp", path);
     let encoded = match serde_json::to_vec_pretty(workloads) {
@@ -59,10 +58,9 @@ pub(crate) fn persist_workloads(workloads: &HashMap<u32, WorkloadInfo>, path: &s
     }
 }
 
-/// Read the mirrored workload table back. A missing file is the normal
-/// first-run case; a corrupt one degrades to empty, because a provider that
-/// refuses to boot over unreadable bookkeeping is worse than one that boots
-/// having forgotten some leases.
+/// A missing file is the normal first-run case; a corrupt one degrades to
+/// empty, because a provider that refuses to boot over unreadable bookkeeping
+/// is worse than one that boots having forgotten some leases.
 pub(crate) fn load_workloads(path: &str) -> HashMap<u32, WorkloadInfo> {
     let raw = match std::fs::read(path) {
         Ok(r) => r,
@@ -85,17 +83,13 @@ pub(crate) fn load_workloads(path: &str) -> HashMap<u32, WorkloadInfo> {
     }
 }
 
-/// Mirror reserved standby slots to disk.
-///
-/// A slot is paid-for capacity held for a workload that has not failed over
-/// yet. Without this a restart silently drops every reservation while the
-/// consumer's lease keeps running.
+/// Mirror reserved standby slots to disk, so a restart does not silently drop
+/// reservations the consumer has already paid for.
 ///
 /// Slots whose `container_config` carries a volume-encryption key are
 /// deliberately **not** written: that key is consumer key material, and the
-/// alternative to dropping the slot would be either persisting the key or
-/// silently promoting to an unencrypted volume. Both are worse than losing a
-/// reservation the consumer can re-make.
+/// alternatives are persisting the key or silently promoting to an unencrypted
+/// volume. Both are worse than losing a reservation the consumer can re-make.
 pub(crate) fn persist_standby_slots(slots: &HashMap<String, super::StandbySlot>, path: &str) {
     let persistable: HashMap<&String, &super::StandbySlot> = slots
         .iter()

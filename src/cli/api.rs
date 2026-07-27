@@ -85,7 +85,6 @@ pub struct PodStatusRequest {
     pub pod_id: String,
 }
 
-/// Attach the Cashu token as an `Authorization` header when present.
 fn with_cashu_auth(builder: RequestBuilder, token: Option<&String>) -> RequestBuilder {
     match token {
         Some(t) => builder.header("Authorization", format!("Cashu {}", t)),
@@ -120,7 +119,6 @@ impl PaygressClient {
             .map_err(|e| anyhow!("Failed to connect to server: {}", e))
     }
 
-    /// Liveness probe. Errors carry the server's status code.
     pub async fn health(&self) -> Result<()> {
         let url = format!("{}/health", self.base_url);
         let response = self.send(self.client.get(&url)).await?;

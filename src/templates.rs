@@ -2,17 +2,15 @@
 
 use std::collections::HashMap;
 
-/// Template-default replication mode. Distinct from
-/// `durable_workload::ReplicationMode` (which carries runtime data)
-/// and `cli::commands::deploy::ReplicationMode` (the CLI flag).
+/// Template default. Distinct from `durable_workload::ReplicationMode` (which
+/// carries runtime data) and `cli::commands::deploy::ReplicationMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationMode {
     /// Crash → consumer retries on a fresh provider.
     None,
     /// Periodic Blossom checkpoints; restart from the latest one.
     Checkpointed,
-    /// Checkpoints plus a hot standby on a second provider.
-    /// Single-writer always.
+    /// Checkpoints plus a hot standby on a second provider. Single-writer.
     WarmStandby,
 }
 
@@ -24,20 +22,13 @@ pub enum TemplateName {
     InferenceEndpoint,
     HeadlessBrowser,
     BitcoinNode,
-    /// Python + Node + git in a writable `/workspace`. No browser —
-    /// `HeadlessBrowser` covers that case.
     AgentSandbox,
-    /// openclaw.ai personal AI assistant Gateway. Holds persistent
-    /// memory + chat-app credentials in `~/.openclaw`.
     OpenClaw,
-    /// One-shot ngit CI/CD runner: clones a repo, checks out a
-    /// commit, runs the steps in `.ngit/ci.yml`.
     NgitRunner,
 }
 
 impl TemplateName {
-    /// Wire-format slug used by `paygress deploy <slug>` and the
-    /// `templates/<slug>/` directory.
+    /// Wire format: `paygress deploy <slug>` and `templates/<slug>/`.
     pub fn slug(self) -> &'static str {
         match self {
             Self::NostrRelay => "nostr-relay",
@@ -76,7 +67,6 @@ impl TemplateName {
     }
 }
 
-/// One port the consumer needs to reach to use the workload.
 #[derive(Debug, Clone)]
 pub struct Port {
     pub container_port: u16,
@@ -93,25 +83,22 @@ pub struct TemplateDefinition {
 
     pub image: &'static str,
     pub ports: Vec<Port>,
-    /// Default environment; consumers can override per-deploy.
+    /// Defaults; consumers can override per-deploy.
     pub env: HashMap<&'static str, &'static str>,
-    /// Repo-relative path to a `docker-compose.yml` that reproduces
-    /// the workload locally with no Paygress involved.
+    /// Repo-relative `docker-compose.yml` reproducing the workload locally.
     pub compose_path: &'static str,
 
-    /// Extra `docker run` flags passed verbatim before the image
-    /// positional. Every flag here is cross-template attack surface,
-    /// so keep the list minimal and justified.
+    /// Passed verbatim before the image positional. Every flag here is
+    /// cross-template attack surface, so keep the list minimal and justified.
     pub extra_docker_args: &'static [&'static str],
 
-    /// Container path holding persistent state; DockerBackend mounts
-    /// a vmid-scoped volume there. `None` = stateless.
+    /// Where DockerBackend mounts a vmid-scoped volume. `None` = stateless.
     pub data_path: Option<&'static str>,
 
     pub tier: &'static str,
     pub replication: ReplicationMode,
 
-    /// Minimum sane resources. Provisioning rejects tiers below this.
+    /// Provisioning rejects tiers below these.
     pub min_cpu_millicores: u64,
     pub min_memory_mb: u64,
     pub min_storage_gb: u64,
@@ -131,19 +118,12 @@ impl TemplateDefinition {
     }
 
     pub fn all() -> Vec<Self> {
-        TemplateName::all()
-            .iter()
-            .map(|n| Self::lookup(*n))
-            .collect()
+        TemplateName::all().into_iter().map(Self::lookup).collect()
     }
 }
 
-/// Whether `--encrypt-volume` defaults on for this template.
-///
-/// Rule: yes for anything with persistent state. Replication mode is
-/// a recovery knob, not a confidentiality one — every stateful
-/// template leaks the same class of data to a curious operator, and
-/// stateless ones have nothing to encrypt.
+/// Whether `--encrypt-volume` defaults on: yes for anything with persistent
+/// state, since only that leaks data to a curious operator.
 pub fn template_default_encrypts_volume(name: TemplateName) -> bool {
     TemplateDefinition::lookup(name).data_path.is_some()
 }
@@ -270,17 +250,15 @@ fn agent_sandbox() -> TemplateDefinition {
     env.insert("WORKSPACE", "/workspace");
     env.insert("PYTHONUNBUFFERED", "1");
     env.insert("NODE_ENV", "production");
-    // Credentials for the baked-in HTTP exec server. The provider
-    // overwrites these with the consumer's ssh_username/ssh_password
-    // at spawn; the server returns 503 while they are empty.
+    // The provider overwrites these with the consumer's
+    // ssh_username/ssh_password at spawn; the server 503s while empty.
     env.insert("EXEC_USER", "");
     env.insert("EXEC_PASS", "");
     TemplateDefinition {
         name: TemplateName::AgentSandbox,
         summary: "Generic compute sandbox: Python 3.12 + Node 20 + git in a writable /workspace volume. Bundled HTTP exec server on port 8080 lets agents run shell commands directly via the `paygress-cli exec` / MCP `run_command` path — no SSH needed. Stateless by default — retry-on-fresh-provider is the recovery model. Browser-using agents should compose with the `headless-browser` template.",
-        // Pinned so a registry-side rebuild can't silently change
-        // spawn behavior. Published by
-        // .github/workflows/agent-sandbox-image.yml on `agent-sandbox-v*`.
+        // Pinned so a registry-side rebuild can't silently change spawn
+        // behavior. Published by .github/workflows/agent-sandbox-image.yml.
         image: "ghcr.io/dhananjaypurohit/paygress-agent-sandbox:0.1.0",
         ports: vec![Port {
             container_port: 8080,
@@ -303,15 +281,13 @@ fn openclaw() -> TemplateDefinition {
     let mut env = HashMap::new();
     env.insert("OPENCLAW_GATEWAY_PORT", "18789");
     env.insert("OPENCLAW_GATEWAY_HOST", "0.0.0.0");
-    // Config + memory + sessions + per-skill credentials, so a
-    // checkpoint round-trip preserves them.
+    // Config + memory + credentials, so a checkpoint round-trip keeps them.
     env.insert("OPENCLAW_CONFIG_DIR", "/data/.openclaw");
     TemplateDefinition {
         name: TemplateName::OpenClaw,
         summary: "OpenClaw — open-source personal AI assistant Gateway (openclaw.ai). Connects outbound to chat apps (WhatsApp/Telegram/Discord/Slack/Signal/iMessage), keeps persistent memory + tool credentials in /data/.openclaw, exposes the Gateway control plane on 18789. Checkpointed because the memory + credentials are personal and should survive provider restarts.",
-        // TODO(openclaw-image): swap to a paygress-pinned image once
-        // published; upstream's GHCR build is the only option today,
-        // so deploys break if upstream stops publishing.
+        // TODO(openclaw-image): swap to a paygress-pinned image; deploys
+        // break today if upstream stops publishing.
         image: "ghcr.io/openclaw/openclaw:latest",
         ports: vec![Port {
             container_port: 18789,
@@ -332,8 +308,8 @@ fn openclaw() -> TemplateDefinition {
 
 fn ngit_runner() -> TemplateDefinition {
     let mut env = HashMap::new();
-    // Empty defaults mean "refuse to start with a clear error"
-    // rather than running against an unintended target.
+    // Empty defaults mean "refuse to start" rather than running against
+    // an unintended target.
     env.insert("NGIT_REPO", "");
     env.insert("NGIT_COMMIT", "");
     env.insert("NGIT_PIPELINE_PATH", ".ngit/ci.yml");
@@ -342,9 +318,7 @@ fn ngit_runner() -> TemplateDefinition {
         name: TemplateName::NgitRunner,
         summary: "ngit CI/CD runner — one-shot pipeline executor for Nostr-based git repos. Clones the repo at the requested commit, parses .ngit/ci.yml, runs each step. Result reporting today is exit code + /status HTTP; the follow-up step ships the kind-38401 Nostr-event publish once the ngit-ci bridge daemon and event schema are agreed upon.",
         // TODO(ngit-runner-image): publish this image from
-        // `images/ngit-runner/`. Until then deploys fail at pull —
-        // the config is staged ahead of the image so the CLI
-        // surface, schema and tests can land first.
+        // `images/ngit-runner/`; until then deploys fail at pull.
         image: "ghcr.io/dhananjaypurohit/paygress-ngit-runner:0.1.0",
         ports: vec![Port {
             container_port: 8080,
@@ -444,8 +418,7 @@ mod tests {
 
     #[test]
     fn agent_sandbox_has_workspace_data_path() {
-        // /workspace is the contract for callers retrieving
-        // artifacts over SSH; the compose file and docs track it.
+        // /workspace is the contract for callers retrieving artifacts over SSH.
         let def = TemplateDefinition::lookup(TemplateName::AgentSandbox);
         assert_eq!(def.data_path, Some("/workspace"));
         assert_eq!(def.env.get("WORKSPACE"), Some(&"/workspace"));
@@ -482,8 +455,7 @@ mod default_policy_tests {
 
     #[test]
     fn nostr_relay_encrypts_by_default() {
-        // strfry's LMDB carries subscribers' message graph, so
-        // at-rest encryption is justified even under warm-standby.
+        // strfry's LMDB carries subscribers' message graph.
         assert!(template_default_encrypts_volume(TemplateName::NostrRelay));
     }
 

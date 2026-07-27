@@ -1,9 +1,15 @@
 // Provider service: publishes the offer to Nostr, heartbeats, and serves spawn
 // / topup / status requests over NIP-17 DMs (and, when `http_bind_addr` is set,
 // over the HTTP+ngx_l402 interface in `provider_http`).
+//
+// The five loops `run` selects over live here (setup, offer, heartbeat, request
+// listener), in `orchestrator` (state machine, standby watchdog) and in
+// `cleanup` (expiry sweep).
 
+mod cleanup;
 mod config;
 mod handlers;
+mod orchestrator;
 mod persistence;
 mod standby;
 
@@ -25,23 +31,18 @@ use crate::cashu::{resolve_wallet_seed, CdkRedeemer, MintRedeemer};
 use crate::compute::{ComputeBackend, ContainerStatus};
 use crate::docker::DockerBackend;
 use crate::durable_workload::{
-    DurableWorkload, HeartbeatObservation, QuorumConfig, StateMachineEvent, WorkloadState,
-    WorkloadStateMachine,
+    DurableWorkload, HeartbeatObservation, QuorumConfig, WorkloadState, WorkloadStateMachine,
 };
 use crate::lxd::LxdBackend;
 use crate::nostr::{
     parse_private_message_content, CapacityInfo, ErrorResponseContent, HeartbeatContent,
-    LeaseRevocationContent, NostrRelaySubscriber, PrivateRequest, ProviderOfferContent,
-    RelayConfig,
+    NostrRelaySubscriber, PrivateRequest, ProviderOfferContent, RelayConfig,
 };
 use crate::proxmox::{ProxmoxBackend, ProxmoxClient};
 
 use handlers::{handle_spawn_request, handle_status_request, handle_topup_request, HandlerDeps};
+use orchestrator::handle_lease_revocation;
 use persistence::{load_standby_slots, load_workloads, persist_workloads};
-use standby::{
-    primary_is_silent, schedule_standby_promotion, STANDBY_HEARTBEAT_SILENCE_SECS,
-    STANDBY_WATCHDOG_INTERVAL_SECS,
-};
 
 pub struct ProviderService {
     config: ProviderConfig,
@@ -55,12 +56,11 @@ pub struct ProviderService {
     /// `Provisioning → Live → Suspect → Evicted/Respawning/Failed`.
     state_machine: Arc<Mutex<WorkloadStateMachine>>,
 
-    /// Heartbeat observations awaiting the next orchestrator tick. Filled by
-    /// the heartbeat loop (one per relay that ACK'd), drained per tick.
+    /// Heartbeat observations awaiting the next orchestrator tick: one per relay
+    /// that ACK'd, drained per tick.
     observation_buffer: Arc<Mutex<Vec<HeartbeatObservation>>>,
 
     /// Reserved warm-standby slots keyed by consumer-assigned `workload_id`.
-    /// Drained when a matching `LeaseRevocation` arrives or the slot expires.
     standby_slots: Arc<Mutex<HashMap<String, StandbySlot>>>,
 }
 
@@ -151,30 +151,6 @@ impl ProviderService {
     /// The backend is the authority on what exists: a container deleted while
     /// the provider was down would otherwise be tracked forever and
     /// re-announced as capacity that isn't there.
-    ///
-    /// Restored workloads re-enter the state machine as `Provisioning`, the
-    /// same path a fresh spawn takes.
-    /// Reload standby reservations. Unlike workloads there is nothing on the
-    /// backend to reconcile against — a slot is a promise, not a container —
-    /// so expired ones are simply dropped.
-    async fn restore_standby_slots(&self, now: u64) {
-        let persisted = load_standby_slots(&self.config.standby_state_path);
-        if persisted.is_empty() {
-            return;
-        }
-        let total = persisted.len();
-        let live: std::collections::HashMap<String, StandbySlot> = persisted
-            .into_iter()
-            .filter(|(_, slot)| slot.expires_at > now)
-            .collect();
-        info!(
-            "restored {} standby slot(s) ({} dropped as expired)",
-            live.len(),
-            total - live.len()
-        );
-        *self.standby_slots.lock().await = live;
-    }
-
     async fn restore_workloads(&self) {
         let persisted = load_workloads(&self.config.workload_state_path);
         if persisted.is_empty() {
@@ -209,6 +185,8 @@ impl ProviderService {
                 Ok(_) => {}
             }
 
+            // Restored workloads re-enter as `Provisioning`, the same path a
+            // fresh spawn takes.
             self.state_machine.lock().await.track(DurableWorkload {
                 workload_id: vmid,
                 provider_npub: self.nostr.get_service_public_key(),
@@ -238,13 +216,33 @@ impl ProviderService {
         persist_workloads(&lock, &self.config.workload_state_path);
     }
 
+    /// Unlike workloads there is nothing on the backend to reconcile against —
+    /// a slot is a promise, not a container — so expired ones are just dropped.
+    async fn restore_standby_slots(&self, now: u64) {
+        let persisted = load_standby_slots(&self.config.standby_state_path);
+        if persisted.is_empty() {
+            return;
+        }
+        let total = persisted.len();
+        let live: HashMap<String, StandbySlot> = persisted
+            .into_iter()
+            .filter(|(_, slot)| slot.expires_at > now)
+            .collect();
+        info!(
+            "restored {} standby slot(s) ({} dropped as expired)",
+            live.len(),
+            total - live.len()
+        );
+        *self.standby_slots.lock().await = live;
+    }
+
     pub fn get_npub(&self) -> String {
         self.nostr.get_service_public_key()
     }
 
-    /// Shared state for the HTTP+ngx_l402 interface: Arc-clones of this
-    /// service's own state, so both control planes see the same live data.
-    /// The Cashu redeemer is deliberately excluded — see `provider_http`.
+    /// Arc-clones of this service's own state, so both control planes see the
+    /// same live data. The Cashu redeemer is deliberately excluded — see
+    /// `provider_http`.
     pub(crate) fn http_state(&self) -> crate::provider_http::ProviderHttpState {
         crate::provider_http::ProviderHttpState {
             config: self.config.clone(),
@@ -270,8 +268,6 @@ impl ProviderService {
         self.restore_standby_slots(now).await;
         self.publish_offer().await?;
 
-        // `pending()` keeps the select! branch dormant when the HTTP interface
-        // is disabled.
         let http_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
             if let Some(ref addr) = self.config.http_bind_addr {
                 info!("HTTP+ngx_l402 interface enabled on {}", addr);
@@ -385,8 +381,8 @@ impl ProviderService {
 
         let (_event_id, accepting_relays) = self.nostr.publish_heartbeat(heartbeat).await?;
 
-        // One observation per relay that ACK'd. `now` serves as both timestamps
-        // because we just published; relays that didn't ACK get no observation.
+        // `now` serves as both timestamps because we just published; relays that
+        // didn't ACK get no observation.
         if !accepting_relays.is_empty() {
             let provider_npub = self.get_npub();
             let mut buf = self.observation_buffer.lock().await;
@@ -487,369 +483,4 @@ impl ProviderService {
 
         Ok(())
     }
-
-    /// Every 15s, drain the observation buffer, advance the state machine, and
-    /// act on the emitted events. 15s is well under `t1=120s` / `t2=300s` so
-    /// transitions are detected promptly without churning idle providers.
-    async fn orchestrator_loop(&self) -> Result<()> {
-        let interval = tokio::time::Duration::from_secs(15);
-        info!("Orchestrator loop starting (cadence: 15s)");
-
-        loop {
-            tokio::time::sleep(interval).await;
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-
-            let observations: Vec<HeartbeatObservation> = {
-                let mut buf = self.observation_buffer.lock().await;
-                std::mem::take(&mut *buf)
-            };
-
-            let events = {
-                let mut sm = self.state_machine.lock().await;
-                sm.tick(now, &observations)
-            };
-
-            for event in events {
-                self.handle_state_machine_event(event, now).await;
-            }
-        }
-    }
-
-    async fn handle_state_machine_event(&self, event: StateMachineEvent, now: u64) {
-        match event {
-            StateMachineEvent::EnteredLive { workload_id } => {
-                info!("Workload {} entered Live", workload_id);
-            }
-            StateMachineEvent::EnteredSuspect { workload_id } => {
-                warn!(
-                    "Workload {} entered Suspect (heartbeat quorum lost)",
-                    workload_id
-                );
-            }
-            StateMachineEvent::Evicted {
-                workload_id,
-                reason,
-            } => {
-                error!("Workload {} evicted: {}", workload_id, reason);
-            }
-            StateMachineEvent::PublishLeaseRevocation {
-                workload_id,
-                standby_providers,
-            } => {
-                // The vmid-derived fallback is unreachable for a real
-                // warm-standby workload (the spawn handler requires the UUID);
-                // it just keeps this call total.
-                let (consumer_workload_id, state_uri) = {
-                    let lock = self.active_workloads.lock().await;
-                    let entry = lock.get(&workload_id);
-                    let cid = entry
-                        .and_then(|w| w.consumer_workload_id.clone())
-                        .unwrap_or_else(|| format!("vmid-{}", workload_id));
-                    (cid, entry.and_then(|w| w.state_uri.clone()))
-                };
-                let revocation = LeaseRevocationContent {
-                    workload_id: consumer_workload_id.clone(),
-                    primary_provider_npub: self.get_npub(),
-                    standby_providers: standby_providers.clone(),
-                    reason: "heartbeat-quorum-lost-past-t2".to_string(),
-                    revoked_at: now,
-                    state_uri,
-                    version: crate::nostr::SCHEMA_VERSION,
-                };
-                match self.nostr.publish_lease_revocation(revocation).await {
-                    Ok(event_id) => info!(
-                        "Published lease revocation for workload {} (vmid {}) to {} standby(s): {}",
-                        consumer_workload_id,
-                        workload_id,
-                        standby_providers.len(),
-                        event_id
-                    ),
-                    Err(e) => error!(
-                        "Failed to publish lease revocation for workload {}: {}",
-                        workload_id, e
-                    ),
-                }
-            }
-            StateMachineEvent::AttemptRespawn {
-                workload_id,
-                attempt,
-            } => {
-                info!(
-                    "Attempting respawn of workload {} (attempt {})",
-                    workload_id, attempt
-                );
-                // Respawning needs the original ContainerConfig, which
-                // `WorkloadInfo` does not retain. Record the failure so the
-                // state machine retries or fails out deterministically instead
-                // of hanging in Respawning.
-                let mut sm = self.state_machine.lock().await;
-                sm.notify_respawn_failed(
-                    workload_id,
-                    "respawn handler not yet implemented (follow-up)",
-                );
-            }
-            StateMachineEvent::Failed {
-                workload_id,
-                reason,
-            } => {
-                error!("Workload {} marked Failed: {}", workload_id, reason);
-
-                // Once the workload leaves active_workloads, cleanup_loop can
-                // never see it again — anything left behind strands the
-                // container and burns its vmid for good. So only reclaim a
-                // container that already terminated itself; a still-running box
-                // belongs to a consumer who paid through `expires_at`.
-                match self.backend.get_container_status(workload_id).await {
-                    Ok(ContainerStatus::Stopped) => {
-                        if let Err(e) = self.backend.delete_container(workload_id).await {
-                            warn!(
-                                "failed to delete self-terminated workload {}: {}",
-                                workload_id, e
-                            );
-                        }
-                    }
-                    Ok(ContainerStatus::Absent) => {}
-                    Ok(ContainerStatus::Running) => {
-                        warn!(
-                            "workload {} failed but its container is still running; \
-                             leaving it to the expiry sweep",
-                            workload_id
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "could not determine container status for failed workload {}: {} \
-                             — leaving it to the expiry sweep",
-                            workload_id, e
-                        );
-                        return;
-                    }
-                }
-
-                self.state_machine.lock().await.untrack(workload_id);
-                let mut wl = self.active_workloads.lock().await;
-                wl.remove(&workload_id);
-                persist_workloads(&wl, &self.config.workload_state_path);
-            }
-        }
-    }
-
-    async fn cleanup_loop(&self) -> Result<()> {
-        let interval = tokio::time::Duration::from_secs(30);
-
-        loop {
-            tokio::time::sleep(interval).await;
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-
-            self.reap_expired_workloads(now).await;
-            self.reap_expired_standby_slots(now).await;
-        }
-    }
-
-    async fn reap_expired_workloads(&self, now: u64) {
-        let mut workloads = self.active_workloads.lock().await;
-        let expired: Vec<u32> = workloads
-            .iter()
-            .filter(|(_, w)| w.expires_at <= now)
-            .map(|(vmid, _)| *vmid)
-            .collect();
-
-        for vmid in expired {
-            info!("Cleaning up expired workload: {}", vmid);
-
-            if workloads.remove(&vmid).is_none() {
-                continue;
-            }
-
-            // Delete unconditionally: the workload is already out of the map, so
-            // a failed stop that skipped the delete would leak the container and
-            // its vmid forever, with no retry. `delete --force` handles running
-            // and stopped alike.
-            if let Err(e) = self.backend.stop_container(vmid).await {
-                warn!("stop failed for {} ({}), deleting anyway", vmid, e);
-            }
-            let result = self.backend.delete_container(vmid).await;
-
-            // Untrack regardless of backend success: the lease is over, and the
-            // orchestrator should not keep driving transitions on it.
-            self.state_machine.lock().await.untrack(vmid);
-
-            match result {
-                Ok(_) => {
-                    info!("Cleaned up workload {}", vmid);
-                    self.stats.lock().await.total_jobs_completed += 1;
-                }
-                Err(e) => error!("Failed to cleanup workload {}: {}", vmid, e),
-            }
-
-            // Persist per workload, not once per sweep: a crash midway through
-            // would otherwise resurrect entries whose containers are gone.
-            persist_workloads(&workloads, &self.config.workload_state_path);
-        }
-    }
-
-    /// Drop slots whose lease window passed without a failover. The watchdog
-    /// already skips past-expiry slots, but without this the map grows
-    /// unbounded on a long-running provider.
-    async fn reap_expired_standby_slots(&self, now: u64) {
-        let mut slots = self.standby_slots.lock().await;
-        let expired: Vec<String> = slots
-            .iter()
-            .filter(|(_, slot)| slot.expires_at <= now)
-            .map(|(workload_id, _)| workload_id.clone())
-            .collect();
-        let any_expired = !expired.is_empty();
-        for workload_id in expired {
-            if let Some(slot) = slots.remove(&workload_id) {
-                info!(
-                    "Expiring standby slot for workload {} (index {}/{}, primary {}, expired at {})",
-                    workload_id,
-                    slot.standby_index,
-                    slot.standby_count,
-                    slot.primary_npub,
-                    slot.expires_at
-                );
-            }
-        }
-        if !any_expired {
-            return;
-        }
-        persistence::persist_standby_slots(&slots, &self.config.standby_state_path);
-    }
-
-    /// Promote ourselves when a primary stops heartbeating.
-    ///
-    /// The `LeaseRevocation` listener only covers *graceful* failover — the
-    /// primary still has network access and chooses to give up the lease. It
-    /// does not cover a hard crash (process death, host offline, kernel panic),
-    /// where no revocation is ever published. Without this loop, warm standby
-    /// would only protect against the workload dying, not the provider hosting
-    /// it, which is the more common failure.
-    ///
-    /// At most one promotion happens per workload: within this process because
-    /// both callers funnel through `schedule_standby_promotion`, which removes
-    /// the slot atomically; across processes because the winner publishes a
-    /// promotion announcement that later peers check for.
-    async fn standby_watchdog_loop(&self) -> Result<()> {
-        let interval = tokio::time::Duration::from_secs(STANDBY_WATCHDOG_INTERVAL_SECS);
-        info!(
-            "Standby watchdog loop starting (cadence: {}s, silence threshold: {}s)",
-            STANDBY_WATCHDOG_INTERVAL_SECS, STANDBY_HEARTBEAT_SILENCE_SECS
-        );
-
-        loop {
-            tokio::time::sleep(interval).await;
-
-            let slots: Vec<StandbySlot> = {
-                let lock = self.standby_slots.lock().await;
-                lock.values().cloned().collect()
-            };
-            if slots.is_empty() {
-                continue;
-            }
-
-            // Many slots may share one primary; query each npub once.
-            let primary_npubs: Vec<String> = slots
-                .iter()
-                .map(|s| s.primary_npub.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            let heartbeats = match self.nostr.get_latest_heartbeats_multi(primary_npubs).await {
-                Ok(hb) => hb,
-                Err(e) => {
-                    warn!(
-                        "standby watchdog: heartbeat batch query failed: {}; \
-                         skipping this tick (will retry next interval)",
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-
-            for slot in slots {
-                // With no heartbeat observed yet, fall back to the reservation
-                // timestamp so a fresh slot gets a full silence window of grace
-                // instead of promoting over a healthy primary on the first tick.
-                let silence_baseline = match heartbeats.get(&slot.primary_npub) {
-                    Some(hb) if hb.timestamp != 0 => hb.timestamp,
-                    _ => slot.created_at,
-                };
-                if !primary_is_silent(now, silence_baseline, STANDBY_HEARTBEAT_SILENCE_SECS) {
-                    continue;
-                }
-                warn!(
-                    "Primary {} silent for {}s on slot workload_id={} (threshold {}s); \
-                     triggering standby promotion",
-                    slot.primary_npub,
-                    now.saturating_sub(silence_baseline),
-                    slot.workload_id,
-                    STANDBY_HEARTBEAT_SILENCE_SECS
-                );
-                schedule_standby_promotion(
-                    self.backend.clone(),
-                    self.active_workloads.clone(),
-                    self.state_machine.clone(),
-                    self.standby_slots.clone(),
-                    self.nostr.clone(),
-                    slot,
-                );
-            }
-        }
-    }
-}
-
-/// Schedule promotion if the revocation matches one of our reserved slots.
-async fn handle_lease_revocation(deps: &HandlerDeps, revocation: LeaseRevocationContent) {
-    info!(
-        "Lease revocation observed: workload_id={}, primary={}, reason={}, state_uri={:?}, standbys={:?}",
-        revocation.workload_id,
-        revocation.primary_provider_npub,
-        revocation.reason,
-        revocation.state_uri,
-        revocation.standby_providers,
-    );
-
-    let slot = deps
-        .standby_slots
-        .lock()
-        .await
-        .get(&revocation.workload_id)
-        .cloned();
-    let Some(slot) = slot else {
-        debug!(
-            "Revocation workload_id={} did not match any local standby slot; ignoring",
-            revocation.workload_id
-        );
-        return;
-    };
-
-    if slot.primary_npub != revocation.primary_provider_npub {
-        warn!(
-            "Revocation primary_npub ({}) does not match slot's primary ({}); ignoring",
-            revocation.primary_provider_npub, slot.primary_npub
-        );
-        return;
-    }
-
-    schedule_standby_promotion(
-        deps.backend.clone(),
-        deps.workloads.clone(),
-        deps.state_machine.clone(),
-        deps.standby_slots.clone(),
-        deps.nostr.clone(),
-        slot,
-    );
 }

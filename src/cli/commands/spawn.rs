@@ -19,8 +19,7 @@ use paygress::nostr::{
     VolumeEncryption,
 };
 
-/// Decode a Nostr secret key (`nsec1...` bech32 or 64-hex) to its raw
-/// 32-byte form, for the volume-key KDF.
+/// `nsec1...` bech32 or 64-hex to raw bytes, for the volume-key KDF.
 fn nsec_to_bytes(nostr_key: &str) -> Result<[u8; 32]> {
     use std::str::FromStr;
     let secret = nostr_sdk::SecretKey::from_str(nostr_key)
@@ -69,8 +68,7 @@ pub struct SpawnArgs {
     #[arg(long)]
     pub relays: Option<String>,
 
-    /// Template slug; the provider resolves image/ports/env from its
-    /// own registry and ignores --image. Normally set by `deploy`.
+    /// Template slug; the provider resolves image/ports/env and ignores --image
     #[arg(long, hide = true)]
     pub template_slug: Option<String>,
 
@@ -82,20 +80,15 @@ pub struct SpawnArgs {
     #[arg(long)]
     pub standby: Option<String>,
 
-    /// Primary provider's ID (warm-standby only). Tells each receiving
-    /// provider which one of them is the primary.
+    /// Primary provider's ID (warm-standby only)
     #[arg(long)]
     pub primary_id: Option<String>,
 
-    /// Consumer-assigned workload identifier (warm-standby only). The
-    /// same value must be passed when spawning against the primary and
-    /// each standby — it ties the N+1 spawns into one logical workload.
+    /// Shared workload identifier, passed to the primary and each standby
     #[arg(long)]
     pub workload_id: Option<String>,
 
-    /// Encrypt the workload's persistent data volume with a key derived
-    /// from your nsec + workload-id. On by default for templates that
-    /// hold persistent state.
+    /// Encrypt the persistent data volume (key derived from nsec + workload-id)
     #[arg(long, conflicts_with = "no_encrypt_volume")]
     pub encrypt_volume: bool,
 
@@ -103,15 +96,13 @@ pub struct SpawnArgs {
     #[arg(long, conflicts_with = "encrypt_volume")]
     pub no_encrypt_volume: bool,
 
-    /// Minimum isolation tier: shared-kernel, dedicated-host, or
-    /// attested-research-tier. Verified before the token is sent.
+    /// Minimum isolation tier, verified before the token is sent
     #[arg(long, value_parser = parse_isolation_level)]
     pub isolation_level: Option<IsolationLevel>,
 }
 
-/// Translate the `--replication` + `--standby` flags into the
-/// wire-format `Option<ReplicationMode>`. `Ok(None)` for the default so
-/// the wire stays empty and old providers don't see a redundant field.
+/// `Ok(None)` for the default, so the wire field stays absent for
+/// providers that predate it.
 pub fn parse_replication_arg(
     mode: &str,
     standby_csv: Option<&str>,
@@ -242,9 +233,7 @@ async fn execute_http_spawn(
     Ok(())
 }
 
-/// Typed outcome of a single Nostr spawn round-trip, so the
-/// pretty-printer, the batch coordinator, and the MCP server can share
-/// one transport path.
+/// Shared by the pretty-printer, the batch coordinator, and MCP.
 #[derive(Debug, Clone)]
 pub enum NostrSpawnOutcome {
     /// Provider's heartbeat says it's offline; no token spent.
@@ -258,7 +247,6 @@ pub enum NostrSpawnOutcome {
     Timeout,
 }
 
-/// Everything a spawn request carries besides the transport settings.
 #[derive(Debug, Clone, Default)]
 pub struct NostrSpawnParams {
     pub tier: String,
@@ -274,7 +262,6 @@ pub struct NostrSpawnParams {
     pub isolation_level: Option<IsolationLevel>,
 }
 
-/// Dispatch a single Nostr spawn request and wait for the response.
 /// No stdout I/O — pure round-trip plus structured outcome.
 pub async fn nostr_spawn_round_trip(
     provider_npub: &str,
@@ -294,8 +281,8 @@ pub async fn nostr_spawn_round_trip(
         .await?
         .ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
 
-    // Pre-checks below all run before the token is sent, so a mismatch
-    // fails fast and never spends it.
+    // Every check below runs before the token is sent, so a mismatch
+    // never spends it.
     if !provider.specs.iter().any(|s| s.id == params.tier) {
         anyhow::bail!("Tier '{}' not available on this provider", params.tier);
     }
@@ -377,13 +364,9 @@ pub async fn nostr_spawn_round_trip(
     }
 }
 
-/// Decide whether to encrypt the data volume and, if so, derive the key.
-///
-/// Precedence: `--no-encrypt-volume` < `--encrypt-volume` < the
-/// template's own default. Custom-image spawns (no slug) stay off by
-/// default so existing scripts aren't surprised. Returns the resolved
-/// workload id alongside the key, since encryption mints one when the
-/// caller didn't supply it.
+/// Precedence: `--no-encrypt-volume` beats `--encrypt-volume` beats the
+/// template default; custom-image spawns (no slug) stay off. Returns the
+/// resolved workload id, which encryption mints when unset.
 fn resolve_volume_encryption(
     encrypt_volume: bool,
     no_encrypt_volume: bool,
@@ -456,8 +439,7 @@ async fn execute_nostr_spawn(
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     let replication = parse_replication_arg(&replication, standby.as_deref())?;
-    // Warm-standby needs both ids so every receiving provider can
-    // self-determine its role and share one stable workload id.
+    // Both ids let each receiving provider determine its own role.
     if matches!(replication, Some(ReplicationMode::WarmStandby { .. })) {
         if primary_id.is_none() {
             anyhow::bail!("--replication warm-standby requires --primary-id <primary provider ID>");

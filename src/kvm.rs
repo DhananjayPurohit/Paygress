@@ -1,8 +1,6 @@
-// KVM/qemu compute backend: one qemu VM per workload, giving each
-// tenant its own kernel. Corresponds to `IsolationLevel::
-// DedicatedHost` — it closes container-escape and co-tenant paths,
-// but not a host operator with hypervisor root (that needs SEV-SNP /
-// TDX, the attested tier).
+// KVM/qemu compute backend: one qemu VM per workload, giving each tenant its
+// own kernel. `IsolationLevel::DedicatedHost` — closes container-escape and
+// co-tenant paths, but not a host operator with hypervisor root.
 //
 // Storage layout under `KvmConfig::vm_root`:
 //   base/<image>.img   read-only cloud image shared by every VM
@@ -10,10 +8,6 @@
 //   <id>/seed.iso      cloud-init seed
 //   <id>/qemu.pid      qemu daemon pidfile
 //   <id>/serial.log    guest serial console
-//
-// v1 scope: a vanilla Ubuntu VM reachable over SSH. Template images,
-// template ports beyond SSH, persistent data volumes and orphan
-// sweeps on provider crash are not implemented here.
 
 use std::path::PathBuf;
 
@@ -32,9 +26,8 @@ const DEFAULT_BASE_IMAGE_FILE: &str = "jammy-server-cloudimg-amd64.img";
 
 #[derive(Debug, Clone)]
 pub struct KvmConfig {
-    /// Read-only base cloud image; per-VM qcow2 overlays sit on top,
-    /// so every workload shares one physical base. Downloaded on
-    /// first spawn if absent.
+    /// Read-only base cloud image; per-VM qcow2 overlays sit on top. Downloaded
+    /// on first spawn if absent.
     pub base_image_path: PathBuf,
     pub base_image_url: String,
     pub vm_root: PathBuf,
@@ -81,9 +74,8 @@ impl KvmBackend {
         self.vm_dir(id).join("serial.log")
     }
 
-    /// Verify qemu + KVM support. Called at provider startup so
-    /// "this host doesn't support KVM" surfaces before a consumer
-    /// has paid for a spawn.
+    /// Called at provider startup so "this host doesn't support KVM" surfaces
+    /// before a consumer has paid for a spawn.
     pub async fn check_kvm_available() -> Result<String> {
         if !PathBuf::from("/dev/kvm").exists() {
             anyhow::bail!(
@@ -98,7 +90,6 @@ impl KvmBackend {
         Ok(version.lines().next().unwrap_or("").to_string())
     }
 
-    /// Idempotent: no-ops once the base image is on disk.
     async fn ensure_base_image(&self) -> Result<()> {
         if self.config.base_image_path.exists() {
             return Ok(());
@@ -130,9 +121,8 @@ impl KvmBackend {
         Ok(())
     }
 
-    /// Cloud-init userdata. Password auth rather than key auth: the
-    /// consumer already handed this provider the password in the
-    /// spawn DM, and the VM is single-tenant.
+    /// Password auth rather than key auth: the consumer already has the
+    /// password from the spawn DM, and the VM is single-tenant.
     fn user_data(password: &str) -> String {
         format!(
             "#cloud-config\n\
@@ -154,8 +144,8 @@ impl KvmBackend {
         )
     }
 
-    /// Build the cloud-init seed ISO. `genisoimage` rather than
-    /// `cloud-localds` — the latter isn't packaged everywhere.
+    /// `genisoimage` rather than `cloud-localds`: the latter isn't packaged
+    /// everywhere.
     async fn make_seed_iso(&self, id: u32, password: &str) -> Result<()> {
         let dir = self.vm_dir(id);
         let user_path = dir.join("user-data");
@@ -183,8 +173,7 @@ impl KvmBackend {
         Ok(())
     }
 
-    /// Build the qemu-system-x86_64 argv. Pure — the caller must
-    /// have created the seed ISO and qcow2 already.
+    /// Pure: the caller must have created the seed ISO and qcow2 already.
     pub fn qemu_argv(&self, config: &ContainerConfig) -> Vec<String> {
         let id = config.id;
         let cores = config.cpu_cores.max(1);
@@ -202,7 +191,7 @@ impl KvmBackend {
 
         vec![
             "-enable-kvm".to_string(),
-            // Pass through the physical CPU's features (AES-NI, AVX).
+            // Pass through the host CPU's features (AES-NI, AVX).
             "-cpu".to_string(),
             "host".to_string(),
             "-machine".to_string(),
@@ -225,8 +214,8 @@ impl KvmBackend {
             netdev,
             "-device".to_string(),
             "virtio-net-pci,netdev=net0".to_string(),
-            // Daemonize + pidfile so the lifecycle is manageable by
-            // pid after create_container returns.
+            // Pidfile so the lifecycle is manageable by pid after
+            // create_container returns.
             "-daemonize".to_string(),
             "-pidfile".to_string(),
             self.pidfile_path(id).to_string_lossy().to_string(),
@@ -237,8 +226,7 @@ impl KvmBackend {
     }
 
     async fn create_overlay_disk(&self, id: u32, size_gb: u32) -> Result<()> {
-        // -b/-F make the new qcow2 a copy-on-write overlay of the
-        // shared base image.
+        // -b/-F make the new qcow2 a copy-on-write overlay of the base image.
         run_checked(
             "qemu-img",
             &[
@@ -326,11 +314,9 @@ impl ComputeBackend for KvmBackend {
         Ok(())
     }
 
-    /// A dead qemu leaves its directory (and therefore its id, which
-    /// `find_available_id` derives from the directory listing) behind.
-    /// Without this the workload reports `Running` forever and the id
-    /// is never reclaimed, so liveness is read from the process, not
-    /// from the directory existing.
+    /// Liveness is read from the process, not from the directory: a dead qemu
+    /// leaves its directory behind, and `find_available_id` derives ids from
+    /// that listing, so the id would never be reclaimed.
     async fn get_container_status(&self, id: u32) -> Result<ContainerStatus> {
         if !self.vm_dir(id).exists() {
             return Ok(ContainerStatus::Absent);
@@ -338,8 +324,7 @@ impl ComputeBackend for KvmBackend {
         let Some(pid) = self.read_pid(id).await else {
             return Ok(ContainerStatus::Stopped);
         };
-        // `/proc/<pid>` is the cheapest liveness check on the Linux
-        // hosts providers run on, and needs no signal permissions.
+        // Cheapest liveness check that needs no signal permissions.
         if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
             Ok(ContainerStatus::Running)
         } else {
@@ -388,8 +373,8 @@ impl ComputeBackend for KvmBackend {
     }
 
     async fn get_container_ip(&self, _id: u32) -> Result<Option<String>> {
-        // User-mode networking NATs everything; the guest is reached
-        // via the host IP plus the SSH hostfwd.
+        // User-mode networking NATs everything; the guest is reached via the
+        // host IP plus the SSH hostfwd.
         Ok(None)
     }
 }

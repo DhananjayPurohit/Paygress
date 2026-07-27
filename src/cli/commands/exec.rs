@@ -1,6 +1,4 @@
-// `paygress-cli exec` — run a shell command inside a spawned
-// agent-sandbox workload via its baked-in HTTP exec server. Shares
-// `cli::exec_client` with the MCP `run_command` tool so both behave
+// Shares `cli::exec_client` with the MCP `run_command` tool so both behave
 // identically.
 
 use std::time::Duration;
@@ -47,8 +45,7 @@ pub struct ExecArgs {
 }
 
 pub async fn execute(args: ExecArgs, _verbose: bool) -> Result<()> {
-    // Give the server 5s of headroom so it can report `timed_out: true`
-    // before our transport timeout fires.
+    // 5s of headroom so the server can report `timed_out: true` first.
     let total_timeout = Duration::from_secs(args.timeout_secs.saturating_add(5));
     let target = ExecTarget {
         host: &args.host,

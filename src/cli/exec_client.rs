@@ -1,12 +1,5 @@
-// Typed HTTP client for the agent-sandbox exec server
-// (`images/agent-sandbox/server.py`).
-//
-// Wire format mirrors the server's:
-//   POST http://<host>:<port>/exec
-//   Authorization: Basic <base64(user:pass)>
-//   Body: {"command": "<bash command>", "timeout_secs": 60, "working_dir": "/workspace"}
-//   200 OK: {"stdout": "...", "stderr": "...", "exit_code": 0,
-//            "duration_ms": 12, "timed_out": false}
+// Typed client for `POST /exec` on the agent-sandbox exec server
+// (`images/agent-sandbox/server.py`), authenticated with HTTP Basic.
 
 use std::time::Duration;
 
@@ -14,7 +7,6 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// Where to reach an exec server, and how to authenticate to it.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecTarget<'a> {
     pub host: &'a str,
@@ -32,8 +24,7 @@ pub struct ExecRequest {
     pub working_dir: Option<String>,
 }
 
-/// Server response from POST /exec. Stable schema — agents and the
-/// MCP `run_command` tool depend on it.
+/// Stable schema — agents and the MCP `run_command` tool depend on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecResponse {
     pub stdout: String,
@@ -43,8 +34,8 @@ pub struct ExecResponse {
     pub timed_out: bool,
 }
 
-/// Accept either a bare host or a full base URL so a pasted URL
-/// doesn't end up double-prefixed or double-ported.
+/// Accepts a bare host or a full URL without double-prefixing or
+/// double-porting it.
 fn normalize_endpoint(host: &str, port: u16) -> String {
     let h = host.trim();
     let (scheme, rest) = if let Some(r) = h.strip_prefix("https://") {
@@ -64,17 +55,15 @@ fn normalize_endpoint(host: &str, port: u16) -> String {
     }
 }
 
-/// HTTP Basic auth header value. Public so test harnesses can
-/// build the same value the server expects.
+/// Public so test harnesses can build the value the server expects.
 pub fn basic_auth(user: &str, pass: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
     format!("Basic {}", encoded)
 }
 
-/// POST /exec on the agent-sandbox HTTP server. `total_timeout` covers
-/// the full request including the server-side command runtime — set it
-/// slightly above `request.timeout_secs` so the server can return a
-/// structured `timed_out: true` before our transport gives up.
+/// Set `total_timeout` slightly above `request.timeout_secs` so the
+/// server can return a structured `timed_out: true` before the
+/// transport gives up.
 pub async fn call_exec(
     target: ExecTarget<'_>,
     request: &ExecRequest,
@@ -145,8 +134,7 @@ mod tests {
 
     #[test]
     fn basic_auth_matches_servers_python_format() {
-        // Pin the format: a python-side change in server.py must also
-        // change this side. Both base64-encode "user:pass".
+        // A change in server.py must change this side too.
         assert_eq!(basic_auth("root", "hunter2"), "Basic cm9vdDpodW50ZXIy");
     }
 

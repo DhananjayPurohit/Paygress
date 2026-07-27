@@ -91,13 +91,9 @@ struct TaskResponse {
 }
 
 impl ProxmoxClient {
-    /// * `api_url` — e.g. `https://192.168.1.100:8006/api2/json`
-    /// * `token_id` — e.g. `root@pam!paygress`
-    /// * `node` — Proxmox node name, e.g. `pve`
-    /// * `accept_invalid_certs` — disables TLS verification. Proxmox
-    ///   ships self-signed certs, so operators often need this, but it
-    ///   is opt-in: silently trusting any certificate would expose the
-    ///   API token to anyone on the path.
+    /// `accept_invalid_certs` disables TLS verification. Proxmox ships
+    /// self-signed certs, so operators often need it, but it stays opt-in:
+    /// trusting any certificate exposes the API token to anyone on the path.
     pub fn new(
         api_url: &str,
         token_id: &str,
@@ -351,8 +347,7 @@ impl ComputeBackend for ProxmoxBackend {
 
     async fn create_container(&self, config: &ContainerConfig) -> Result<String> {
         // `config.image` is a Docker-style reference; Proxmox needs a
-        // `local:vztmpl/...` path, so the operator-configured
-        // template wins.
+        // `local:vztmpl/...` path, so the operator-configured template wins.
         let lxc = LxcConfig {
             vmid: config.id,
             hostname: config.name.clone(),

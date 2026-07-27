@@ -1,12 +1,5 @@
-//! Integration tests for the Blossom client (Unit 6 of the
-//! 12-month plan,
-//! docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
-//!
-//! Crypto round-trip tests live as inline `#[cfg(test)] mod tests`
-//! in `src/blossom_crypto.rs` (no I/O needed). This file uses
-//! `wiremock` to stub the Blossom HTTP surface and exercise the
-//! client end-to-end against a local server, including the auth
-//! header generation that real Blossom servers verify.
+//! Exercises the Blossom client against a `wiremock` stub, including the auth
+//! header real servers verify. Crypto round-trips live in `src/blossom_crypto.rs`.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use nostr_sdk::Keys;
@@ -22,11 +15,15 @@ fn key() -> EncryptionKey {
     [0xab; 32]
 }
 
+async fn stub_server() -> (MockServer, BlossomClient) {
+    let server = MockServer::start().await;
+    let client = BlossomClient::new(server.uri(), Keys::generate());
+    (server, client)
+}
+
 #[tokio::test]
 async fn auth_header_carries_required_tags_and_signature() {
-    let server = MockServer::start().await;
-    let keys = Keys::generate();
-    let client = BlossomClient::new(server.uri(), keys);
+    let (_server, client) = stub_server().await;
 
     let header = client
         .build_auth_header(BlossomOp::Upload, "abc123")
@@ -69,18 +66,13 @@ async fn auth_header_carries_required_tags_and_signature() {
 
 #[tokio::test]
 async fn put_then_get_round_trips_through_blossom_stub() {
-    let server = MockServer::start().await;
-    let keys = Keys::generate();
-    let client = BlossomClient::new(server.uri(), keys);
+    let (server, client) = stub_server().await;
 
-    // Encrypt a payload before uploading; the server should never
-    // see plaintext.
+    // The server must never see plaintext.
     let plaintext = b"a checkpoint blob worth protecting".to_vec();
     let ciphertext = encrypt_for_upload(&plaintext, &key()).expect("encrypt");
     let expected_hash = sha256_hex(&ciphertext);
 
-    // Stub /upload: requires Authorization header, returns the
-    // server's response shape.
     let upload_response = serde_json::json!({
         "url": format!("{}/{}", server.uri(), expected_hash),
         "sha256": expected_hash,
@@ -102,7 +94,6 @@ async fn put_then_get_round_trips_through_blossom_stub() {
     assert_eq!(resp.sha256, expected_hash);
     assert_eq!(resp.size, ciphertext.len() as u64);
 
-    // Stub GET /<sha256>: returns the ciphertext bytes.
     let ciphertext_for_response = ciphertext.clone();
     Mock::given(method("GET"))
         .and(path_regex(r"^/[0-9a-f]{64}$"))
@@ -119,9 +110,7 @@ async fn put_then_get_round_trips_through_blossom_stub() {
 
 #[tokio::test]
 async fn upload_5xx_is_surfaced_as_error() {
-    let server = MockServer::start().await;
-    let keys = Keys::generate();
-    let client = BlossomClient::new(server.uri(), keys);
+    let (server, client) = stub_server().await;
 
     Mock::given(method("PUT"))
         .and(path("/upload"))
@@ -143,9 +132,7 @@ async fn upload_5xx_is_surfaced_as_error() {
 
 #[tokio::test]
 async fn delete_uses_auth_and_targets_hash_path() {
-    let server = MockServer::start().await;
-    let keys = Keys::generate();
-    let client = BlossomClient::new(server.uri(), keys);
+    let (server, client) = stub_server().await;
 
     let hash = "0".repeat(64);
 

@@ -9,8 +9,7 @@ pub struct DiscoveryClient {
     nostr: NostrRelaySubscriber,
 }
 
-/// A provider whose most recent heartbeat is older than this is
-/// reported offline.
+/// A provider whose most recent heartbeat is older than this reports offline.
 const ONLINE_HEARTBEAT_WINDOW_SECS: u64 = 120;
 
 impl DiscoveryClient {
@@ -50,7 +49,6 @@ impl DiscoveryClient {
 
         let mut providers = Vec::new();
 
-        // One batched query rather than a round-trip per provider.
         let provider_npubs: Vec<String> = offers.iter().map(|o| o.provider_npub.clone()).collect();
         let heartbeats = self
             .nostr
@@ -71,7 +69,7 @@ impl DiscoveryClient {
             };
 
             let provider = ProviderInfo {
-                npub: offer.provider_npub.clone(),
+                npub: offer.provider_npub,
                 hostname: offer.hostname,
                 location: offer.location,
                 capabilities: offer.capabilities,
@@ -84,33 +82,11 @@ impl DiscoveryClient {
                 isolation_level: offer.isolation_level,
             };
 
-            // Apply filters
-            if let Some(ref f) = filter {
-                if let Some(ref cap) = f.capability {
-                    if !provider.capabilities.contains(cap) {
-                        continue;
-                    }
-                }
-                if let Some(min_uptime) = f.min_uptime {
-                    if provider.uptime_percent < min_uptime {
-                        continue;
-                    }
-                }
-                if let Some(min_mem) = f.min_memory_mb {
-                    if !provider.specs.iter().any(|s| s.memory_mb >= min_mem) {
-                        continue;
-                    }
-                }
-                if let Some(min_cpu) = f.min_cpu {
-                    if !provider.specs.iter().any(|s| s.cpu_millicores >= min_cpu) {
-                        continue;
-                    }
-                }
-                if let Some(min_iso) = f.isolation_level {
-                    if !provider.isolation_level.meets(min_iso) {
-                        continue;
-                    }
-                }
+            if filter
+                .as_ref()
+                .is_some_and(|f| !matches_filter(&provider, f))
+            {
+                continue;
             }
 
             providers.push(provider);
@@ -120,8 +96,8 @@ impl DiscoveryClient {
         Ok(providers)
     }
 
-    /// Look up a provider by ID or friendly name, so every
-    /// `--provider` flag accepts either form. `input` is tried as:
+    /// Look up a provider by ID or friendly name, so every `--provider` flag
+    /// accepts either form. `input` is tried as:
     ///
     /// 1. an exact ID — full hex pubkey or `npub1…` bech32;
     /// 2. an unambiguous ID prefix of ≥ 8 hex chars;
@@ -129,7 +105,6 @@ impl DiscoveryClient {
     pub async fn get_provider(&self, input: &str) -> Result<Option<ProviderInfo>> {
         let providers = self.list_providers(None).await?;
 
-        // Normalize to hex; handles both raw hex and npub1… bech32.
         let lookup_hex = match nostr_sdk::PublicKey::parse(input) {
             Ok(pk) => pk.to_hex(),
             Err(_) => input.to_string(),
@@ -160,8 +135,6 @@ impl DiscoveryClient {
             0 => Ok(None),
             1 => Ok(Some(name_matches[0].clone())),
             _ => {
-                // Possible when the same Nostr key was bootstrapped
-                // on two machines. Make the user disambiguate.
                 let ids: Vec<String> = name_matches
                     .iter()
                     // npub comes off the wire; slice by chars so a short
@@ -193,13 +166,12 @@ impl DiscoveryClient {
         self.nostr.calculate_uptime(&full_npub, days).await
     }
 
-    /// Underlying Nostr client, for sending messages.
     pub fn nostr(&self) -> &NostrRelaySubscriber {
         &self.nostr
     }
 
-    /// Sort in place by `price`, `uptime`, `capacity` or `jobs`.
-    /// Any other value leaves the order untouched.
+    /// Sort in place by `price`, `uptime`, `capacity` or `jobs`. Any other
+    /// value leaves the order untouched.
     pub fn sort_providers(providers: &mut [ProviderInfo], sort_by: &str) {
         match sort_by {
             "price" => {
@@ -243,8 +215,8 @@ impl DiscoveryClient {
 
         let mut output = String::new();
 
-        // Column widths: ID(16) | PROVIDER(18) | LOCATION(10) | UPTIME(8) | CHEAPEST(8) | TIER(10) | MINTS(36) | ONLINE(6)
-        // Inner = 112, separators = 9×3 = 27 → 139 + 2 borders = 141
+        // ID(16) PROVIDER(18) LOCATION(10) UPTIME(8) CHEAPEST(8) TIER(10)
+        // MINTS(36) ONLINE(6) → inner 112 + 9×3 separators + 2 borders = 141.
         writeln!(&mut output, "┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐").unwrap();
         writeln!(
             &mut output,
@@ -402,6 +374,33 @@ impl DiscoveryClient {
     }
 }
 
+fn matches_filter(p: &ProviderInfo, f: &ProviderFilter) -> bool {
+    if let Some(ref cap) = f.capability {
+        if !p.capabilities.contains(cap) {
+            return false;
+        }
+    }
+    if f.min_uptime.is_some_and(|min| p.uptime_percent < min) {
+        return false;
+    }
+    if let Some(min_mem) = f.min_memory_mb {
+        if !p.specs.iter().any(|s| s.memory_mb >= min_mem) {
+            return false;
+        }
+    }
+    if let Some(min_cpu) = f.min_cpu {
+        if !p.specs.iter().any(|s| s.cpu_millicores >= min_cpu) {
+            return false;
+        }
+    }
+    if f.isolation_level
+        .is_some_and(|min| !p.isolation_level.meets(min))
+    {
+        return false;
+    }
+    true
+}
+
 /// Truncate by characters, not bytes. These strings come off the wire
 /// (provider names, mint hostnames) and may be non-ASCII, where a byte
 /// slice can land mid-codepoint and panic.
@@ -413,8 +412,7 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
     }
 }
 
-/// Strip the URL scheme and any path, keeping the full hostname
-/// (`https://mint.minibits.cash/api` → `mint.minibits.cash`).
+/// `https://mint.minibits.cash/api` → `mint.minibits.cash`.
 fn mint_label(url: &str) -> String {
     let stripped = url
         .trim_start_matches("https://")
@@ -422,9 +420,9 @@ fn mint_label(url: &str) -> String {
     stripped.split('/').next().unwrap_or(stripped).to_string()
 }
 
-/// Render whitelisted mints into a `col`-wide table column:
-/// `-` when empty, one or two labels otherwise, with a ` +N`
-/// overflow suffix and truncation only when the result won't fit.
+/// Render whitelisted mints into a `col`-wide table column: `-` when empty,
+/// otherwise one or two labels with a ` +N` overflow suffix, truncated only
+/// when the result won't fit.
 fn format_mints_column(mints: &[String], col: usize) -> String {
     match mints.len() {
         0 => "-".to_string(),
@@ -477,7 +475,6 @@ mod tests {
         let s = "日本語のプロバイダー名です";
         assert!(truncate_str(s, 5).chars().count() <= 5);
         assert!(truncate_owned(s.to_string(), 5).chars().count() <= 5 + 2);
-        // Emoji are 4 bytes each — the worst case for byte slicing.
         let emoji = "🚀🚀🚀🚀🚀🚀";
         assert!(truncate_str(emoji, 3).chars().count() <= 3);
         assert!(!truncate_owned(emoji.to_string(), 3).is_empty());

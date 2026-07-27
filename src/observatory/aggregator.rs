@@ -1,7 +1,5 @@
-// Pure aggregator: turns observed Nostr events into a reproducible
-// JSON snapshot. No I/O, no clock — `now` and stake statuses are
-// inputs, so two invocations with the same inputs produce
-// byte-identical bytes regardless of where they run.
+// Pure: no I/O, no clock. `now` and stake statuses are inputs, so two
+// invocations with the same inputs produce byte-identical JSON anywhere.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -11,23 +9,19 @@ use crate::nostr::{HeartbeatContent, IsolationLevel, PodSpec, ProviderOfferConte
 use crate::reputation::{score_provider, CompletionReceipt, ConsumerProfile, SybilHeuristics};
 use crate::stake::{stake_rank, StakeStatus};
 
-/// Snapshot schema version, so the static frontend can branch on
-/// bumps without breaking old archives.
+/// Bumped so the frontend can branch without breaking old archives.
 pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// Receipts older than this age out of the rolling-window score.
 pub const RECEIPT_WINDOW_SECS: u64 = 30 * 24 * 3600;
 
-/// Inputs to one aggregator run. The caller owns all the I/O
-/// (Nostr, Esplora, consumer first-seen times); given these, the
-/// snapshot is a pure function.
+/// The caller owns all the I/O (Nostr, Esplora, consumer first-seen times).
 pub struct AggregatorInput {
     pub offers: Vec<ProviderOfferContent>,
     pub heartbeats: Vec<HeartbeatContent>,
     pub receipts: Vec<CompletionReceipt>,
     pub consumers: HashMap<String, ConsumerProfile>,
-    /// Pre-computed against Esplora by the caller, keyed by
-    /// `provider_npub`, so `compute_snapshot` stays pure.
+    /// Pre-computed against Esplora by the caller, keyed by `provider_npub`.
     pub stake_statuses: HashMap<String, StakeStatus>,
     /// Paygress-team-run providers, flagged in the UI.
     pub anchor_providers: HashSet<String>,
@@ -37,7 +31,6 @@ pub struct AggregatorInput {
 pub struct Snapshot {
     pub version: u8,
     pub generated_at: u64,
-    /// Stamped so readers can verify reproducibility.
     pub receipt_window_secs: u64,
     /// Sorted by `npub` for byte-identical reproducibility.
     pub providers: Vec<ProviderSummary>,
@@ -51,12 +44,9 @@ pub struct ProviderSummary {
     /// involuntarily.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jurisdiction: Option<String>,
-    /// Sybil-resistant score over the windowed receipts.
     pub score: f32,
-    /// Most recent heartbeat across the input set.
     pub last_seen_unix: Option<u64>,
-    /// `Some` only when the offer carried a stake proof and its
-    /// pre-computed `StakeStatus` was `Valid`.
+    /// `Some` only when the pre-computed `StakeStatus` was `Valid`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stake: Option<StakeSummary>,
     pub anchor: bool,
@@ -72,7 +62,6 @@ pub struct StakeSummary {
     pub rank: f64,
 }
 
-/// Pure: no clock, no network, no filesystem.
 pub fn compute_snapshot(input: &AggregatorInput, now: u64) -> Snapshot {
     let heuristics = SybilHeuristics::default();
     let receipt_floor = now.saturating_sub(RECEIPT_WINDOW_SECS);
@@ -98,15 +87,15 @@ pub fn compute_snapshot(input: &AggregatorInput, now: u64) -> Snapshot {
         by_npub.insert(offer.provider_npub.as_str(), offer);
     }
 
+    let scored_receipts: Vec<CompletionReceipt> = windowed.iter().map(|r| (*r).clone()).collect();
+
     let mut providers = Vec::with_capacity(by_npub.len());
     for (npub, offer) in by_npub {
         // Always-accept verifiers: bad receipts are dropped during
         // the Nostr crawl, before they reach this pure path.
-        let receipts_owned: Vec<CompletionReceipt> =
-            windowed.iter().map(|r| (*r).clone()).collect();
         let score = score_provider(
             npub,
-            &receipts_owned,
+            &scored_receipts,
             &input.consumers,
             now,
             &heuristics,
@@ -249,10 +238,7 @@ mod tests {
     fn jurisdiction_is_only_emitted_if_offer_opted_in() {
         let now = 1_700_000_000;
         let input = AggregatorInput {
-            offers: vec![
-                offer("npubA", "a", Some("BER")),
-                offer("npubB", "b", None), // opted out
-            ],
+            offers: vec![offer("npubA", "a", Some("BER")), offer("npubB", "b", None)],
             heartbeats: vec![],
             receipts: vec![],
             consumers: HashMap::new(),
@@ -272,8 +258,8 @@ mod tests {
     #[test]
     fn old_receipts_are_aged_out_of_window() {
         let now = 1_700_000_000;
-        let in_window = receipt("P", "C", now - 7 * 24 * 3600); // 7 days ago
-        let out_of_window = receipt("P", "C", now - 60 * 24 * 3600); // 60 days ago
+        let in_window = receipt("P", "C", now - 7 * 24 * 3600);
+        let out_of_window = receipt("P", "C", now - 60 * 24 * 3600);
         let mut consumers = HashMap::new();
         consumers.insert(
             "C".to_string(),

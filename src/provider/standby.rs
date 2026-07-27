@@ -12,23 +12,21 @@ use crate::nostr::{
 };
 use crate::provider::persistence::WorkloadInfo;
 
-/// Cadence at which the standby watchdog re-queries heartbeats. Matches
-/// `cleanup_loop` so no new periodic is added to the box.
+/// Cadence at which the standby watchdog re-queries heartbeats.
 pub(crate) const STANDBY_WATCHDOG_INTERVAL_SECS: u64 = 30;
 
 /// How long without a primary heartbeat before we treat the primary as crashed.
-/// 3x the default 60s cadence, so two missed beats (relay flake, network blip)
-/// are tolerated before promotion fires.
+/// 3x the default 60s cadence, so two missed beats are tolerated before
+/// promotion fires.
 pub(crate) const STANDBY_HEARTBEAT_SILENCE_SECS: u64 = 180;
 
-/// Per-standby ordered backoff: standby `i` waits `i * DELAY` after observing a
-/// revocation before spawning. Single-writer is best-effort — a brief two-Live
-/// window is an accepted v1 trade-off for the workloads warm-standby targets.
+/// Standby `i` waits `i * DELAY` after observing a revocation before spawning.
+/// Single-writer is best-effort: a brief two-Live window is an accepted v1
+/// trade-off.
 const STANDBY_PROMOTION_DELAY_SECS: u64 = 30;
 
-/// A standby slot reserved for a warm-standby workload. The consumer's spawn
-/// request was paid for and acknowledged, but no container exists yet — the
-/// standby is armed and waiting for a `LeaseRevocation` from the primary.
+/// A paid-for, acknowledged warm-standby reservation. No container exists yet;
+/// the standby is armed and waiting for a `LeaseRevocation` from the primary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StandbySlot {
     pub workload_id: String,
@@ -39,18 +37,15 @@ pub struct StandbySlot {
     pub spec_id: String,
     pub expires_at: u64,
     pub owner_npub: String,
-    /// When the slot was reserved. Serves as the watchdog's silence baseline
-    /// before any primary heartbeat is observed; without it a fresh slot would
-    /// read `last_seen == 0` as silence and promote over a healthy primary.
+    /// The watchdog's silence baseline before any primary heartbeat is
+    /// observed; without it a fresh slot would read `last_seen == 0` as silence
+    /// and promote over a healthy primary.
     pub created_at: u64,
-    /// The other standbys for this workload, excluding self and the primary.
-    /// Queried at promotion time to detect that a peer already promoted;
-    /// without it every standby would promote independently.
+    /// The other standbys, queried at promotion time to detect that a peer
+    /// already promoted; without it every standby would promote independently.
     pub peer_standby_npubs: Vec<String>,
 }
 
-/// True iff the primary has been silent for at least `threshold`.
-///
 /// `baseline` is the most recent primary heartbeat, or the slot's reservation
 /// timestamp when none has been observed. `baseline == 0` means the caller
 /// mis-wired the lookup and returns `false`: a missed promotion beats a
@@ -62,8 +57,7 @@ pub(crate) fn primary_is_silent(now: u64, baseline: u64, threshold: u64) -> bool
     now.saturating_sub(baseline) >= threshold
 }
 
-/// Role this provider takes for a spawn request. Non-`WarmStandby` requests
-/// return `Primary`, which is correct: in the single-provider path the
+/// Non-`WarmStandby` requests return `Primary`: in the single-provider path the
 /// "primary" is just the one provider running the workload.
 pub(crate) fn compute_warm_standby_role(
     self_npub: &str,
@@ -79,10 +73,9 @@ pub(crate) fn compute_warm_standby_role(
     }
 }
 
-/// Spawn the promotion task on its own tokio task so the request handler
-/// returns immediately. After the per-index backoff it checks for a peer's
-/// promotion announcement, spawns the container, then publishes its own
-/// announcement so higher-indexed peers back off.
+/// Runs on its own task so the caller returns immediately. After the per-index
+/// backoff it checks for a peer's promotion announcement, spawns the container,
+/// then publishes its own announcement so higher-indexed peers back off.
 pub(crate) fn schedule_standby_promotion(
     backend: Arc<dyn ComputeBackend>,
     workloads: Arc<Mutex<HashMap<u32, WorkloadInfo>>>,
@@ -103,10 +96,9 @@ pub(crate) fn schedule_standby_promotion(
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         }
 
-        // Taking the slot out of the map is what makes promotion at-most-once
-        // within this process (watchdog vs. revocation listener, or duplicate
-        // revocations from several relays). Peers' slots live in their own
-        // processes; the announcement query below covers those.
+        // Removing the slot is what makes promotion at-most-once within this
+        // process (watchdog vs. revocation listener, or duplicate revocations
+        // from several relays). The announcement query below covers peers.
         let slot = match standby_slots.lock().await.remove(&workload_id) {
             Some(s) => s,
             None => {
@@ -120,7 +112,7 @@ pub(crate) fn schedule_standby_promotion(
 
         // Heartbeats cannot serve as the peer-promotion signal: every standby
         // heartbeats regardless of promotion state, so a fresh one means "peer
-        // online", not "peer promoted". The announcement event is unambiguous.
+        // online", not "peer promoted".
         if !slot.peer_standby_npubs.is_empty() {
             match nostr
                 .query_standby_promotion_announcements(&slot.workload_id, &slot.peer_standby_npubs)
@@ -174,10 +166,9 @@ pub(crate) fn schedule_standby_promotion(
             expires_at: slot.expires_at,
             owner_npub: slot.owner_npub.clone(),
             consumer_workload_id: Some(slot.workload_id.clone()),
-            // This provider is the primary now. Record replication as None so
-            // the orchestrator doesn't re-emit a revocation on a later quorum
-            // loss — that would need a fresh standby topology from the
-            // consumer, which post-promotion we don't have.
+            // None, so the orchestrator doesn't re-emit a revocation on a
+            // later quorum loss: that would need a fresh standby topology from
+            // the consumer, which post-promotion we don't have.
             replication: crate::durable_workload::ReplicationMode::None,
             restart_policy: crate::durable_workload::RestartPolicy::default(),
             state_uri: None,
