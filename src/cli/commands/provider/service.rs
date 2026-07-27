@@ -13,10 +13,6 @@ pub struct StartArgs {
     /// Path to configuration file
     #[arg(long, default_value = "/etc/paygress/provider-config.json")]
     pub config: String,
-
-    /// Run in foreground (don't daemonize)
-    #[arg(long, default_value = "true")]
-    pub foreground: bool,
 }
 
 #[derive(Args)]
@@ -24,14 +20,6 @@ pub struct ConfigArgs {
     /// Show current configuration
     #[arg(long)]
     pub show: bool,
-
-    /// Edit a specific setting
-    #[arg(long)]
-    pub set: Option<String>,
-
-    /// Value for the setting
-    #[arg(long)]
-    pub value: Option<String>,
 }
 
 pub(super) async fn execute_start(args: StartArgs, _verbose: bool) -> Result<()> {
@@ -178,13 +166,6 @@ pub(super) async fn execute_config(args: ConfigArgs, _verbose: bool) -> Result<(
     if args.show {
         let config = load_config(CONFIG_PATH)?;
         println!("{}", serde_json::to_string_pretty(&config)?);
-        return Ok(());
-    }
-
-    if let (Some(key), Some(value)) = (args.set, args.value) {
-        println!("Setting {} = {}", key, value);
-        // TODO: Implement config editing
-        println!("{}", "Config editing not yet implemented".yellow());
     }
 
     Ok(())

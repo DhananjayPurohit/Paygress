@@ -170,11 +170,10 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
     if replication != ReplicationMode::None {
         println!(
             "{}",
-            "  Note: replication != none is parsed but not yet enforced;".yellow()
-        );
-        println!(
-            "{}",
-            "  Units 5/6 wire it through to the provider.".yellow()
+            "  Note: warm-standby failover is honored (a standby is reserved and \
+             promoted on lease revocation). Automatic respawn and restore from a \
+             checkpoint are not implemented."
+                .yellow()
         );
         println!();
     }
