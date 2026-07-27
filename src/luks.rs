@@ -51,23 +51,6 @@ pub struct EncryptedVolume {
     pub mount_path: PathBuf,
 }
 
-pub async fn check_cryptsetup_available() -> Result<String> {
-    let out = Command::new("cryptsetup")
-        .arg("--version")
-        .output()
-        .await
-        .context(
-            "cryptsetup binary not found on PATH; install cryptsetup or disable encrypted-volume support",
-        )?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "cryptsetup --version returned non-zero: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 /// Create + format + open + mount a LUKS volume for `id`. Rolls back partial
 /// state on failure so a retry at the same id starts clean.
 pub async fn create_encrypted_volume(

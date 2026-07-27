@@ -246,8 +246,7 @@ fn parse_wg_config(config: &str) -> Option<(String, Option<u16>, Option<u16>)> {
         .lines()
         .find(|l| l.contains("Public Ports:") || l.contains("Port Range:"))
         .and_then(|l| {
-            let re_part = l.split(':').next_back()?;
-            let range_str = re_part.trim().split(':').next_back()?.trim();
+            let range_str = l.split(':').next_back()?.trim();
             let mut parts = range_str.split('-');
             let start: u16 = parts.next()?.trim().parse().ok()?;
             let end: u16 = parts.next()?.trim().parse().ok()?;
