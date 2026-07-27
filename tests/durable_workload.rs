@@ -1,16 +1,6 @@
-//! State-machine tests for `paygress::durable_workload` (Unit 5 of
-//! the 12-month plan,
-//! docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
-//!
-//! These run before any production wiring of the fourth concurrent
-//! loop in `ProviderService::run`. The state machine is logic-heavy
-//! and bug-prone, so the plan calls for test-first execution. Each
-//! transition has a deterministic test; the single-writer invariant
-//! has a proptest.
-//!
-//! Out of scope here:
-//! - Multi-provider integration (two state machines, real Nostr).
-//! - Spawn-from-checkpoint after eviction — that's Unit 6.
+//! State-machine tests for `paygress::durable_workload`: one deterministic
+//! test per transition, plus a proptest for the single-writer invariant.
+//! Multi-provider integration and spawn-from-checkpoint are out of scope.
 
 use proptest::prelude::*;
 
@@ -48,8 +38,7 @@ fn workload(id: u32, provider: &str, replication: ReplicationMode, now: u64) -> 
 
 /// Heartbeat quorum is a provider-level signal, so only warm-standby
 /// workloads act on losing it — they have a standby to promote. Tests
-/// that exercise the Suspect / eviction path must therefore use this
-/// mode; `ReplicationMode::None` deliberately stays Live.
+/// exercising the Suspect / eviction path must use this mode.
 fn warm_standby() -> ReplicationMode {
     ReplicationMode::WarmStandby {
         standby_providers: vec![PROVIDER_B.to_string()],
@@ -63,6 +52,14 @@ fn observation(provider: &str, relay: &str, when: u64) -> HeartbeatObservation {
         seen_at: when,
         event_timestamp: when,
     }
+}
+
+/// A full N-of-N heartbeat sweep for `PROVIDER_A` at `when`.
+fn all_relays(when: u64) -> Vec<HeartbeatObservation> {
+    RELAYS
+        .iter()
+        .map(|r| observation(PROVIDER_A, r, when))
+        .collect()
 }
 
 #[test]
@@ -80,11 +77,7 @@ fn provisioning_advances_to_live_after_quorum() {
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
 
-    let obs: Vec<_> = RELAYS
-        .iter()
-        .map(|r| observation(PROVIDER_A, r, 10))
-        .collect();
-    let _ = sm.tick(10, &obs);
+    let _ = sm.tick(10, &all_relays(10));
 
     assert!(matches!(sm.state_of(1), Some(WorkloadState::Live { .. })));
 }
@@ -93,17 +86,10 @@ fn provisioning_advances_to_live_after_quorum() {
 fn live_stays_live_with_one_relay_silent() {
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
     assert!(matches!(sm.state_of(1), Some(WorkloadState::Live { .. })));
 
-    // Next tick: only 2 of 3 relays observe a heartbeat. M=2 of N=3
-    // is met, so we stay Live.
+    // M=2 of N=3 is still met.
     let _ = sm.tick(
         70,
         &[
@@ -118,15 +104,9 @@ fn live_stays_live_with_one_relay_silent() {
 fn live_transitions_to_suspect_after_t1_silence() {
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
 
-    // No more observations. After T1 = 120s of silence we go Suspect.
+    // T1 = 120s of silence.
     let _ = sm.tick(200, &[]);
     assert!(matches!(
         sm.state_of(1),
@@ -138,23 +118,11 @@ fn live_transitions_to_suspect_after_t1_silence() {
 fn suspect_recovers_to_live_within_t2() {
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
     let _ = sm.tick(200, &[]); // → Suspect
 
     // Heartbeats resume on M-of-N before T2.
-    let _ = sm.tick(
-        220,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 220))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(220, &all_relays(220));
     assert!(matches!(sm.state_of(1), Some(WorkloadState::Live { .. })));
 }
 
@@ -162,17 +130,9 @@ fn suspect_recovers_to_live_within_t2() {
 fn suspect_evicts_after_t2_silence() {
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, warm_standby(), 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
     let _ = sm.tick(200, &[]); // → Suspect at t≈200
-
-    // T2 = 300s past Suspect entry. Tick well past that.
-    let events = sm.tick(600, &[]);
+    let events = sm.tick(600, &[]); // well past T2 = 300s
 
     assert!(matches!(
         sm.state_of(1),
@@ -189,22 +149,11 @@ fn suspect_evicts_after_t2_silence() {
 
 #[test]
 fn non_replicated_workload_survives_quorum_loss() {
-    // Quorum is a provider-level signal: it says the provider could
-    // not reach enough relays, NOT that this container is unhealthy.
-    // A `replication: none` consumer paid through `expires_at` and
-    // has no standby to promote, so a relay outage must not start
-    // tearing their workload down. Regression test: this path used to
-    // evict, and eviction dropped the workload without deleting the
-    // container — leaking it and burning its vmid.
+    // Regression: this path used to evict, and eviction dropped the workload
+    // without deleting the container — leaking it and burning its vmid.
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
 
     // Total relay silence, well past both T1 and T2.
     let _ = sm.tick(200, &[]);
@@ -226,16 +175,10 @@ fn non_replicated_workload_survives_quorum_loss() {
 
 #[test]
 fn checkpointed_workload_also_survives_quorum_loss() {
-    // Checkpointed has no standby either — same reasoning.
+    // Checkpointed has no standby either.
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, ReplicationMode::Checkpointed, 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
     let _ = sm.tick(200, &[]);
     let _ = sm.tick(5000, &[]);
 
@@ -249,13 +192,7 @@ fn warm_standby_eviction_emits_lease_revocation() {
         standby_providers: vec![PROVIDER_B.to_string()],
     };
     sm.track(workload(1, PROVIDER_A, replication, 0));
-    let _ = sm.tick(
-        10,
-        &RELAYS
-            .iter()
-            .map(|r| observation(PROVIDER_A, r, 10))
-            .collect::<Vec<_>>(),
-    );
+    let _ = sm.tick(10, &all_relays(10));
     let _ = sm.tick(200, &[]);
     let events = sm.tick(600, &[]);
 
@@ -277,8 +214,7 @@ fn stale_observation_does_not_count_for_quorum() {
     let mut sm = WorkloadStateMachine::new(quorum());
     sm.track(workload(1, PROVIDER_A, ReplicationMode::None, 0));
 
-    // Observation claims a 1-hour-old event_timestamp at tick t=10.
-    // stale_secs = 180s, so this must be ignored.
+    // event_timestamp is an hour before the tick; stale_secs = 180.
     let stale = HeartbeatObservation {
         provider_npub: PROVIDER_A.to_string(),
         relay_url: RELAYS[0].to_string(),
@@ -303,13 +239,10 @@ fn untrack_removes_workload() {
 
 #[test]
 fn respawn_failure_after_max_attempts_goes_to_failed() {
-    // Entered directly rather than driven through quorum loss:
-    // warm-standby evicts to a standby instead of respawning, and
-    // non-replicated workloads no longer evict on quorum at all, so
-    // nothing reaches Respawning today. The restart-policy logic is
-    // still worth pinning — the trigger it's waiting for is a
-    // container-health signal (the workload's own process dying),
-    // which the provider does not yet observe.
+    // Entered directly: nothing reaches Respawning today, because
+    // warm-standby evicts to a standby and non-replicated workloads no
+    // longer evict on quorum. The trigger this waits for is a
+    // container-health signal the provider does not yet observe.
     let mut sm = WorkloadStateMachine::new(quorum());
     let mut wl = workload(1, PROVIDER_A, ReplicationMode::None, 0);
     wl.restart_policy = RestartPolicy::OnFailure { max_attempts: 1 };
@@ -320,21 +253,16 @@ fn respawn_failure_after_max_attempts_goes_to_failed() {
     };
     sm.track(wl);
 
-    // The attempt fails, and max_attempts is already used up.
     sm.notify_respawn_failed(1, "backend down");
 
     assert!(matches!(sm.state_of(1), Some(WorkloadState::Failed { .. })));
 }
 
 proptest! {
-    /// Approximation of the cross-provider single-writer invariant:
-    /// whenever the state machine emits a `PublishLeaseRevocation`,
-    /// its own local state must already have left `Live`. A standby
-    /// promotion that observes the revocation can only become Live
-    /// AFTER the primary's local state machine has crossed out of
-    /// Live, so two-Live windows are impossible by construction.
-    /// Across 256 random observation sequences this property must
-    /// hold.
+    /// Cross-provider single-writer invariant: whenever the machine emits a
+    /// `PublishLeaseRevocation`, its own state must already have left `Live`.
+    /// A standby only becomes Live after observing that revocation, so
+    /// two-Live windows are impossible by construction.
     #[test]
     fn warm_standby_revocation_only_after_local_eviction(
         seed in any::<u64>(),

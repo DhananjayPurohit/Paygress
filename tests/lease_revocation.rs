@@ -1,9 +1,6 @@
-//! Wire-format regression tests for `LeaseRevocationContent` (Unit 5
-//! orchestrator wiring). Standby providers depend on this schema for
-//! cold-start replay, so old payloads MUST keep parsing and new
-//! payloads MUST round-trip cleanly. The runtime publish/subscribe
-//! path is exercised live in `src/provider.rs` (orchestrator_loop),
-//! which is integration-tested manually against deployed providers.
+//! Wire-format regression tests for `LeaseRevocationContent`. Standby
+//! providers read this schema for cold-start replay, so old payloads must
+//! keep parsing and new ones must round-trip.
 
 use paygress::nostr::LeaseRevocationContent;
 
@@ -41,15 +38,12 @@ fn empty_state_uri_skipped_on_wire() {
     let json = serde_json::to_string(&v).unwrap();
     assert!(
         !json.contains("state_uri"),
-        "skip_serializing_if respected — None state_uri stays off the wire so non-checkpointed revocations don't carry a noisy null"
+        "None state_uri must stay off the wire, not serialize as null"
     );
 }
 
 #[test]
 fn v0_without_version_field_parses() {
-    // A pre-this-PR provider would never have published a revocation,
-    // but for forward-compat (a future version dropping `version`)
-    // we want #[serde(default)] to keep working.
     let v0 = serde_json::json!({
         "workload_id": "wid-7",
         "primary_provider_npub": "npub1abc",
@@ -67,21 +61,14 @@ fn v0_without_version_field_parses() {
 
 #[test]
 fn empty_standby_list_round_trips() {
-    // Defensive: a primary self-evicting on a non-warm-standby
-    // workload would still emit a revocation (currently it doesn't,
-    // but the schema must support it cleanly so a future expansion —
-    // e.g. broadcast revocations — doesn't need a wire bump).
+    // Nothing emits this today, but the schema must support it so broadcast
+    // revocations don't need a wire bump later.
     let mut v = sample();
     v.standby_providers.clear();
     let json = serde_json::to_string(&v).unwrap();
     let back: LeaseRevocationContent = serde_json::from_str(&json).unwrap();
     assert!(back.standby_providers.is_empty());
 }
-
-// ==================== parse_revocation_event tests ====================
-//
-// Pin the standby-side dispatcher's pure helper so the dispatcher
-// in src/provider.rs stays correct without needing a relay pool.
 
 use paygress::nostr::{parse_revocation_event, NostrEvent, KIND_LEASE_REVOCATION};
 
@@ -109,9 +96,7 @@ fn parse_revocation_event_returns_some_for_matching_kind_and_body() {
 
 #[test]
 fn parse_revocation_event_returns_none_for_wrong_kind() {
-    // Even if the body would parse as LeaseRevocationContent, a
-    // wrong-kind event must not be misclassified — the dispatcher
-    // relies on this to fall through to the DM path.
+    // The dispatcher relies on this to fall through to the DM path.
     let body = serde_json::to_string(&sample()).unwrap();
     let ev = make_event(4, body); // Kind::EncryptedDirectMessage = 4
     assert!(parse_revocation_event(&ev).is_none());
@@ -119,8 +104,6 @@ fn parse_revocation_event_returns_none_for_wrong_kind() {
 
 #[test]
 fn parse_revocation_event_returns_none_for_malformed_body() {
-    // A right-kind event with junk in the body returns None instead
-    // of panicking — the dispatcher logs and moves on.
     let ev = make_event(KIND_LEASE_REVOCATION as u32, "{not json".to_string());
     assert!(parse_revocation_event(&ev).is_none());
 }

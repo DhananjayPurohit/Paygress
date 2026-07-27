@@ -1,10 +1,6 @@
-// `paygress-cli deploy` — opinionated wrapper around `spawn` that
-// hides reliability, persistence, and replication choices behind
-// per-template defaults:
-//
-//     paygress deploy nostr-relay --pay <token>
-//
-// Every default is overridable by an explicit flag.
+// `paygress-cli deploy` — wrapper around `spawn` that hides
+// reliability, persistence, and replication behind per-template
+// defaults, each overridable by an explicit flag.
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
@@ -13,7 +9,6 @@ use std::str::FromStr;
 
 use super::spawn::{self, SpawnArgs};
 
-/// Replication / availability override. Defaults vary per template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReplicationMode {
     /// One container, no checkpoint, no failover. Cheapest.
@@ -34,9 +29,6 @@ impl ReplicationMode {
     }
 }
 
-/// Templates the marketplace knows about. Each is a deliberate
-/// intersection of (use-case, image, port profile, replication
-/// default); adding one is a compatibility-bearing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum Template {
@@ -56,8 +48,8 @@ pub enum Template {
 }
 
 impl Template {
-    /// Slug the provider uses to resolve image/ports/env from its OWN
-    /// template registry, rather than trusting consumer-supplied bytes.
+    /// Slug the provider resolves image/ports/env from, instead of
+    /// trusting consumer-supplied bytes.
     pub const fn slug(self) -> &'static str {
         match self {
             Template::NostrRelay => "nostr-relay",
@@ -70,10 +62,9 @@ impl Template {
     }
 }
 
-/// Per-template "what should we do unless told otherwise" table.
 pub struct TemplateDefaults {
     pub tier: &'static str,
-    /// Fallback only: the provider normally resolves the real image
+    /// Fallback only; the provider normally resolves the real image
     /// from its registry via the template slug.
     pub image: &'static str,
     pub replication: ReplicationMode,
@@ -121,7 +112,7 @@ pub const fn template_defaults(t: Template) -> TemplateDefaults {
     }
 }
 
-/// Reject malformed Cashu tokens at parse time, before any network work.
+/// Rejects malformed tokens before any network work.
 fn parse_cashu_token(s: &str) -> Result<String, String> {
     cdk::nuts::Token::from_str(s)
         .map(|_| s.to_string())
@@ -154,8 +145,7 @@ pub struct DeployArgs {
     #[arg(long)]
     pub image: Option<String>,
 
-    /// Your Nostr private key (nsec) — uses ~/.paygress/identity if
-    /// not provided.
+    /// Your Nostr private key (nsec) — uses ~/.paygress/identity if unset
     #[arg(long)]
     pub nostr_key: Option<String>,
 
@@ -179,8 +169,6 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
     println!();
 
     if replication != ReplicationMode::None {
-        // The provider currently treats every workload as `none`;
-        // surface that rather than silently accepting the override.
         println!(
             "{}",
             "  Note: replication != none is parsed but not yet enforced;".yellow()
@@ -199,10 +187,9 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         );
     }
 
-    // Deploy is a thin lens over spawn, not a parallel implementation.
-    // Warm-standby degrades to `none` on the wire because deploy does
-    // not collect a standby topology; the full flow is `spawn` with
-    // explicit --primary-id / --workload-id, once per provider.
+    // Warm-standby degrades to `none` on the wire: deploy collects no
+    // standby topology. That flow is `spawn --primary-id --workload-id`,
+    // once per provider.
     let replication_str = match replication {
         ReplicationMode::WarmStandby => ReplicationMode::None,
         other => other,
@@ -225,8 +212,7 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
         standby: None,
         primary_id: None,
         workload_id: None,
-        // Both false means `spawn` applies the template's
-        // encrypt-by-default policy.
+        // Both false: `spawn` applies the template's own volume policy.
         encrypt_volume: false,
         no_encrypt_volume: false,
         isolation_level: None,

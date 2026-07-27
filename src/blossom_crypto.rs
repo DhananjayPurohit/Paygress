@@ -1,8 +1,5 @@
-// Client-side encryption for Blossom-stored blobs.
-//
-// Blossom servers content-address by SHA-256 of the *uploaded*
-// bytes, and we don't trust a third-party operator, so blobs are
-// encrypted before hashing: the server only ever sees ciphertext.
+// Client-side encryption for Blossom-stored blobs: blobs are encrypted
+// before hashing, so a third-party server only ever sees ciphertext.
 //
 // Wire format: `nonce || XChaCha20-Poly1305 ciphertext`, where the
 // 24-byte nonce is fresh per encryption and prepended so `decrypt`
@@ -16,8 +13,6 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 /// 32-byte symmetric key, per-blob or per-lease.
 pub type EncryptionKey = [u8; 32];
 
-/// Distinct from `anyhow` so callers can map AEAD failures to
-/// specific user-facing messages.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("ciphertext too short to contain a nonce")]
@@ -30,9 +25,9 @@ pub enum CryptoError {
 
 const NONCE_LEN: usize = 24;
 
-/// Encrypt `plaintext`, returning `nonce || ciphertext`. The fresh
-/// per-call nonce means two encryptions of the same plaintext differ,
-/// so observers can't tell that two checkpoints carry identical state.
+/// Returns `nonce || ciphertext`. The fresh per-call nonce means two
+/// encryptions of the same plaintext differ, so observers can't tell that
+/// two checkpoints carry identical state.
 pub fn encrypt_for_upload(plaintext: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, CryptoError> {
     use rand::RngCore;
     let cipher = XChaCha20Poly1305::new(key.into());
@@ -51,8 +46,7 @@ pub fn encrypt_for_upload(plaintext: &[u8], key: &EncryptionKey) -> Result<Vec<u
     Ok(out)
 }
 
-/// Inverse of [`encrypt_for_upload`]. Wrong key, tampered bytes and
-/// truncated input all surface as typed `CryptoError`s.
+/// Inverse of [`encrypt_for_upload`].
 pub fn decrypt_after_download(wire: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, CryptoError> {
     if wire.len() < NONCE_LEN {
         return Err(CryptoError::Truncated);

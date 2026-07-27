@@ -27,7 +27,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    // ============ Consumer Commands ============
     /// Discover providers and their offers
     List(list::ListArgs),
 
@@ -55,7 +54,6 @@ enum Commands {
     /// Local token utilities
     Wallet(wallet::WalletArgs),
 
-    // ============ Provider Commands ============
     /// Provider management - setup, start, stop, status
     Provider(provider::ProviderArgs),
 
@@ -74,8 +72,7 @@ fn print_banner() {
 
 #[tokio::main]
 async fn main() {
-    // Default to `error` so relay-pool noise stays hidden during normal
-    // consumer use. Set RUST_LOG=info to see it.
+    // Default `error` hides relay-pool noise; RUST_LOG=info shows it.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

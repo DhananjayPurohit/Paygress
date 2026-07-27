@@ -1,5 +1,4 @@
-// Compute backend trait shared by the Docker, LXD, KVM and Proxmox
-// backends.
+// Compute backend trait shared by the Docker, LXD, KVM and Proxmox backends.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -8,9 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// Host-visible name for a workload. Every name-addressed backend
-/// uses this form and `find_available_id` parses the id back out of
-/// it, so the two must stay in sync.
+/// Host-visible name for a workload. `find_available_id` parses the id back out
+/// of this form, so the two must stay in sync.
 pub fn container_name(id: u32) -> String {
     format!("paygress-{}", id)
 }
@@ -20,8 +18,7 @@ pub fn id_from_container_name(name: &str) -> Option<u32> {
     name.strip_prefix("paygress-")?.parse().ok()
 }
 
-/// Run `program` and return its stdout, failing with the child's
-/// stderr when it exits non-zero.
+/// Run `program`, failing with the child's stderr when it exits non-zero.
 pub(crate) async fn run_checked(program: &str, args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new(program)
         .args(args)
@@ -49,9 +46,8 @@ pub struct NodeStatus {
     pub disk_total: u64,
 }
 
-/// One published port mapping. Docker translates this to
-/// `-p host_port:container_port`; LXD/Proxmox ignore it and expose
-/// only SSH via `ContainerConfig::host_port`.
+/// One published port mapping. Docker-only; LXD/Proxmox expose just SSH via
+/// `ContainerConfig::host_port`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortMapping {
     pub host_port: u16,
@@ -72,23 +68,19 @@ pub struct ContainerConfig {
     pub ssh_key: Option<String>,
     /// SSH host-port forward. Distinct from `template_ports`.
     pub host_port: Option<u16>,
-    /// Workload ports the consumer reaches. Docker-only.
     pub template_ports: Vec<PortMapping>,
-    /// Workload environment (template defaults + consumer overrides).
+    /// Template defaults plus consumer overrides.
     pub template_env: HashMap<String, String>,
     /// Extra `docker run` flags from the template definition.
     pub extra_runtime_args: Vec<String>,
-    /// In-container path for persistent state. `None` = stateless,
-    /// no volume created.
+    /// In-container path for persistent state. `None` = stateless.
     pub data_path: Option<String>,
-    /// 32-byte LUKS key for the persistent data volume. When set the
-    /// Docker backend builds a LUKS-on-loop file instead of a plain
-    /// named volume; the key is fed to cryptsetup over stdin and
-    /// never written to disk. No-op when `data_path` is `None`.
+    /// 32-byte LUKS key for the data volume. When set the Docker backend builds
+    /// a LUKS-on-loop file instead of a plain named volume. No-op when
+    /// `data_path` is `None`.
     ///
-    /// `serde(skip)`: this is consumer key material. It stays in
-    /// memory for the life of the process and is never written to
-    /// provider-side state.
+    /// `serde(skip)`: this is consumer key material. It stays in memory for the
+    /// life of the process and is never written to provider-side state.
     #[serde(skip)]
     pub volume_encryption_key: Option<[u8; 32]>,
 }
@@ -110,17 +102,15 @@ pub trait ComputeBackend: Send + Sync {
 
     async fn get_container_ip(&self, id: u32) -> Result<Option<String>>;
 
-    /// Whether the workload is still running.
-    ///
-    /// Defaults to `Running` so a backend that cannot answer never
-    /// causes a destructive action to be taken on its behalf.
+    /// Defaults to `Running` so a backend that cannot answer never causes a
+    /// destructive action to be taken on its behalf.
     async fn get_container_status(&self, _id: u32) -> Result<ContainerStatus> {
         Ok(ContainerStatus::Running)
     }
 }
 
-/// Coarse run state of a workload. Deliberately three-valued: an
-/// unreachable backend must not be mistaken for a stopped workload.
+/// Deliberately three-valued: an unreachable backend must not be mistaken for
+/// a stopped workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerStatus {
     Running,

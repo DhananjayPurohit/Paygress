@@ -1,14 +1,10 @@
-// MCP (Model Context Protocol) server over stdio.
-//
-// Exposes the consumer commands (list, spawn, batch, status, topup,
-// exec) as tools an MCP client can call:
+// MCP (Model Context Protocol) server over stdio, exposing the consumer
+// commands as tools:
 //
 //     {"mcpServers": {"paygress": {"command": "paygress-cli",
 //                                  "args": ["mcp"]}}}
 //
-// Each tool calls the same helpers the CLI subcommands use, so behavior
-// stays identical regardless of how the user invokes it. Tracing goes
-// to stderr (see cli/main.rs) so the stdio transport stays clean.
+// Each tool calls the same helpers the CLI subcommands do.
 
 use std::future::Future;
 
@@ -32,8 +28,7 @@ use paygress::nostr::{IsolationLevel, ProviderFilter};
 
 #[derive(Args, Default, Debug, Clone)]
 pub struct McpArgs {
-    /// Nostr private key used when calling providers. Falls back to
-    /// ~/.paygress/identity.
+    /// Nostr private key (nsec) — uses ~/.paygress/identity if unset
     #[arg(long)]
     pub nostr_key: Option<String>,
 
@@ -57,17 +52,14 @@ pub struct PaygressMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-// Tool parameter types. Keep these stable — once a client has cached
-// our tool schema, breaking changes mean silent tool-call failures from
-// older harnesses.
+// Tool parameter types. Keep them stable — clients cache the schema.
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListProvidersParams {
-    /// Optional capability filter (e.g. "lxc", "vm"). When unset,
-    /// returns every advertised provider.
+    /// Capability filter (e.g. "lxc", "vm"); unset returns every provider.
     #[serde(default)]
     pub capability: Option<String>,
-    /// Optional minimum advertised uptime percentage (0.0-100.0).
+    /// Minimum advertised uptime percentage (0.0-100.0).
     #[serde(default)]
     pub min_uptime: Option<f32>,
 }
@@ -81,14 +73,13 @@ pub struct SpawnParams {
     /// Tier id from the provider's offer (e.g. "basic").
     #[serde(default = "default_tier")]
     pub tier: String,
-    /// Template slug (e.g. "agent-sandbox", "inference-endpoint").
-    /// Empty string means a generic spawn governed by `image`.
+    /// Template slug (e.g. "agent-sandbox"); unset spawns `image` directly.
     #[serde(default)]
     pub template: Option<String>,
-    /// Container image used only when `template` is unset.
+    /// Container image, used only when `template` is unset.
     #[serde(default = "default_image")]
     pub image: String,
-    /// SSH username (default "user"). Some templates ignore this.
+    /// SSH username; some templates ignore this.
     #[serde(default = "default_ssh_user")]
     pub ssh_user: String,
     /// SSH password. Auto-generated if omitted.
@@ -97,11 +88,7 @@ pub struct SpawnParams {
     /// Per-spawn timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Minimum isolation tier the provider must offer; stricter tiers
-    /// also match. One of "shared-kernel" (Docker / LXC; weakest),
-    /// "dedicated-host" (per-VM; no co-tenants), or
-    /// "attested-research-tier" (SEV-SNP / TDX confidential VM).
-    /// Checked before the Cashu token is sent.
+    /// Minimum isolation tier, stricter tiers also match: "shared-kernel" (Docker/LXC), "dedicated-host" (per-VM), or "attested-research-tier" (SEV-SNP/TDX).
     #[serde(default)]
     pub isolation_level: Option<String>,
 }
@@ -123,9 +110,7 @@ fn default_timeout_secs() -> u64 {
 pub struct BatchParams {
     /// Provider ID to spawn against.
     pub provider: String,
-    /// Either a list of N pre-minted Cashu tokens, OR a single token
-    /// to split into `shards` shards. Mutually exclusive: set
-    /// exactly one.
+    /// N pre-minted Cashu tokens, one per shard; mutually exclusive with `split_token`.
     #[serde(default)]
     pub tokens: Option<Vec<String>>,
     /// One large Cashu token to split into `shards` shards.
@@ -143,8 +128,7 @@ pub struct BatchParams {
     /// Per-shard timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Minimum isolation tier the provider must offer (same values as
-    /// `SpawnParams.isolation_level`). Applied to every shard.
+    /// Minimum isolation tier (same values as `SpawnParams.isolation_level`), applied to every shard.
     #[serde(default)]
     pub isolation_level: Option<String>,
 }
@@ -153,8 +137,7 @@ fn default_batch_template() -> String {
     "agent-sandbox".to_string()
 }
 
-/// Resolve the optional `isolation_level` string into the internal
-/// enum, erroring on a typo before any spawn round-trip.
+/// Errors on a typo before any spawn round-trip.
 fn parse_iso_param(s: Option<&str>) -> Result<Option<IsolationLevel>, McpError> {
     match s {
         None => Ok(None),
@@ -170,8 +153,8 @@ fn parse_iso_param(s: Option<&str>) -> Result<Option<IsolationLevel>, McpError> 
     }
 }
 
-/// Serialize a tool result body. Serialization of a `serde_json::Value`
-/// cannot fail, so the fallback is unreachable.
+/// Serializing a `serde_json::Value` cannot fail; the fallback is
+/// unreachable.
 fn tool_json(body: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -182,8 +165,7 @@ fn tool_json(body: serde_json::Value) -> Result<CallToolResult, McpError> {
 pub struct StatusParams {
     /// Provider ID that owns the workload.
     pub provider: String,
-    /// Pod identifier from the spawn response (e.g.
-    /// "container-1042").
+    /// Pod identifier from the spawn response (e.g. "container-1042").
     pub pod_id: String,
     /// Per-call timeout in seconds.
     #[serde(default = "default_status_timeout_secs")]
@@ -200,9 +182,8 @@ pub struct TopupParams {
     pub provider: String,
     /// Pod identifier from the spawn response.
     pub pod_id: String,
-    /// Cashu token paying for the lease extension. The provider
-    /// applies `redeemed_amount / rate_msats_per_sec` seconds of
-    /// extension on success.
+    /// Cashu token paying for the lease extension; buys
+    /// `redeemed_amount / rate_msats_per_sec` seconds.
     pub token: String,
     /// Per-call timeout in seconds.
     #[serde(default = "default_timeout_secs")]
@@ -211,23 +192,16 @@ pub struct TopupParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunCommandParams {
-    /// Host the agent-sandbox is published on. Comes from the
-    /// `host` field of a `spawn_workload` / `batch_spawn` response.
+    /// Host from the `host` field of a `spawn_workload` / `batch_spawn` response.
     pub host: String,
-    /// Port the exec server is reachable on. For the `agent-sandbox`
-    /// template this is the host port mapped to container 8080
-    /// (label `sandbox-exec` in the template ports list).
+    /// Exec server port — the `sandbox-exec` entry in the response's template ports.
     pub port: u16,
-    /// HTTP Basic auth username. The provider sets this to "root"
-    /// inside the container; rarely overridden.
+    /// HTTP Basic auth username; the provider uses "root".
     #[serde(default = "default_exec_user")]
     pub user: String,
-    /// HTTP Basic auth password. Must match the password the spawn
-    /// response printed (the provider injects it as EXEC_PASS in the
-    /// container's env).
+    /// HTTP Basic auth password — the ssh_pass from the spawn response.
     pub pass: String,
-    /// Shell command to run. Interpreted by `bash -lc` inside the
-    /// container, so pipes / redirects work naturally.
+    /// Shell command, interpreted by `bash -lc` inside the container.
     pub command: String,
     /// Server-side command timeout (seconds). Capped at 1800.
     #[serde(default = "default_exec_timeout_secs")]
@@ -278,8 +252,8 @@ impl PaygressMcpServer {
             .await
             .map_err(|e| McpError::internal_error(format!("nostr connect: {}", e), None))?;
 
-        // Deliberately no `is_online` filter, so the model can decide
-        // what to do with offline providers (e.g. wait + retry).
+        // No `is_online` filter: let the model decide what to do with
+        // offline providers.
         let filter = if params.capability.is_some() || params.min_uptime.is_some() {
             Some(ProviderFilter {
                 capability: params.capability,
@@ -332,8 +306,6 @@ impl PaygressMcpServer {
         .await
         .map_err(|e| McpError::internal_error(format!("spawn: {}", e), None))?;
 
-        // Always reply with structured JSON so the caller can act on
-        // either branch without parsing prose.
         tool_json(match outcome {
             NostrSpawnOutcome::Success(access) => serde_json::json!({
                 "status": "spawned",
@@ -370,7 +342,7 @@ impl PaygressMcpServer {
         Parameters(params): Parameters<BatchParams>,
     ) -> Result<CallToolResult, McpError> {
         // Reuse the CLI's token materialization so the split path
-        // behaves identically; BatchArgs is what it consumes.
+        // behaves identically.
         let cli_args = batch::BatchArgs {
             provider: params.provider.clone(),
             tokens: params.tokens.as_ref().map(|v| v.join(",")),
@@ -407,7 +379,6 @@ impl PaygressMcpServer {
             .into_iter()
             .map(shard_result_json)
             .collect();
-        // Sort by index so the JSON ordering matches shard ordering.
         shards.sort_by_key(|v| v["index"].as_u64().unwrap_or(0));
 
         let spawned_count = shards
@@ -553,7 +524,6 @@ impl PaygressMcpServer {
     }
 }
 
-/// Render one fan-out shard as the MCP manifest's per-shard object.
 fn shard_result_json(result: ShardResult) -> serde_json::Value {
     let spawn = match result {
         ShardResult::Done(s) => *s,
@@ -652,8 +622,6 @@ mod tests {
 
     #[test]
     fn spawn_params_default_tier_is_basic() {
-        // Round-trip through serde so any rename / default rot
-        // surfaces here, not at runtime.
         let v = serde_json::from_value::<SpawnParams>(serde_json::json!({
             "provider": "npub1abc",
             "token": "tok",

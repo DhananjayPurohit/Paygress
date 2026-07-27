@@ -1,10 +1,6 @@
 //! Wire-format regression tests for `StandbyPromotionAnnouncementContent`
-//! (#60). Higher-indexed standbys depend on this schema for the
-//! pre-emption check that prevents split-brain after a primary
-//! crash, so old payloads MUST keep parsing and new payloads MUST
-//! round-trip cleanly. The runtime publish/query path is exercised
-//! live in `src/provider.rs::schedule_standby_promotion`, which is
-//! integration-tested manually against deployed providers.
+//! (#60). Higher-indexed standbys read this schema for the pre-emption
+//! check that prevents split-brain after a primary crash.
 
 use paygress::nostr::{StandbyPromotionAnnouncementContent, KIND_STANDBY_PROMOTION_ANNOUNCEMENT};
 
@@ -34,9 +30,6 @@ fn round_trip() {
 
 #[test]
 fn missing_version_defaults_to_one() {
-    // Forward-compat: if a future version drops the `version` field
-    // entirely, payloads from a transitional provider must still
-    // parse on this version of the consumer/peer.
     let v_missing_version = serde_json::json!({
         "workload_id": "wid-promotion-7",
         "new_primary_npub": "npub1abc",
@@ -50,10 +43,7 @@ fn missing_version_defaults_to_one() {
 
 #[test]
 fn unexpected_extra_fields_are_ignored() {
-    // A peer running a newer schema (e.g. with a `replication_topology`
-    // or `previous_primary_npub` field added later) must not break
-    // older peers' parsing — serde defaults to ignoring unknown
-    // fields, but pin the contract here so it's a deliberate decision.
+    // serde ignores unknown fields by default; pin it as a deliberate contract.
     let with_extra = serde_json::json!({
         "workload_id": "wid-future",
         "new_primary_npub": "npub1xyz",
@@ -69,8 +59,6 @@ fn unexpected_extra_fields_are_ignored() {
 
 #[test]
 fn event_kind_constant_is_38386() {
-    // Pin the kind so a casual refactor can't silently change it —
-    // peers identify announcement events by this kind, and a change
-    // would silently break the split-brain dedup across versions.
+    // Peers identify announcements by kind; a change breaks split-brain dedup.
     assert_eq!(KIND_STANDBY_PROMOTION_ANNOUNCEMENT, 38386);
 }

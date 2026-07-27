@@ -1,27 +1,14 @@
-//! Integration tests for Cashu mint redemption on the Nostr-DM provider path.
+//! Cashu mint redemption on the Nostr-DM provider path, exercised through
+//! an injected `MintRedeemer` so no real mint is contacted.
 //!
-//! Covers Unit 1 of the 12-month plan
-//! (docs/plans/2026-04-26-001-feat-paygress-12mo-vision-plan.md).
-//!
-//! These tests inject a `MintRedeemer` mock so they never hit a real mint.
-//! Stubbing the mint's HTTP API with `wiremock` was rejected because the
-//! cdk wallet's swap protocol requires cryptographically-valid blinded
-//! signatures, which can't be faithfully synthesized without the mint's
-//! private keys. The trait seam exercises the same code path
-//! (whitelist enforcement, error mapping, replay detection) without
-//! coupling tests to cdk's HTTP wire format.
+//! Stubbing the mint's HTTP API with `wiremock` is not viable: cdk's swap
+//! protocol needs cryptographically-valid blinded signatures, which can't
+//! be synthesized without the mint's private keys. The trait seam covers
+//! the same logic (whitelist enforcement, error mapping, replay detection)
+//! without coupling to cdk's wire format.
 //!
 //! See `docs/solutions/patterns/critical-patterns.md` for the historical
-//! footgun this fix closes.
-//!
-//! Test scenarios per Unit 1 plan:
-//! 1. Happy path: whitelisted mint, never-spent → success.
-//! 2. Already-spent token → `RedeemError::AlreadySpent`, no backend call.
-//! 3. Non-whitelisted mint → rejected before redeemer is contacted.
-//! 4. Pending token → `RedeemError::Pending`.
-//! 5. Mint network failure → `RedeemError::Network`.
-//! 6. In-provider replay: same token twice → first OK, second AlreadySpent.
-//! 7. Cross-provider replay: shared mint mock → exactly one swap succeeds.
+//! footgun this closes.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,10 +22,9 @@ use paygress::cashu::{validate_and_redeem, MintRedeemer, RedeemError};
 const WHITELISTED_MINT: &str = "https://testnut.cashu.space";
 const OTHER_MINT: &str = "https://attacker.example";
 
-/// Build a synthetic Cashu V3 token string. Body is plain JSON so cdk's
-/// `Token::from_str` parses it; proof signatures are dummy hex because no
-/// local crypto verification happens before `Wallet::receive` would hit
-/// the mint, and our tests never reach the wallet.
+/// Synthetic Cashu V3 token. Proof signatures are dummy hex: no local crypto
+/// verification happens before `Wallet::receive` would hit the mint, and these
+/// tests never reach the wallet.
 fn make_token(mint_url: &str, amount_sat: u64, secret: &str) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -60,8 +46,8 @@ fn make_token(mint_url: &str, amount_sat: u64, secret: &str) -> String {
     format!("cashuA{}", URL_SAFE_NO_PAD.encode(json.as_bytes()))
 }
 
-/// Stateful mock that records redeemed token strings so we can model
-/// replay detection (in-provider and cross-provider via a shared `Arc`).
+/// Records redeemed token strings, so replay detection can be modelled both
+/// in-provider and cross-provider (via a shared `Arc`).
 struct MockRedeemer {
     redeemed: Arc<Mutex<HashSet<String>>>,
     next_error: Arc<Mutex<Option<RedeemError>>>,
@@ -77,8 +63,7 @@ impl MockRedeemer {
         })
     }
 
-    /// Cause the next call to fail with the given error. After the call,
-    /// the slot resets and subsequent calls behave normally.
+    /// The slot resets after the call, so later calls behave normally.
     async fn fail_next_with(self: &Arc<Self>, err: RedeemError) {
         *self.next_error.lock().await = Some(err);
     }
@@ -106,8 +91,6 @@ impl MintRedeemer for MockRedeemer {
         use std::str::FromStr;
         let token = cdk::nuts::Token::from_str(token_str)
             .map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
-        // cdk: Token::value() returns the proof-amount sum without
-        // requiring keyset metadata. We're not redeeming, just summing.
         let amount = token
             .value()
             .map_err(|e| RedeemError::InvalidToken(e.to_string()))?;
@@ -249,8 +232,7 @@ async fn in_provider_replay_second_call_fails_already_spent() {
 
 #[tokio::test]
 async fn cross_provider_replay_only_one_swap_succeeds() {
-    // Two providers whose `MintRedeemer` instances share state — modelling
-    // the real-world property that the *mint* serializes spend attempts.
+    // Shared state models the real property: the *mint* serializes spends.
     let shared_mint = MockRedeemer::new();
     let provider_a = shared_mint.clone();
     let provider_b = shared_mint.clone();

@@ -1,8 +1,6 @@
-// `paygress-cli topup` — extend a workload's lease with more payment.
-//
-// Single-shot via Nostr (--provider) or HTTP (--server), or streaming
-// (--stream --tokens-file): one TopUp DM per tick, pulling fresh tokens
-// from the file until exhausted or Ctrl-C.
+// `paygress-cli topup` — extend a workload's lease with more payment,
+// single-shot via Nostr (--provider) or HTTP (--server), or streaming
+// (--stream --tokens-file): one TopUp DM per tick.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -23,7 +21,7 @@ pub struct TopupArgs {
     #[arg(short, long)]
     pub pod_id: String,
 
-    /// Cashu token for payment (single-shot mode only).
+    /// Cashu token for payment (single-shot mode only)
     #[arg(short = 'k', long)]
     pub token: Option<String>,
 
@@ -43,18 +41,15 @@ pub struct TopupArgs {
     #[arg(long)]
     pub relays: Option<String>,
 
-    /// Stream chunked top-ups: one TopUp DM per tick, pulling fresh
-    /// tokens from --tokens-file until exhausted or Ctrl-C
+    /// Stream chunked top-ups: one TopUp DM per tick from --tokens-file
     #[arg(long)]
     pub stream: bool,
 
-    /// Seconds between top-ups in streaming mode. Smaller ticks have
-    /// higher message overhead; larger ticks coarsen failover.
+    /// Seconds between top-ups in streaming mode
     #[arg(long, default_value_t = 60)]
     pub tick_secs: u64,
 
-    /// Path to a file with one Cashu token per line (streaming mode).
-    /// Blank lines and lines starting with `#` are ignored.
+    /// File with one Cashu token per line, streaming mode (`#` comments ignored)
     #[arg(long)]
     pub tokens_file: Option<PathBuf>,
 }
@@ -126,21 +121,18 @@ async fn execute_http_topup(
     Ok(())
 }
 
-/// Typed outcome of a Nostr topup round-trip, shared by the CLI
-/// pretty-printer and the MCP server.
+/// Shared by the CLI pretty-printer and the MCP server.
 #[derive(Debug, Clone)]
 pub enum NostrTopupOutcome {
     Success(paygress::nostr::TopUpResponseContent),
-    /// Provider rejected the topup (insufficient payment, lease
-    /// expired, not the owner, race-lost, ...). Error type strings are
-    /// stable — callers can match on them.
+    /// Provider rejected the topup; `error_type` strings are stable, so
+    /// callers can match on them.
     ProviderError(paygress::nostr::ErrorResponseContent),
     UnknownResponse(String),
     /// No reply in the timeout window. The token MAY have been spent.
     Timeout,
 }
 
-/// Dispatch one Nostr topup request and wait for the provider's reply.
 /// No stdout I/O — pure round-trip plus structured outcome.
 pub async fn nostr_topup_round_trip(
     pod_id: &str,
@@ -171,8 +163,6 @@ pub async fn nostr_topup_round_trip(
         .await
     {
         Ok(response) => {
-            // Success and error bodies have distinct shapes, so the
-            // wrong-type parse fails cleanly.
             if let Ok(s) = serde_json::from_str::<TopUpResponseContent>(&response.content) {
                 Ok(NostrTopupOutcome::Success(s))
             } else if let Ok(err) = serde_json::from_str::<ErrorResponseContent>(&response.content)
@@ -244,18 +234,11 @@ async fn execute_nostr_topup(provider_npub: String, args: TopupArgs, token: Stri
     Ok(())
 }
 
-/// Read tokens from a file (one per line). Blank lines and `#` comments
-/// are ignored. Returned in file order so callers can reason about
-/// per-tick spend predictably.
+/// Returned in file order, so per-tick spend stays predictable.
 pub fn read_tokens_file(path: &std::path::Path) -> Result<Vec<String>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
-    Ok(raw
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.to_string())
-        .collect())
+    Ok(crate::util::parse_token_lines(&raw))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,10 +250,8 @@ pub struct StreamSummary {
 
 pub type SendFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 
-/// Pull tokens off `tokens` and call `send_one` once per tick until the
-/// list is empty. Errors are counted but do not abort the loop — the
-/// wallet already paid for the chunk; retrying doesn't get it back.
-///
+/// Calls `send_one` once per tick until `tokens` is empty. Errors are
+/// counted but never abort the loop — the chunk is already paid for.
 /// Generic over the send function so tests can pass a recording mock.
 pub async fn run_stream_loop<F>(tokens: Vec<String>, tick: Duration, send_one: F) -> StreamSummary
 where

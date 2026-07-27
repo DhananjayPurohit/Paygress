@@ -5,8 +5,8 @@
 // `Authorization: Nostr <b64>`, tagged with the operation (`t`), the
 // post-encryption content hash (`x`) and an `expiration`.
 //
-// Callers encrypt before `put` and decrypt after `get` via
-// `crate::blossom_crypto`, so the server only ever sees ciphertext.
+// Callers encrypt/decrypt via `crate::blossom_crypto`, so the server
+// only ever sees ciphertext.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -17,7 +17,7 @@ use serde::Deserialize;
 const AUTH_KIND: u16 = 24242;
 const DEFAULT_AUTH_TTL_SECS: u64 = 60;
 
-/// Operation named in the auth event's `t` tag.
+/// Named in the auth event's `t` tag.
 #[derive(Debug, Clone, Copy)]
 pub enum BlossomOp {
     Upload,
@@ -35,7 +35,6 @@ impl BlossomOp {
     }
 }
 
-/// One client per (server, identity) pair.
 pub struct BlossomClient {
     http: HttpClient,
     server: String,
@@ -70,8 +69,8 @@ impl BlossomClient {
         self
     }
 
-    /// Upload already-encrypted ciphertext. The response's `sha256`
-    /// is the checkpoint's content address.
+    /// Upload already-encrypted ciphertext; the response's `sha256` is the
+    /// checkpoint's content address.
     pub async fn put(&self, bytes: Vec<u8>) -> Result<UploadResponse> {
         let hash = crate::blossom_crypto::sha256_hex(&bytes);
         let auth = self.build_auth_header(BlossomOp::Upload, &hash).await?;
@@ -98,8 +97,7 @@ impl BlossomClient {
         Ok(parsed)
     }
 
-    /// Fetch by hash. Bytes are still encrypted; the caller decrypts
-    /// via `blossom_crypto`.
+    /// Fetch by hash. Bytes are still encrypted.
     pub async fn get(&self, sha256: &str) -> Result<Vec<u8>> {
         let url = format!("{}/{}", self.server, sha256);
         let resp = self
@@ -130,7 +128,6 @@ impl BlossomClient {
         Ok(())
     }
 
-    /// Build the `Authorization: Nostr <base64>` header value.
     pub async fn build_auth_header(&self, op: BlossomOp, x_hash: &str) -> Result<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?

@@ -13,9 +13,8 @@ pub struct LxdBackend {
 }
 
 impl LxdBackend {
-    /// `network_device` is accepted for symmetry with the other
-    /// backends but unused: containers get their NIC from LXD's
-    /// default profile.
+    /// `network_device` is unused: containers get their NIC from LXD's default
+    /// profile.
     pub fn new(storage_pool: &str, _network_device: &str) -> Self {
         Self {
             storage_pool: storage_pool.to_string(),
@@ -39,9 +38,9 @@ impl LxdBackend {
 
     /// Run `lxc` with `stdin` piped in.
     ///
-    /// Exists so secrets never reach a command line or a shell: the
-    /// value is written to the child's stdin instead of being
-    /// interpolated into `sh -c`, where a quote in it would escape.
+    /// Exists so secrets never reach a command line or a shell: the value goes
+    /// to the child's stdin instead of being interpolated into `sh -c`, where a
+    /// quote in it would escape.
     async fn run_lxc_stdin(&self, args: &[&str], stdin_data: &str) -> Result<()> {
         use std::process::Stdio;
         use tokio::io::AsyncWriteExt;
@@ -69,15 +68,14 @@ impl LxdBackend {
         Ok(())
     }
 
-    /// `lxc list --format json` prints empty stdout (not `[]`) when
-    /// nothing exists, which `serde_json` rejects.
+    /// `lxc list --format json` prints empty stdout (not `[]`) when nothing
+    /// exists, which `serde_json` rejects.
     fn parse_lxc_json(raw: &str) -> Result<serde_json::Value> {
         let s = if raw.trim().is_empty() { "[]" } else { raw };
         serde_json::from_str(s).context("Failed to parse lxc list output")
     }
 
-    /// The configured pool if it exists, else the first pool `lxc
-    /// storage list` reports.
+    /// The configured pool if it exists, else the first one LXD reports.
     async fn resolve_storage_pool(&self) -> Result<String> {
         let raw = self
             .run_lxc(&["storage", "list", "--format", "json"])
@@ -86,8 +84,8 @@ impl LxdBackend {
 
         let names: Vec<String> = pools
             .as_array()
-            .unwrap_or(&vec![])
-            .iter()
+            .into_iter()
+            .flatten()
             .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
             .collect();
 
@@ -109,10 +107,10 @@ impl ComputeBackend for LxdBackend {
         let raw = self.run_lxc(&["list", "--format", "json"]).await?;
         let containers = Self::parse_lxc_json(&raw)?;
 
-        let existing_ids: Vec<u32> = containers
+        let existing_ids: std::collections::HashSet<u32> = containers
             .as_array()
-            .unwrap_or(&vec![])
-            .iter()
+            .into_iter()
+            .flatten()
             .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
             .filter_map(crate::compute::id_from_container_name)
             .collect();
@@ -162,9 +160,8 @@ impl ComputeBackend for LxdBackend {
         ])
         .await?;
 
-        // Set the root password regardless of the image's default
-        // user, retrying while the container finishes booting. The
-        // credential goes over stdin, never through a shell.
+        // Retry while the container finishes booting. The credential goes over
+        // stdin, never through a shell.
         let credential = format!("root:{}\n", config.password);
         for _ in 0..10 {
             match self
@@ -241,19 +238,18 @@ impl ComputeBackend for LxdBackend {
             None => ContainerStatus::Absent,
             Some(c) => match c.get("status").and_then(|s| s.as_str()) {
                 Some("Running") => ContainerStatus::Running,
-                // Stopped, Frozen and anything else are all "not
-                // serving the tenant" for our purposes.
+                // Stopped, Frozen and anything else are all "not serving the
+                // tenant" for our purposes.
                 Some(_) => ContainerStatus::Stopped,
                 None => ContainerStatus::Running,
             },
         })
     }
 
-    /// Idempotent: `lxc stop` exits non-zero on an already-stopped
-    /// instance, which is a normal state here — CI workloads power
-    /// themselves off when their job ends. Treating that as an error
-    /// would strand the container, since the cleanup path only
-    /// deletes after a successful stop.
+    /// Idempotent: `lxc stop` exits non-zero on an already-stopped instance,
+    /// which is a normal state here — CI workloads power themselves off when
+    /// their job ends. Treating that as an error would strand the container,
+    /// since the cleanup path only deletes after a successful stop.
     async fn stop_container(&self, id: u32) -> Result<()> {
         match self.run_lxc(&["stop", &container_name(id)]).await {
             Ok(_) => Ok(()),

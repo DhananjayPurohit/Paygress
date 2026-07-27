@@ -1,13 +1,9 @@
 // `paygress-snapshot` — crawl Nostr for the marketplace's live state
 // and write a single JSON snapshot the static dashboard reads.
 //
-// Pure I/O glue: queries provider offers + recent heartbeats, drops
-// receipts/consumers/stake-statuses (left as `Default::default()`
-// because this snapshot is for at-a-glance dashboarding, not the full
-// reputation aggregation that needs a real receipt corpus). Routes
-// through `paygress::observatory::aggregator::compute_snapshot` so
-// the wire format matches what other tools (and the spec) already
-// expect.
+// I/O glue only. Receipts / consumers / stake statuses are left empty:
+// this snapshot is for at-a-glance dashboarding, not the full reputation
+// aggregation, which needs a real receipt corpus.
 //
 // Usage:
 //     cargo run --release --bin paygress-snapshot -- \
@@ -37,8 +33,7 @@ struct Args {
     )]
     relays: String,
 
-    /// Heartbeat lookback window in seconds. Recent heartbeats inform
-    /// the dashboard's last-seen / online indicators.
+    /// Heartbeat lookback window in seconds, feeding the last-seen column.
     #[arg(long, default_value_t = 600)]
     heartbeat_window_secs: u64,
 
@@ -46,12 +41,9 @@ struct Args {
     #[arg(long, default_value = "")]
     anchors: String,
 
-    /// Subscription timeout per query in seconds. The default of
-    /// 15s is conservative: relay cold-handshake + REQ + EOSE can
-    /// easily exceed a 5s budget, and tighter timeouts silently
-    /// drop events (verified empirically — at 5s the snapshot
-    /// showed 0 last-seen even with the relay holding the events;
-    /// at 15s it correctly populates).
+    /// Subscription timeout per query in seconds. Relay cold-handshake +
+    /// REQ + EOSE exceeds a 5s budget and silently drops events; measured
+    /// at 0 last-seen rows on 5s, correct on 15s.
     #[arg(long, default_value_t = 15)]
     timeout_secs: u64,
 }
@@ -83,20 +75,18 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    let relay_count = relays.len();
     let nostr = NostrRelaySubscriber::new(RelayConfig {
-        relays: relays.clone(),
+        relays,
         private_key: None,
     })
     .await
     .context("connect to relays")?;
 
-    eprintln!("querying offers from {} relays...", relays.len());
+    eprintln!("querying offers from {} relays...", relay_count);
     let offers = nostr.query_providers().await.context("query offers")?;
     eprintln!("got {} offers", offers.len());
 
-    // Heartbeats: query each provider's recent activity. Keeps the
-    // snapshot at-a-glance fast; the full uptime aggregator runs at
-    // a different cadence.
     eprintln!(
         "querying heartbeats (last {}s) for {} providers...",
         args.heartbeat_window_secs,
@@ -106,11 +96,9 @@ async fn main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let since = now.saturating_sub(args.heartbeat_window_secs);
-    let provider_npubs: Vec<String> = offers.iter().map(|o| o.provider_npub.clone()).collect();
     let mut heartbeats = Vec::new();
-    for npub in &provider_npubs {
-        // Per-provider with a short timeout so a slow / silent
-        // provider doesn't hold up the whole crawl.
+    for npub in offers.iter().map(|o| o.provider_npub.as_str()) {
+        // Per-provider timeout so one silent provider can't stall the crawl.
         match tokio::time::timeout(
             Duration::from_secs(args.timeout_secs),
             nostr.query_heartbeats(npub, since),

@@ -5,13 +5,10 @@
 //   /dev/mapper/paygress-<id>-luks       device-mapper alias after luksOpen
 //   /var/lib/paygress/mounts/<id>/       ext4 mountpoint (the `-v` source)
 //
-// Threat model: defends against post-eviction disk forensics, lazy
-// operator backups, co-tenant access to shared storage and cold-disk
-// seizure. It does NOT defend against a live host reading the key out
-// of the kernel keyring or /proc/<pid>/mem — that needs SEV-SNP / TDX.
-//
-// The key is passed to cryptsetup on stdin (`--key-file=-`) so it
-// never lands on a command line where `ps` would leak it.
+// Threat model: defends against post-eviction disk forensics, operator
+// backups, co-tenant access to shared storage and cold-disk seizure. It
+// does NOT defend against a live host reading the key out of the kernel
+// keyring or /proc/<pid>/mem — that needs SEV-SNP / TDX.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -25,8 +22,7 @@ use crate::compute::run_checked;
 
 const VOLUME_ROOT: &str = "/var/lib/paygress";
 
-/// Device-mapper name, stable per `id` so cleanup can find it again
-/// after a provider crash.
+/// Stable per `id` so cleanup can find it again after a provider crash.
 fn mapper_name(id: u32) -> String {
     format!("paygress-{}-luks", id)
 }
@@ -47,7 +43,6 @@ fn mapper_device(id: u32) -> PathBuf {
     PathBuf::from("/dev/mapper").join(mapper_name(id))
 }
 
-/// Handle to a created, opened and mounted encrypted volume.
 /// Deliberately has no `Drop` impl: teardown is explicit via
 /// `destroy_encrypted_volume`, so retry paths can't double-destroy.
 #[derive(Debug, Clone)]
@@ -56,7 +51,6 @@ pub struct EncryptedVolume {
     pub mount_path: PathBuf,
 }
 
-/// Verify cryptsetup is on PATH, returning its version string.
 pub async fn check_cryptsetup_available() -> Result<String> {
     let out = Command::new("cryptsetup")
         .arg("--version")
@@ -74,8 +68,7 @@ pub async fn check_cryptsetup_available() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Create + format + open + mount a LUKS volume for `id`, returning
-/// the mount path to bind into the container. Rolls back partial
+/// Create + format + open + mount a LUKS volume for `id`. Rolls back partial
 /// state on failure so a retry at the same id starts clean.
 pub async fn create_encrypted_volume(
     id: u32,
@@ -99,11 +92,7 @@ pub async fn create_encrypted_volume(
     // and luksOpen then fails with "device already exists". Destroy is
     // idempotent, so running it first makes create self-healing.
     if let Err(e) = destroy_encrypted_volume(id).await {
-        warn!(
-            "pre-create cleanup of id={} returned {}; continuing — \
-             create steps will surface any persistent state",
-            id, e
-        );
+        warn!("pre-create cleanup of id={} returned {}; continuing", id, e);
     }
 
     tokio::fs::create_dir_all(img.parent().context("image path has no parent")?)
@@ -174,10 +163,9 @@ pub async fn create_encrypted_volume(
     })
 }
 
-/// Tear down everything `create_encrypted_volume` set up. Idempotent
-/// — never errors on "already gone". Order matters: umount releases
-/// the block device, luksClose releases the mapper entry and the key
-/// from keyring memory, and luksErase overwrites every keyslot so the
+/// Idempotent teardown — never errors on "already gone". Order matters:
+/// umount releases the block device, luksClose releases the mapper entry and
+/// the key from keyring memory, and luksErase overwrites every keyslot so the
 /// payload is unrecoverable even from a copy taken beforehand.
 pub async fn destroy_encrypted_volume(id: u32) -> Result<()> {
     let img = image_path(id);
@@ -207,7 +195,6 @@ pub async fn destroy_encrypted_volume(id: u32) -> Result<()> {
     let _ = run_quiet("cryptsetup", &["luksClose", &mapper_n]).await;
 
     if img.exists() {
-        // luksErase wipes all keyslots without needing the key.
         if let Err(e) = run_checked("cryptsetup", &["luksErase", "--batch-mode", &img_str]).await {
             warn!("cryptsetup luksErase {} non-fatal: {}", img_str, e);
         }
@@ -223,8 +210,8 @@ pub async fn destroy_encrypted_volume(id: u32) -> Result<()> {
     Ok(())
 }
 
-/// Feed `key` to `prog` on stdin (for cryptsetup `--key-file=-`) so
-/// the key bytes never appear on a command line or in a log.
+/// Feed `key` to `prog` on stdin (cryptsetup `--key-file=-`) so the key bytes
+/// never appear on a command line where `ps` would leak them.
 async fn run_with_key_stdin(prog: &str, args: &[&str], key: &[u8; 32]) -> Result<()> {
     let mut child = Command::new(prog)
         .args(args)
@@ -301,9 +288,6 @@ mod tests {
         assert_ne!(mount_path(1), mount_path(2));
     }
 
-    /// `create_encrypted_volume`'s pre-create cleanup calls destroy
-    /// first, so destroy must be a no-op on a fresh host.
-    ///
     /// Ignored: shells out to cryptsetup/umount against the real
     /// filesystem, so it runs in the VPS acceptance suite only.
     #[tokio::test]
