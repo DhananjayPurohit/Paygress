@@ -11,6 +11,8 @@ use super::ssh::{run_ssh_command, write_remote_file};
 use super::{step_banner, BootstrapArgs};
 use crate::util::split_csv;
 
+use super::ngx_l402::HTTP_BIND_ADDR;
+
 const CONFIG_PATH: &str = "/etc/paygress/provider-config.json";
 const SERVICE_PATH: &str = "/etc/systemd/system/paygress-provider.service";
 
@@ -159,6 +161,10 @@ fn render_provider_config(
         "minimum_duration_seconds": 60,
         "cashu_wallet_db_path": "/var/lib/paygress/cashu-wallet.sqlite",
         "lightning_address": &args.lightning_address,
+        // Only when ngx_l402 is deployed (step 8, which needs a Lightning
+        // address). The axum backend must never run without a paywall in
+        // front, and loopback is what lets it trust the paywall's headers.
+        "http_bind_addr": args.lightning_address.as_ref().map(|_| HTTP_BIND_ADDR),
     });
 
     Ok(serde_json::to_string_pretty(&config)?)
@@ -232,6 +238,24 @@ mod tests {
             sweep_min_balance_sats: 100,
             root_key: None,
         }
+    }
+
+    #[test]
+    fn http_interface_is_enabled_only_behind_the_paywall() {
+        // The axum backend must never be running without ngx_l402 in front:
+        // it trusts the paywall's settled-amount header.
+        let mut a = args(None, "https://testnut.cashu.space");
+        assert!(render(&a)["http_bind_addr"].is_null());
+
+        a.lightning_address = Some("you@getalby.com".to_string());
+        assert_eq!(render(&a)["http_bind_addr"], HTTP_BIND_ADDR);
+    }
+
+    #[test]
+    fn http_bind_stays_on_loopback() {
+        // Any other address and the provider stops believing the header,
+        // silently falling back to decoding instruments.
+        assert!(paygress::provider_http::is_loopback_bind(HTTP_BIND_ADDR));
     }
 
     fn render(args: &BootstrapArgs) -> serde_json::Value {

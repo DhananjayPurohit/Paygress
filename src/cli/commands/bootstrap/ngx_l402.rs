@@ -1,5 +1,10 @@
-// ngx_l402 deployment: an L402 paywall in front of the axum backend
+// ngx_l402 deployment: the paywall in front of the provider's HTTP API,
 // plus a periodic sweep of accumulated ecash to Lightning.
+//
+// The nginx container runs with `network_mode: host` so it can reach the
+// backend on loopback. That is not a convenience: the backend only trusts
+// the paywall's settled-amount header when bound to loopback, and a bridged
+// container would force it onto a reachable address.
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -12,6 +17,10 @@ use super::{step_banner, BootstrapArgs};
 // The image's baked-in nginx.conf references grpc-content-server (used by
 // the ngx_l402 test suite), which doesn't exist in a Paygress deployment
 // and crash-loops nginx. Mount over it.
+/// Where the provider's axum interface listens. Loopback-only — see the
+/// module comment.
+pub(super) const HTTP_BIND_ADDR: &str = "127.0.0.1:8080";
+
 const NGINX_CONF: &str = r#"user  nginx;
 worker_processes  auto;
 
@@ -34,11 +43,32 @@ http {
         listen [::]:80;
         server_name _;
 
-        location / {
-            root   /usr/share/nginx/html;
+        # Provider API behind the paywall. ngx_l402 answers 402 until the
+        # request carries payment, settles it, then proxies here.
+        location /pods/ {
             l402    on;
             l402_amount_msat_default    10000;
             l402_macaroon_timeout 0;
+
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_read_timeout 300s;
+        }
+
+        # Free: offers and health carry no payment and gate nothing.
+        location /offers {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+        }
+
+        location /health {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+        }
+
+        location / {
+            root   /usr/share/nginx/html;
             try_files $uri $uri/index.html =404;
         }
 
@@ -58,8 +88,10 @@ const DOCKER_COMPOSE: &str = r#"services:
     image: ghcr.io/ngx-l402/ngx-l402:latest
     container_name: nginx-l402
     restart: always
-    ports:
-      - "80:80"
+    # Host networking so nginx reaches the provider on 127.0.0.1:8080. A
+    # bridged container cannot, and moving the backend off loopback would
+    # make its settled-amount header untrustworthy.
+    network_mode: host
     env_file:
       - .env
     environment:

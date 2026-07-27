@@ -168,7 +168,7 @@ fn settled_amount_msats(headers: &HeaderMap, trust_paywall_headers: bool) -> Opt
 
 /// True when the only thing that can reach this socket is a paywall on the same
 /// host, which is what makes `PAYMENT_AMOUNT_HEADER` safe to believe.
-pub(crate) fn is_loopback_bind(bind_addr: &str) -> bool {
+pub fn is_loopback_bind(bind_addr: &str) -> bool {
     let host = match bind_addr.rsplit_once(':') {
         Some((h, _)) => h,
         None => bind_addr,
