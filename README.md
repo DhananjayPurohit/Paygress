@@ -37,7 +37,7 @@ graph LR
 In plain English, what Paygress lets a user do today:
 
 - **Rent a Linux container by the second.** Hand it a prepaid voucher, get a container running on someone else's machine. No signup, no credit card, no email. The container shuts down when the voucher runs out; extend the lease anytime by handing over another voucher.
-- **Pick from seven ready-made boxes.** Generic Python + Node sandbox (with a built-in HTTP exec endpoint — run code without SSH); AI inference endpoint (Ollama, OpenAI-compatible API); Nostr relay; disposable headless Chrome; Bitcoin node; OpenClaw; and a one-shot ngit CI runner.
+- **Pick from six ready-made boxes.** Generic Python + Node sandbox (with a built-in HTTP exec endpoint — run code without SSH); AI inference endpoint (Ollama, OpenAI-compatible API); Nostr relay; disposable headless Chrome; Bitcoin node; and OpenClaw.
 - **Run code inside the sandbox without SSH.** The agent-sandbox template ships with a bundled HTTP exec server. POST a command, get back stdout/stderr/exit code. Same credentials as SSH, no extra setup.
 - **Run many containers in parallel.** One command spawns N containers, splits a single voucher N ways automatically, hands you a JSON manifest with each one's address. Built for batch jobs (render farms, ML batch inference), CI matrices (one runner per OS/version), and map-reduce workloads.
 - **Long-running services with automatic failover.** Pay 3 hosts at once (one primary, two standbys). The primary runs the actual container and pings the network every minute. If it stops pinging — machine crashed, network died — the first standby takes over within ~30 seconds, becomes the new primary. (V1 caveat: best-effort single-writer for ~30s during failover; ideal for relays / stateless services, see PR #43 for the full story.)
@@ -163,6 +163,41 @@ paygress-cli status --server http://my-server:8080 --pod-id <ID>
 ```
 
 Both paths write into the same wallet, so a provider can run either or both.
+
+### CI jobs (execution adapter)
+
+`paygress-cli adapter` is a sandbox provider for CI coordinators. It listens on a
+Unix socket speaking the [Loom execution-adapter
+protocol](https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-ci)
+— the same contract [ngit-ci](https://ngit.dev) uses for its own sandboxes — and
+buys one workload per job, runs the job in it over SSH, and streams the output
+back. No pool, no reuse: the box dies when its lease runs out.
+
+```bash
+paygress-cli adapter \
+  --socket /run/paygress-adapter.sock \
+  --provider SwiftGoldenOwl \
+  --image paygress-ci \
+  --token-command "paygress-cli wallet mint --mint https://testnut.cashu.space --amount 60"
+```
+
+Then point the coordinator at it (`ngit-ci --runner socket-adapter
+--adapter-socket /run/paygress-adapter.sock`). The adapter host needs `sshpass`.
+
+A CI job needs `bash`, `git`, `act` and a container daemon in the sandbox, which
+no Docker template provides — `act` cannot have the host's daemon socket without
+handing workflow code the host. Build a sandbox that carries its own daemon
+instead:
+
+| Provider backend | Build with | Spawn with |
+| --- | --- | --- |
+| LXD | `images/ci-sandbox/build-lxd.sh` on the provider host | `--image paygress-ci` |
+| KVM | `images/ci-sandbox/build.sh`, then `kvm_base_image_path` in the provider config | no `--image` — the base image is the sandbox |
+
+Both bake docker and act in. The LXD route runs the job's daemon nested inside
+an unprivileged container (`security.nesting=true`, which the backend already
+sets) and needs no `/dev/kvm`, so it works on a VPS. The KVM route gives each
+job its own kernel and is the one to serve third-party PRs from.
 
 ---
 
@@ -333,7 +368,7 @@ graph TB
     end
 
     subgraph workloads["Workloads"]
-        T["7 templates<br/><small>relay · inference · browser<br/>bitcoin · sandbox · openclaw · ngit-runner</small>"]
+        T["6 templates<br/><small>relay · inference · browser<br/>bitcoin · sandbox · openclaw</small>"]
         RAW["or a bare box"]
     end
 
