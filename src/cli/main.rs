@@ -7,7 +7,8 @@ mod exec_client;
 mod util;
 
 use commands::{
-    batch, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system, topup, wallet,
+    adapter, batch, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system, topup,
+    wallet,
 };
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
@@ -48,6 +49,9 @@ enum Commands {
     /// Run a Model Context Protocol (MCP) server over stdio
     Mcp(mcp::McpArgs),
 
+    /// Run a CI execution adapter that buys a sandbox per job
+    Adapter(adapter::AdapterArgs),
+
     /// Run a shell command inside a spawned agent-sandbox workload
     Exec(exec::ExecArgs),
 
@@ -76,7 +80,11 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
+                // `adapter` is a daemon whose per-job lines are the only record
+                // of what it bought and attested to; the rest stays quiet.
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("error,paygress_cli::commands::adapter=info")
+                }),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -95,6 +103,7 @@ async fn main() {
         Commands::Status(args) => status::execute(args, cli.verbose).await,
         Commands::Batch(args) => batch::execute(args, cli.verbose).await,
         Commands::Mcp(args) => mcp::execute(args, cli.verbose).await,
+        Commands::Adapter(args) => adapter::execute(args, cli.verbose).await,
         Commands::Exec(args) => exec::execute(args, cli.verbose).await,
         Commands::Wallet(args) => wallet::execute(args).await,
         Commands::Provider(args) => provider::execute(args, cli.verbose).await,

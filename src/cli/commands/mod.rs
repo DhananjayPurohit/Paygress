@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod batch;
 pub mod bootstrap;
 pub mod deploy;

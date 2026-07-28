@@ -189,4 +189,47 @@ impl NostrRelaySubscriber {
             }
         }
     }
+
+    /// Publish an arbitrary signed event. The kind and tags are the caller's
+    /// schema, not ours — used for CI job results, whose shape belongs to the
+    /// ngit-ci NIP rather than to paygress.
+    pub async fn publish_foreign_event(
+        &self,
+        kind: u16,
+        content: String,
+        tags: Vec<Vec<String>>,
+    ) -> Result<String> {
+        let parsed: Result<Vec<Tag>, _> = tags.iter().map(Tag::parse).collect();
+        let event = EventBuilder::new(Kind::Custom(kind), content)
+            .tags(parsed?)
+            .sign_with_keys(&self.keys)?;
+        let event_id = event.id.to_hex();
+
+        match self.client.send_event(&event).await {
+            Ok(out) if out.success.is_empty() => {
+                // `send_event` succeeds as long as the send itself did not
+                // error, so an event every relay refused looks identical to a
+                // published one unless the acceptances are counted.
+                Err(anyhow::anyhow!(
+                    "kind-{} event {} was accepted by no relay ({} refused)",
+                    kind,
+                    event_id,
+                    out.failed.len()
+                ))
+            }
+            Ok(out) => {
+                info!(
+                    "Published kind-{} event {}: accepted by {} relay(s)",
+                    kind,
+                    event_id,
+                    out.success.len()
+                );
+                Ok(event_id)
+            }
+            Err(e) => {
+                error!("Failed to publish kind-{} event: {}", kind, e);
+                Err(e.into())
+            }
+        }
+    }
 }

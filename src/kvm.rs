@@ -29,7 +29,9 @@ pub struct KvmConfig {
     /// Read-only base cloud image; per-VM qcow2 overlays sit on top. Downloaded
     /// on first spawn if absent.
     pub base_image_path: PathBuf,
-    pub base_image_url: String,
+    /// `None` means the operator supplies the file themselves and a missing
+    /// one is an error rather than something to fetch.
+    pub base_image_url: Option<String>,
     pub vm_root: PathBuf,
 }
 
@@ -39,8 +41,31 @@ impl Default for KvmConfig {
             base_image_path: PathBuf::from(VM_ROOT)
                 .join("base")
                 .join(DEFAULT_BASE_IMAGE_FILE),
-            base_image_url: DEFAULT_BASE_IMAGE_URL.to_string(),
+            base_image_url: Some(DEFAULT_BASE_IMAGE_URL.to_string()),
             vm_root: PathBuf::from(VM_ROOT),
+        }
+    }
+}
+
+impl KvmConfig {
+    /// Overrides from the provider's config, each falling back to the stock
+    /// Ubuntu default. A CI provider sets both to an image carrying docker and
+    /// act; setting only the path serves a file the operator placed there and
+    /// never downloads.
+    pub fn for_provider(base_image_path: Option<&str>, base_image_url: Option<&str>) -> Self {
+        let defaults = Self::default();
+        if base_image_path.is_none() && base_image_url.is_none() {
+            return defaults;
+        }
+        Self {
+            base_image_path: base_image_path
+                .map(PathBuf::from)
+                .unwrap_or(defaults.base_image_path),
+            // Deliberately not falling back to the stock URL: downloading
+            // Ubuntu into a path the operator named `ci-sandbox.qcow2` would
+            // serve the wrong image under the right name.
+            base_image_url: base_image_url.map(str::to_string),
+            vm_root: defaults.vm_root,
         }
     }
 }
@@ -94,6 +119,13 @@ impl KvmBackend {
         if self.config.base_image_path.exists() {
             return Ok(());
         }
+        let Some(url) = self.config.base_image_url.as_deref() else {
+            anyhow::bail!(
+                "base image {} is missing and no download URL is configured; \
+                 build one with images/ci-sandbox/build.sh or set kvm_base_image_url",
+                self.config.base_image_path.display()
+            );
+        };
         let parent = self
             .config
             .base_image_path
@@ -104,7 +136,7 @@ impl KvmBackend {
             .context("create base image directory")?;
         info!(
             "Downloading base image from {} to {}",
-            self.config.base_image_url,
+            url,
             self.config.base_image_path.display()
         );
         run_checked(
@@ -113,7 +145,7 @@ impl KvmBackend {
                 "-fsSL",
                 "-o",
                 self.config.base_image_path.to_string_lossy().as_ref(),
-                &self.config.base_image_url,
+                url,
             ],
         )
         .await
@@ -476,5 +508,39 @@ mod tests {
         let ud = KvmBackend::user_data("hunter2");
         assert!(ud.contains("ssh_pwauth: true"));
         assert!(ud.contains("root:hunter2"));
+    }
+
+    #[test]
+    fn unconfigured_provider_keeps_the_stock_image() {
+        let config = KvmConfig::for_provider(None, None);
+        assert_eq!(config.base_image_path, KvmConfig::default().base_image_path);
+        assert_eq!(
+            config.base_image_url.as_deref(),
+            Some(DEFAULT_BASE_IMAGE_URL)
+        );
+    }
+
+    #[test]
+    fn a_custom_image_path_alone_never_downloads() {
+        // Otherwise a provider serving `ci-sandbox.qcow2` would silently fetch
+        // stock Ubuntu into that name and run CI jobs without docker or act.
+        let config = KvmConfig::for_provider(Some("/srv/ci-sandbox.qcow2"), None);
+        assert_eq!(
+            config.base_image_path,
+            PathBuf::from("/srv/ci-sandbox.qcow2")
+        );
+        assert!(config.base_image_url.is_none());
+    }
+
+    #[test]
+    fn a_configured_url_is_used_verbatim() {
+        let config = KvmConfig::for_provider(
+            Some("/srv/ci-sandbox.qcow2"),
+            Some("https://example.invalid/ci.qcow2"),
+        );
+        assert_eq!(
+            config.base_image_url.as_deref(),
+            Some("https://example.invalid/ci.qcow2")
+        );
     }
 }
