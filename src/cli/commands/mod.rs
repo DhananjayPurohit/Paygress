@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod batch;
+pub mod blossom;
 pub mod bootstrap;
 pub mod deploy;
 pub mod exec;

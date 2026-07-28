@@ -7,8 +7,8 @@ mod exec_client;
 mod util;
 
 use commands::{
-    adapter, batch, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system, topup,
-    wallet,
+    adapter, batch, blossom, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system,
+    topup, wallet,
 };
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
@@ -58,6 +58,9 @@ enum Commands {
     /// Local token utilities
     Wallet(wallet::WalletArgs),
 
+    /// Blossom blob storage utilities
+    Blossom(blossom::BlossomArgs),
+
     /// Provider management - setup, start, stop, status
     Provider(provider::ProviderArgs),
 
@@ -106,6 +109,7 @@ async fn main() {
         Commands::Adapter(args) => adapter::execute(args, cli.verbose).await,
         Commands::Exec(args) => exec::execute(args, cli.verbose).await,
         Commands::Wallet(args) => wallet::execute(args).await,
+        Commands::Blossom(args) => blossom::execute(args, cli.verbose).await,
         Commands::Provider(args) => provider::execute(args, cli.verbose).await,
         Commands::Bootstrap(args) => bootstrap::execute(args, cli.verbose).await,
         Commands::System(args) => system::execute(args, cli.verbose).await,

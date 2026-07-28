@@ -3,7 +3,7 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use nostr_sdk::Keys;
-use wiremock::matchers::{header_exists, method, path, path_regex};
+use wiremock::matchers::{header, header_exists, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use paygress::blossom::{BlossomClient, BlossomOp};
@@ -128,6 +128,68 @@ async fn upload_5xx_is_surfaced_as_error() {
         "error must surface server status, got: {}",
         msg
     );
+}
+
+#[tokio::test]
+async fn check_upload_sends_signed_bud06_headers() {
+    let (server, client) = stub_server().await;
+
+    let hash = "a".repeat(64);
+    Mock::given(method("HEAD"))
+        .and(path("/upload"))
+        .and(header_exists("authorization"))
+        .and(header("x-sha-256", hash.as_str()))
+        .and(header("x-content-length", "191889408"))
+        .and(header("x-content-type", "application/octet-stream"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let check = client
+        .check_upload(&hash, 191_889_408, Some("application/octet-stream"))
+        .await
+        .expect("probe completes");
+    assert!(check.accepted());
+    assert!(!check.unsupported());
+}
+
+#[tokio::test]
+async fn check_upload_reports_refusal_with_reason_instead_of_erroring() {
+    let (server, client) = stub_server().await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/upload"))
+        .respond_with(
+            ResponseTemplate::new(413).insert_header("X-Reason", "File too large, max 100MB"),
+        )
+        .mount(&server)
+        .await;
+
+    let check = client
+        .check_upload(&"b".repeat(64), 191_889_408, None)
+        .await
+        .expect("a refusal is an answer, not a transport error");
+    assert_eq!(check.status, 413);
+    assert!(!check.accepted());
+    assert_eq!(check.reason.as_deref(), Some("File too large, max 100MB"));
+}
+
+#[tokio::test]
+async fn check_upload_flags_servers_without_bud06_as_unsupported() {
+    let (server, client) = stub_server().await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/upload"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let check = client
+        .check_upload(&"c".repeat(64), 1024, None)
+        .await
+        .expect("probe completes");
+    assert!(check.unsupported(), "404 must not read as a size refusal");
+    assert!(!check.accepted());
 }
 
 #[tokio::test]
