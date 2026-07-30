@@ -90,6 +90,11 @@ impl ProviderService {
             BackendType::LXD => Arc::new(LxdBackend::new(
                 &config.proxmox_storage, // storage field doubles as the pool name
                 &config.proxmox_bridge,  // bridge field doubles as the network
+                // A provider that advertises `nesting` is promising workloads
+                // can run containers; one that does not gets containers that
+                // cannot. Reading it from the same list the offer carries keeps
+                // the promise and the grant in step.
+                crate::lxd::nesting_from_capabilities(&config.capabilities),
             )),
             BackendType::Docker => Arc::new(DockerBackend::new()),
             BackendType::Kvm => {
