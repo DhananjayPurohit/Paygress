@@ -10,14 +10,35 @@ use tracing::info;
 
 pub struct LxdBackend {
     storage_pool: String,
+    /// Whether launched containers may run containers of their own.
+    nesting: bool,
+}
+
+/// Whether a provider advertising `capabilities` is offering nested containers.
+///
+/// Kept next to the code that acts on it, and matched case-insensitively
+/// because these strings are hand-written in provider config files. A typo
+/// costs the provider CI work rather than granting something it did not mean
+/// to, which is the right way round for a capability that lets a renter run
+/// containers.
+pub fn nesting_from_capabilities<S: AsRef<str>>(capabilities: &[S]) -> bool {
+    capabilities
+        .iter()
+        .any(|c| c.as_ref().trim().eq_ignore_ascii_case("nesting"))
 }
 
 impl LxdBackend {
     /// `network_device` is unused: containers get their NIC from LXD's default
     /// profile.
-    pub fn new(storage_pool: &str, _network_device: &str) -> Self {
+    ///
+    /// `nesting` decides whether workloads may run containers of their own. It
+    /// comes from the provider advertising the `nesting` capability rather than
+    /// from a separate setting, so what an offer claims and what a container
+    /// can actually do cannot drift apart.
+    pub fn new(storage_pool: &str, _network_device: &str, nesting: bool) -> Self {
         Self {
             storage_pool: storage_pool.to_string(),
+            nesting,
         }
     }
 
@@ -145,20 +166,20 @@ impl ComputeBackend for LxdBackend {
         let pool = self.resolve_storage_pool().await?;
         info!("Using storage pool: {}", pool);
 
-        self.run_lxc(&[
-            "launch",
-            image,
-            &name,
-            "-s",
-            &pool,
-            "-c",
-            &cpu_limit,
-            "-c",
-            &mem_limit,
-            "-c",
-            "security.nesting=true",
-        ])
-        .await?;
+        // Nesting is what lets a workload run its own containers — a CI job
+        // needing docker-in-docker cannot work without it. It is also a real
+        // grant: with it, everything the renter runs can create containers. So
+        // it is the provider's call, expressed by advertising the capability,
+        // and off for providers that do not.
+        let mut args = vec![
+            "launch", image, &name, "-s", &pool, "-c", &cpu_limit, "-c", &mem_limit,
+        ];
+        if self.nesting {
+            args.push("-c");
+            args.push("security.nesting=true");
+        }
+
+        self.run_lxc(&args).await?;
 
         // Retry while the container finishes booting. The credential goes over
         // stdin, never through a shell.
@@ -343,5 +364,41 @@ impl ComputeBackend for LxdBackend {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nesting_from_capabilities;
+
+    #[test]
+    fn advertising_nesting_enables_it() {
+        assert!(nesting_from_capabilities(&[
+            "lxc", "vm", "nesting", "docker"
+        ]));
+    }
+
+    #[test]
+    fn not_advertising_nesting_leaves_it_off() {
+        // The default provider config advertises only "lxc", so an operator who
+        // never opted in must not be handing out nesting.
+        assert!(!nesting_from_capabilities(&["lxc"]));
+        assert!(!nesting_from_capabilities::<&str>(&[]));
+    }
+
+    #[test]
+    fn matching_ignores_case_and_padding() {
+        assert!(nesting_from_capabilities(&["Nesting"]));
+        assert!(nesting_from_capabilities(&[" nesting "]));
+    }
+
+    // "nested" is not "nesting": a near-miss must not grant the capability.
+    #[test]
+    fn near_misses_do_not_grant_it() {
+        assert!(!nesting_from_capabilities(&[
+            "nested",
+            "nest",
+            "nesting-vm"
+        ]));
     }
 }

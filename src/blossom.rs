@@ -1,5 +1,6 @@
 // Blossom client — the BUD-01/02/04 subset needed for warm-standby
-// checkpoint storage: PUT /upload, GET /<sha256>, DELETE /<sha256>.
+// checkpoint storage: PUT /upload, GET /<sha256>, DELETE /<sha256>,
+// plus the BUD-06 HEAD /upload pre-flight.
 //
 // Auth is a NIP-98-style kind-24242 Nostr event, base64-JSON in
 // `Authorization: Nostr <b64>`, tagged with the operation (`t`), the
@@ -54,6 +55,27 @@ pub struct UploadResponse {
     pub uploaded: u64,
 }
 
+/// `HEAD /upload` outcome (BUD-06). A refusal is an answer, not an error, so
+/// the status travels back intact instead of being flattened into `Err`.
+#[derive(Debug, Clone)]
+pub struct UploadCheck {
+    pub status: u16,
+    /// `X-Reason`, the server's human-readable explanation when it says no.
+    pub reason: Option<String>,
+}
+
+impl UploadCheck {
+    pub fn accepted(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// Servers that never implemented BUD-06 answer the probe itself, not the
+    /// question — treating that as a refusal would rule out a usable server.
+    pub fn unsupported(&self) -> bool {
+        matches!(self.status, 404 | 405 | 501)
+    }
+}
+
 impl BlossomClient {
     pub fn new(server: impl Into<String>, keys: Keys) -> Self {
         Self {
@@ -95,6 +117,42 @@ impl BlossomClient {
 
         let parsed: UploadResponse = resp.json().await.context("parse Blossom upload response")?;
         Ok(parsed)
+    }
+
+    /// Ask whether the server would accept a blob of this size and hash before
+    /// spending the bandwidth to find out (BUD-06). The authorization event is
+    /// the same one `put` would send — an unsigned probe is rejected with 401
+    /// before the size is ever looked at.
+    pub async fn check_upload(
+        &self,
+        sha256: &str,
+        size: u64,
+        mime_type: Option<&str>,
+    ) -> Result<UploadCheck> {
+        let auth = self.build_auth_header(BlossomOp::Upload, sha256).await?;
+        let url = format!("{}/upload", self.server);
+
+        let mut req = self
+            .http
+            .head(&url)
+            .header("Authorization", auth)
+            .header("X-SHA-256", sha256)
+            .header("X-Content-Length", size.to_string());
+        if let Some(mime) = mime_type {
+            req = req.header("X-Content-Type", mime);
+        }
+
+        let resp = req.send().await.with_context(|| format!("HEAD {}", url))?;
+        let reason = resp
+            .headers()
+            .get("X-Reason")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        Ok(UploadCheck {
+            status: resp.status().as_u16(),
+            reason,
+        })
     }
 
     /// Fetch by hash. Bytes are still encrypted.
