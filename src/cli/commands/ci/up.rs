@@ -56,9 +56,23 @@ pub struct UpArgs {
     #[arg(long, default_value = "/tmp/paygress-adapter.sock")]
     pub socket: PathBuf,
 
-    /// Jobs to run at once
+    /// Jobs to run at once. Each one is a separate sandbox, so this is a bill
+    /// as well as a speed: two jobs is two leases running concurrently.
     #[arg(long, default_value_t = 1)]
     pub max_concurrent_jobs: usize,
+
+    /// Seconds before the coordinator abandons a job. A cold integration suite
+    /// compiles from scratch; the default is generous for that reason.
+    #[arg(long, default_value_t = 3600)]
+    pub job_timeout_secs: u64,
+
+    /// Blossom servers for job logs and artifacts (comma-separated)
+    #[arg(long)]
+    pub blossom_servers: Option<String>,
+
+    /// Coordinator working directory for clones and job state
+    #[arg(long)]
+    pub work_dir: Option<PathBuf>,
 
     /// The coordinator executable
     #[arg(long, default_value = "ngit-ci")]
@@ -90,7 +104,22 @@ fn coordinator_argv(args: &UpArgs) -> Vec<String> {
         args.socket.display().to_string(),
         "--act-container-daemon-socket".to_string(),
         SANDBOX_DAEMON_SOCKET.to_string(),
+        // The coordinator has its own limit, separate from the adapter's. Left
+        // at its default of 1 it dispatches one job at a time however much
+        // capacity the adapter has, which reads as the adapter being stuck.
+        "--max-concurrent-jobs".to_string(),
+        args.max_concurrent_jobs.to_string(),
+        "--job-timeout-secs".to_string(),
+        args.job_timeout_secs.to_string(),
     ];
+    if let Some(servers) = &args.blossom_servers {
+        argv.push("--blossom-servers".to_string());
+        argv.push(servers.clone());
+    }
+    if let Some(dir) = &args.work_dir {
+        argv.push("--work-dir".to_string());
+        argv.push(dir.display().to_string());
+    }
     if let Some(relays) = &args.relays {
         for relay in relays.split(',').map(str::trim).filter(|r| !r.is_empty()) {
             argv.push("--index-relays".to_string());
@@ -250,6 +279,9 @@ mod tests {
             tier: "basic".into(),
             socket: PathBuf::from("/tmp/a.sock"),
             max_concurrent_jobs: 1,
+            job_timeout_secs: 3600,
+            blossom_servers: None,
+            work_dir: None,
             coordinator: "ngit-ci".into(),
             print_only: false,
             nostr_key: None,
@@ -275,6 +307,44 @@ mod tests {
             Some(SANDBOX_DAEMON_SOCKET)
         );
         assert_eq!(pair("--repos").as_deref(), Some("naddr1abc"));
+    }
+
+    // The coordinator's own concurrency limit, not the adapter's. Left unset it
+    // defaults to 1 and dispatches serially however much capacity the adapter
+    // advertises -- which looks like the adapter being stuck, not like a limit.
+    #[test]
+    fn the_coordinator_concurrency_limit_is_forwarded() {
+        let mut a = args();
+        a.max_concurrent_jobs = 3;
+        let argv = coordinator_argv(&a);
+        let i = argv
+            .iter()
+            .position(|v| v == "--max-concurrent-jobs")
+            .unwrap();
+        assert_eq!(argv[i + 1], "3");
+        assert_eq!(adapter_args(&a).max_concurrent_jobs, 3);
+    }
+
+    #[test]
+    fn optional_pass_through_flags_are_absent_when_unset() {
+        let argv = coordinator_argv(&args());
+        assert!(!argv.iter().any(|v| v == "--blossom-servers"));
+        assert!(!argv.iter().any(|v| v == "--work-dir"));
+
+        let mut a = args();
+        a.blossom_servers = Some("https://nostr.download".into());
+        a.work_dir = Some(PathBuf::from("/var/lib/ngit-ci"));
+        let argv = coordinator_argv(&a);
+        let pair = |f: &str| {
+            argv.iter()
+                .position(|v| v == f)
+                .map(|i| argv[i + 1].clone())
+        };
+        assert_eq!(
+            pair("--blossom-servers").as_deref(),
+            Some("https://nostr.download")
+        );
+        assert_eq!(pair("--work-dir").as_deref(), Some("/var/lib/ngit-ci"));
     }
 
     #[test]
