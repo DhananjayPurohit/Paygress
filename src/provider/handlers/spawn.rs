@@ -15,24 +15,6 @@ use crate::templates::{TemplateDefinition, TemplateName};
 
 use super::{generate_password, redeem_or_respond, send_error, unix_now, Handled, HandlerDeps};
 
-/// Serialises workload id allocation across concurrent spawns.
-///
-/// Every backend picks an id by listing what exists and taking the first gap.
-/// Two spawns arriving together therefore read the same state and choose the
-/// same id -- and since the SSH port is derived from it, the loser is handed
-/// the winner's container with its own password and fails authentication until
-/// it times out. Both tokens are already spent by then.
-///
-/// Observed 5ms apart on a two-job CI run, which is why this never showed up
-/// while spawns were serial.
-///
-/// The whole allocate-and-create is held rather than just the scan: the id is
-/// only really taken once the backend has created something with that name,
-/// and the gap between the two covers token redemption. Provisioning is ~50s
-/// against workloads that live for minutes to hours, so serialising it costs
-/// almost nothing next to handing someone a box they cannot log into.
-static PROVISION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Everything derived from the request that the container needs, kept together
 /// so the standby and primary branches build it exactly once.
 struct SpawnPlan {
@@ -166,9 +148,6 @@ pub(crate) async fn handle_spawn_request(
         payment_msats, duration_secs, spec.name
     );
 
-    // Held until the container exists; see PROVISION_LOCK.
-    let _provisioning = PROVISION_LOCK.lock().await;
-
     let id = match deps
         .backend
         .find_available_id(config.vmid_range_start, config.vmid_range_end)
@@ -229,8 +208,6 @@ pub(crate) async fn handle_spawn_request(
         return Ok(());
     }
     debug!("Successfully created container {}", id);
-    // The name now exists, so the next spawn's scan will skip this id.
-    drop(_provisioning);
 
     let now = unix_now()?;
     let workload = WorkloadInfo {
@@ -651,64 +628,5 @@ mod tests {
         // Both would take the token and then fail to launch the image.
         assert!(!serves_templates(BackendType::LXD));
         assert!(!serves_templates(BackendType::Kvm));
-    }
-}
-
-#[cfg(test)]
-mod provision_lock_tests {
-    use super::PROVISION_LOCK;
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
-
-    /// A backend, reduced to the two operations that raced: list what exists,
-    /// then create a name. The `yield_now` between them is the real gap --
-    /// token redemption and an `lxc launch` -- compressed to its essence.
-    async fn allocate_and_create(existing: &Arc<AsyncMutex<HashSet<u32>>>) -> u32 {
-        let id = {
-            let taken = existing.lock().await;
-            (2000..2100)
-                .find(|i| !taken.contains(i))
-                .expect("range exhausted")
-        };
-        tokio::task::yield_now().await;
-        existing.lock().await.insert(id);
-        id
-    }
-
-    #[tokio::test]
-    async fn concurrent_spawns_without_the_lock_collide() {
-        let existing = Arc::new(AsyncMutex::new(HashSet::new()));
-        let ids: Vec<u32> =
-            futures::future::join_all((0..8).map(|_| allocate_and_create(&existing))).await;
-
-        // Establishes that the hazard is real rather than theoretical: every
-        // caller scans before any caller has created, so all agree on 2000.
-        assert_eq!(
-            ids.iter().collect::<HashSet<_>>().len(),
-            1,
-            "expected the unguarded path to collide, got {ids:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_provisioning_lock_gives_every_spawn_its_own_id() {
-        let existing = Arc::new(AsyncMutex::new(HashSet::new()));
-        let ids: Vec<u32> = futures::future::join_all((0..8).map(|_| {
-            let existing = existing.clone();
-            async move {
-                let _guard = PROVISION_LOCK.lock().await;
-                allocate_and_create(&existing).await
-            }
-        }))
-        .await;
-
-        let unique: HashSet<_> = ids.iter().copied().collect();
-        assert_eq!(unique.len(), ids.len(), "ids collided: {ids:?}");
-        // Contiguous from the bottom of the range: no id is skipped or reused,
-        // which matters because the SSH port is derived from it.
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (2000..2008).collect::<Vec<_>>());
     }
 }
