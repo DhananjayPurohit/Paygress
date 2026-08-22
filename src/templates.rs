@@ -24,6 +24,7 @@ pub enum TemplateName {
     BitcoinNode,
     AgentSandbox,
     OpenClaw,
+    CiCoordinator,
 }
 
 impl TemplateName {
@@ -36,6 +37,7 @@ impl TemplateName {
             Self::BitcoinNode => "bitcoin-node",
             Self::AgentSandbox => "agent-sandbox",
             Self::OpenClaw => "openclaw",
+            Self::CiCoordinator => "ci-coordinator",
         }
     }
 
@@ -47,11 +49,12 @@ impl TemplateName {
             "bitcoin-node" => Some(Self::BitcoinNode),
             "agent-sandbox" => Some(Self::AgentSandbox),
             "openclaw" => Some(Self::OpenClaw),
+            "ci-coordinator" => Some(Self::CiCoordinator),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 6] {
+    pub fn all() -> [Self; 7] {
         [
             Self::NostrRelay,
             Self::InferenceEndpoint,
@@ -59,6 +62,7 @@ impl TemplateName {
             Self::BitcoinNode,
             Self::AgentSandbox,
             Self::OpenClaw,
+            Self::CiCoordinator,
         ]
     }
 }
@@ -79,8 +83,24 @@ pub struct TemplateDefinition {
 
     pub image: &'static str,
     pub ports: Vec<Port>,
-    /// Defaults; consumers can override per-deploy.
+    /// Provider-side defaults. Not consumer-settable unless the key is also
+    /// listed in `consumer_env`.
     pub env: HashMap<&'static str, &'static str>,
+
+    /// The only env keys a consumer may set on a deploy.
+    ///
+    /// A template's whole point is that the provider builds the workload from
+    /// its own registry rather than from consumer-supplied bytes, so a consumer
+    /// cannot smuggle an image or a mount past the vetted list. But some
+    /// templates are useless without being told *what* to work on -- a CI
+    /// coordinator has to learn which repo to watch -- and that is
+    /// configuration, not code.
+    ///
+    /// A whitelist keeps both: anything named here is data the template
+    /// expects, and anything else a consumer sends is dropped. Adding a key is
+    /// a decision about what a stranger may influence, so keep the list short
+    /// and never put anything path- or image-shaped on it.
+    pub consumer_env: &'static [&'static str],
     /// Repo-relative `docker-compose.yml` reproducing the workload locally.
     pub compose_path: &'static str,
 
@@ -109,6 +129,7 @@ impl TemplateDefinition {
             TemplateName::BitcoinNode => bitcoin_node(),
             TemplateName::AgentSandbox => agent_sandbox(),
             TemplateName::OpenClaw => openclaw(),
+            TemplateName::CiCoordinator => ci_coordinator(),
         }
     }
 
@@ -121,6 +142,67 @@ impl TemplateDefinition {
 /// state, since only that leaks data to a curious operator.
 pub fn template_default_encrypts_volume(name: TemplateName) -> bool {
     TemplateDefinition::lookup(name).data_path.is_some()
+}
+
+/// The other half of Paygress CI: the thing that watches a repo, rather than
+/// the sandbox a job runs in.
+///
+/// Deliberately the opposite shape to a job sandbox. A job wants Docker,
+/// eight gigabytes and a short life; this runs no containers of its own, fits
+/// in the basic tier, and has to still be there next week. So it takes none of
+/// the `docker` capability, and warm-standby replication instead — a
+/// coordinator that is down is a repo whose proposals silently go untested,
+/// which looks like nothing rather than like a failure.
+///
+/// Two things a deployer has to weigh, both documented rather than designed
+/// away:
+///
+/// - The Cashu wallet inside funds job sandboxes, and reaches the host through
+///   the spawn request, which the provider decrypts. A dishonest host can take
+///   whatever is staged there, so stage little and top up.
+/// - A coordinator injects a repo's CI secrets into maintainer-triggered runs.
+///   Hosting one on rented compute hands those to the host, which is fine for
+///   a repo that has none -- most open-source ones -- and not fine otherwise.
+fn ci_coordinator() -> TemplateDefinition {
+    let mut env = HashMap::new();
+    env.insert("PAYGRESS_JOB_TIER", "ci");
+    env.insert("PAYGRESS_JOB_IMAGE", "paygress-ci");
+    env.insert("PAYGRESS_JOB_SATS", "800");
+    env.insert("NGIT_CI_MAX_CONCURRENT_JOBS", "1");
+    env.insert("NOSTR_RELAYS", "wss://relay.ngit.dev,wss://gitnostr.com");
+    TemplateDefinition {
+        name: TemplateName::CiCoordinator,
+        summary: "Watches a Nostr repo and buys a disposable sandbox for every CI job. Runs no containers itself, so it needs no `docker` capability and fits the basic tier; warm-standby because a coordinator that is down is a repo whose proposals silently go untested.",
+        image: "ghcr.io/dhananjaypurohit/paygress-ci-coordinator:latest",
+        // Outbound only: relays, the mint, and its job provider. Nothing dials
+        // in, so there is nothing to publish.
+        ports: vec![],
+        env,
+        // Configuration only: which repo, which mint, which provider to buy
+        // jobs from, and how many at once. Nothing here can change what image
+        // runs or what it can reach -- those stay the provider's to decide.
+        consumer_env: &[
+            "NGIT_CI_REPOS",
+            "PAYGRESS_JOB_PROVIDER",
+            "PAYGRESS_JOB_TIER",
+            "PAYGRESS_JOB_SATS",
+            "PAYGRESS_MINT",
+            "PAYGRESS_FUND_SATS",
+            "NGIT_CI_MAX_CONCURRENT_JOBS",
+            "NOSTR_RELAYS",
+        ],
+        compose_path: "templates/ci-coordinator/docker-compose.yml",
+        extra_docker_args: &[],
+        // The Nostr identity that signs job results and the wallet that pays
+        // for them. Losing it on a restart means a new key, which throws away
+        // whatever reputation the old one had.
+        data_path: Some("/var/lib/paygress"),
+        tier: "basic",
+        replication: ReplicationMode::WarmStandby,
+        min_cpu_millicores: 500,
+        min_memory_mb: 512,
+        min_storage_gb: 2,
+    }
 }
 
 fn nostr_relay() -> TemplateDefinition {
@@ -137,6 +219,7 @@ fn nostr_relay() -> TemplateDefinition {
             label: "relay-ws",
         }],
         env,
+        consumer_env: &[],
         compose_path: "templates/nostr-relay/docker-compose.yml",
         // strfry raises its nofile rlimit to 1M at startup; without
         // this the container exits with "Unable to set NOFILES limit
@@ -165,6 +248,7 @@ fn inference_endpoint() -> TemplateDefinition {
             label: "ollama-http",
         }],
         env,
+        consumer_env: &[],
         compose_path: "templates/inference-endpoint/docker-compose.yml",
         extra_docker_args: &[],
         data_path: Some("/root/.ollama"),
@@ -197,6 +281,7 @@ fn headless_browser() -> TemplateDefinition {
             },
         ],
         env,
+        consumer_env: &[],
         compose_path: "templates/headless-browser/docker-compose.yml",
         extra_docker_args: &[],
         data_path: None,
@@ -229,6 +314,7 @@ fn bitcoin_node() -> TemplateDefinition {
             },
         ],
         env,
+        consumer_env: &[],
         compose_path: "templates/bitcoin-node/docker-compose.yml",
         extra_docker_args: &[],
         data_path: Some("/data"),
@@ -261,6 +347,7 @@ fn agent_sandbox() -> TemplateDefinition {
             label: "sandbox-exec",
         }],
         env,
+        consumer_env: &[],
         compose_path: "templates/agent-sandbox/docker-compose.yml",
         extra_docker_args: &[],
         data_path: Some("/workspace"),
@@ -290,6 +377,7 @@ fn openclaw() -> TemplateDefinition {
             label: "openclaw-gateway",
         }],
         env,
+        consumer_env: &[],
         compose_path: "templates/openclaw/docker-compose.yml",
         extra_docker_args: &[],
         data_path: Some("/data/.openclaw"),
@@ -317,6 +405,13 @@ mod tests {
         assert!(TemplateName::from_slug("not-a-template").is_none());
     }
 
+    /// A template that publishes nothing is only sane if nobody is meant to
+    /// reach it. The coordinator is the one such workload: it dials relays,
+    /// a mint and a provider, and nothing ever dials back.
+    fn serves_traffic(name: TemplateName) -> bool {
+        name != TemplateName::CiCoordinator
+    }
+
     #[test]
     fn every_template_has_an_image_and_ports() {
         for def in TemplateDefinition::all() {
@@ -326,11 +421,19 @@ mod tests {
                 def.name
             );
             assert!(!def.image.is_empty(), "{:?} has empty image", def.name);
-            assert!(
-                !def.ports.is_empty(),
-                "{:?} has no ports — workload would be unreachable",
-                def.name
-            );
+            if serves_traffic(def.name) {
+                assert!(
+                    !def.ports.is_empty(),
+                    "{:?} has no ports — workload would be unreachable",
+                    def.name
+                );
+            } else {
+                assert!(
+                    def.ports.is_empty(),
+                    "{:?} publishes a port but nothing should dial it",
+                    def.name
+                );
+            }
         }
     }
 
@@ -421,5 +524,89 @@ mod default_policy_tests {
     fn openclaw_encrypts_by_default() {
         // /data/.openclaw holds chat-app OAuth tokens.
         assert!(template_default_encrypts_volume(TemplateName::OpenClaw));
+    }
+}
+
+#[cfg(test)]
+mod consumer_env_tests {
+    use super::*;
+
+    /// The filter the provider applies. Kept next to the whitelist it reads so
+    /// the rule and its meaning cannot drift apart.
+    fn accepted(def: &TemplateDefinition, sent: &[(&str, &str)]) -> Vec<String> {
+        sent.iter()
+            .filter(|(k, _)| def.consumer_env.contains(k))
+            .map(|(k, _)| k.to_string())
+            .collect()
+    }
+
+    // A template exists so the provider builds the workload from its own
+    // registry rather than from whatever a stranger sent. Anything not named
+    // by the template is not configuration, whatever it is called.
+    #[test]
+    fn keys_a_template_did_not_ask_for_are_dropped() {
+        let def = TemplateDefinition::lookup(TemplateName::CiCoordinator);
+        let got = accepted(
+            &def,
+            &[
+                ("NGIT_CI_REPOS", "npub1abc"),
+                ("PAYGRESS_MINT", "https://mint.example"),
+                // The shapes that would matter if this were not filtered.
+                ("PATH", "/tmp/evil"),
+                ("LD_PRELOAD", "/tmp/x.so"),
+                ("EXEC_PASS", "hunter2"),
+                ("PAYGRESS_JOB_IMAGE_OVERRIDE", "attacker/image"),
+            ],
+        );
+        assert_eq!(got, vec!["NGIT_CI_REPOS", "PAYGRESS_MINT"]);
+    }
+
+    // Every other template takes no consumer configuration at all, so a deploy
+    // cannot influence them even by naming a key they happen to define.
+    #[test]
+    fn templates_that_take_no_configuration_accept_nothing() {
+        for def in TemplateDefinition::all() {
+            if def.name == TemplateName::CiCoordinator {
+                continue;
+            }
+            assert!(
+                def.consumer_env.is_empty(),
+                "{} unexpectedly accepts consumer env",
+                def.name.slug()
+            );
+            let keys: Vec<&str> = def.env.keys().copied().collect();
+            let sent: Vec<(&str, &str)> = keys.iter().map(|k| (*k, "x")).collect();
+            assert!(accepted(&def, &sent).is_empty());
+        }
+    }
+
+    // Nothing path- or image-shaped may be delegated to a consumer: those are
+    // decisions about what runs, not about what it runs on.
+    #[test]
+    fn no_template_lets_a_consumer_choose_what_runs() {
+        for def in TemplateDefinition::all() {
+            for key in def.consumer_env {
+                let k = key.to_ascii_uppercase();
+                assert!(
+                    !["IMAGE", "PATH", "LD_PRELOAD", "ENTRYPOINT", "COMMAND"]
+                        .iter()
+                        .any(|bad| k == **bad || k.ends_with("_IMAGE")),
+                    "{} lets a consumer set {}",
+                    def.name.slug(),
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_coordinator_can_be_told_what_to_watch() {
+        let def = TemplateDefinition::lookup(TemplateName::CiCoordinator);
+        for required in ["NGIT_CI_REPOS", "PAYGRESS_MINT", "PAYGRESS_JOB_PROVIDER"] {
+            assert!(def.consumer_env.contains(&required), "missing {required}");
+        }
+        // It runs no containers, so it must not be sold as needing to.
+        assert!(def.ports.is_empty());
+        assert_eq!(def.tier, "basic");
     }
 }

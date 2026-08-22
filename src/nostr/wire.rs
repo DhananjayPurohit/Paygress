@@ -99,6 +99,12 @@ pub struct EncryptedSpawnPodRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_slug: Option<String>,
 
+    /// Configuration for the template named above. Only keys the template
+    /// lists in `consumer_env` are honoured; anything else is dropped by the
+    /// provider, so this cannot be used to reach past the vetted registry.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub template_env: std::collections::HashMap<String, String>,
+
     /// For `WarmStandby`, the consumer sends the *same* request to every
     /// provider in the set; each self-determines its role from
     /// `primary_npub` / `standby_providers`.
