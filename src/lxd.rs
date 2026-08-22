@@ -189,6 +189,20 @@ impl LxdBackend {
 
 #[async_trait]
 impl ComputeBackend for LxdBackend {
+    /// Known hazard, deliberately left open: this scans for a free id and the
+    /// caller creates the workload some time later, with token redemption in
+    /// between. Two spawns arriving from different clients can pick the same
+    /// id.
+    ///
+    /// Not fixed by holding a lock across allocate-and-create -- that was
+    /// tried, and it serialises a minute of provisioning, so the second of two
+    /// concurrent spawns times out with its payment already taken. Fixing it
+    /// properly means reserving the id up front so a later scan skips it,
+    /// which every backend has to agree on.
+    ///
+    /// Worth knowing this is not what makes concurrent CI jobs collide: that
+    /// was the spawn round-trip having no way to tell one provider's reply
+    /// from another's, and it is fixed in the adapter.
     async fn find_available_id(&self, range_start: u32, range_end: u32) -> Result<u32> {
         let raw = self.run_lxc(&["list", "--format", "json"]).await?;
         let containers = Self::parse_lxc_json(&raw)?;
