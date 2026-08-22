@@ -9,8 +9,12 @@
 // adapter rejects immediately), no timeouts (the caller drops the connection
 // and we kill the job), no state between connections.
 //
-// The sandbox must contain whatever the job script needs. ngit-ci's rendered
-// script needs `bash`, `git`, `act` and a container daemon — build one with
+// The sandbox must contain whatever the job script needs, and be able to run
+// it: `--requires docker` is checked against the provider's advertised
+// capabilities before its token is spent, because an unprivileged LXD
+// container runs a Docker daemon that cannot actually start anything.
+//
+// ngit-ci's rendered script needs `bash`, `git`, `act` and a container daemon — build one with
 // `images/ci-sandbox/`. `agent-sandbox` is enough for jobs that never shell out
 // to `act`.
 //
@@ -67,6 +71,11 @@ pub struct AdapterArgs {
     #[arg(short, long, default_value = "basic")]
     pub tier: String,
 
+    /// Capabilities the provider must advertise, checked before its token is
+    /// spent. Defaults to what an act job needs; `--requires ""` opts out.
+    #[arg(long, default_value = "docker")]
+    pub requires: String,
+
     /// Jobs to run at once; the rest are rejected, never queued
     #[arg(long, default_value_t = 1)]
     pub max_concurrent_jobs: usize,
@@ -103,6 +112,7 @@ pub async fn execute(args: AdapterArgs, _verbose: bool) -> Result<()> {
         tier: args.tier,
         template: args.template,
         image: args.image,
+        required_capabilities: paygress::capabilities::parse_list(&args.requires),
         token_command: args.token_command,
         ssh_user: args.ssh_user,
         relays: parse_relays(args.relays),

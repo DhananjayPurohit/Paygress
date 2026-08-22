@@ -2,10 +2,13 @@
 # Builds the LXD image a Paygress CI provider serves: Ubuntu with docker, act
 # and git — what ngit-ci's job script expects to find in a sandbox.
 #
-# The LXD backend launches every instance with `security.nesting=true`, which
-# is what lets a job run its own Docker daemon without the host's socket or a
-# privileged container. Nesting is set per instance at launch, so it is not
-# something this image has to carry.
+# Serving this image is not enough on its own: the provider must also advertise
+# the `docker` capability. Unprivileged LXD with nesting runs a Docker daemon
+# that cannot start a container -- containerd cannot write
+# net.ipv4.ip_unprivileged_port_start in the container's netns, and overlayfs
+# refuses to mount -- so the backend launches privileged when `docker` is
+# advertised. That is host root for the renter, which is why it is the
+# provider's explicit decision and not a default.
 #
 # Run on the provider host (the image is published to its local LXD).
 #

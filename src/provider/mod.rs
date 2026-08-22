@@ -95,6 +95,11 @@ impl ProviderService {
                 // cannot. Reading it from the same list the offer carries keeps
                 // the promise and the grant in step.
                 crate::lxd::nesting_from_capabilities(&config.capabilities),
+                // `docker` is the louder grant: it launches privileged, which
+                // is host root for the renter. Read from the same list the
+                // offer carries, so what a consumer is promised and what the
+                // container can do cannot drift apart.
+                crate::lxd::docker_from_capabilities(&config.capabilities),
             )),
             BackendType::Docker => Arc::new(DockerBackend::new()),
             BackendType::Kvm => {

@@ -7,8 +7,8 @@ mod exec_client;
 mod util;
 
 use commands::{
-    adapter, batch, blossom, bootstrap, deploy, exec, list, mcp, provider, spawn, status, system,
-    topup, wallet,
+    adapter, batch, blossom, bootstrap, ci, deploy, exec, list, mcp, provider, spawn, status,
+    system, topup, wallet,
 };
 
 /// Paygress CLI - Pay-per-Use Compute with Lightning + Nostr
@@ -51,6 +51,9 @@ enum Commands {
 
     /// Run a CI execution adapter that buys a sandbox per job
     Adapter(adapter::AdapterArgs),
+
+    /// Give a Nostr repo CI on rented sandboxes
+    Ci(ci::CiArgs),
 
     /// Run a shell command inside a spawned agent-sandbox workload
     Exec(exec::ExecArgs),
@@ -107,6 +110,7 @@ async fn main() {
         Commands::Batch(args) => batch::execute(args, cli.verbose).await,
         Commands::Mcp(args) => mcp::execute(args, cli.verbose).await,
         Commands::Adapter(args) => adapter::execute(args, cli.verbose).await,
+        Commands::Ci(args) => ci::execute(args, cli.verbose).await,
         Commands::Exec(args) => exec::execute(args, cli.verbose).await,
         Commands::Wallet(args) => wallet::execute(args).await,
         Commands::Blossom(args) => blossom::execute(args, cli.verbose).await,

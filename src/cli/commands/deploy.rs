@@ -198,6 +198,8 @@ pub async fn execute(args: DeployArgs, verbose: bool) -> Result<()> {
     let spawn_args = SpawnArgs {
         provider: args.provider,
         server: None,
+        // deploy targets a provider the caller named; no extra requirements.
+        requires: String::new(),
         tier,
         token: args.token,
         image,

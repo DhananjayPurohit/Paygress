@@ -29,6 +29,7 @@ pub struct SandboxConfig {
     pub image: String,
     pub token_command: String,
     pub ssh_user: String,
+    pub required_capabilities: Vec<String>,
     pub relays: Vec<String>,
     pub nostr_key: String,
     pub spawn_timeout_secs: u64,
@@ -91,6 +92,7 @@ pub async fn provision(cfg: &SandboxConfig) -> Result<Sandbox> {
         ssh_user: cfg.ssh_user.clone(),
         ssh_pass: password.clone(),
         template_slug: cfg.template.clone(),
+        required_capabilities: cfg.required_capabilities.clone(),
         ..Default::default()
     };
 

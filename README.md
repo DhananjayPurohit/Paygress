@@ -164,40 +164,70 @@ paygress-cli status --server http://my-server:8080 --pod-id <ID>
 
 Both paths write into the same wallet, so a provider can run either or both.
 
-### CI jobs (execution adapter)
+### CI jobs
 
-`paygress-cli adapter` is a sandbox provider for CI coordinators. It listens on a
-Unix socket speaking the [Loom execution-adapter
+Give a repo hosted on Nostr the CI it cannot get from GitHub. One command runs
+both halves — an [ngit-ci](https://ngit.dev) coordinator watching the repo's
+events, and an adapter buying a fresh sandbox for every job:
+
+```bash
+paygress-cli ci up \
+  --repo naddr1... \
+  --provider SwiftGoldenOwl \
+  --mint https://testnut.cashu.space
+```
+
+Each job buys its own workload, runs in it over SSH, and streams the output
+back. No pool, no reuse, no runner registration: the box dies when its lease
+runs out. `--print-only` prints the coordinator command instead of running it,
+for hosts where it belongs under systemd.
+
+The repo's workflows go in `.ngit/act/workflows/` and are ordinary GitHub
+Actions YAML, executed by [act](https://github.com/nektos/act). They need no
+Nostr-specific steps: `ci up` points act at the sandbox's own Docker daemon, so
+a workflow that runs `docker` finds one already there.
+
+**The provider must advertise the `docker` capability**, which `ci up` requires
+before spending anything. It is a real grant, not a label — on LXD the backend
+launches the workload privileged, because an unprivileged container runs a
+Docker daemon that cannot start anything: containerd cannot write
+`net.ipv4.ip_unprivileged_port_start` in the container's netns, and overlayfs
+refuses to mount. Privileged is host root for the renter, defensible only
+because the workload is a lease on a box that is destroyed when the money runs
+out. On KVM each job gets its own kernel and the capability costs nothing extra.
+
+Build the sandbox image on the provider host:
+
+| Provider backend | Build with | Then |
+| --- | --- | --- |
+| LXD | `images/ci-sandbox/build-lxd.sh` | advertise `docker`, spawn with `--image paygress-ci` |
+| KVM | `images/ci-sandbox/build.sh`, then `kvm_base_image_path` in the provider config | advertise `docker`; the base image is the sandbox |
+
+```json
+"capabilities": ["lxc", "vm", "docker"]
+```
+
+The adapter host needs `sshpass`.
+
+#### Driving it yourself
+
+`paygress-cli adapter` is the lower half on its own — a sandbox provider for any
+CI coordinator speaking the [Loom execution-adapter
 protocol](https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-ci)
-— the same contract [ngit-ci](https://ngit.dev) uses for its own sandboxes — and
-buys one workload per job, runs the job in it over SSH, and streams the output
-back. No pool, no reuse: the box dies when its lease runs out.
+over a Unix socket:
 
 ```bash
 paygress-cli adapter \
   --socket /run/paygress-adapter.sock \
   --provider SwiftGoldenOwl \
   --image paygress-ci \
-  --token-command "paygress-cli wallet mint --mint https://testnut.cashu.space --amount 60"
+  --requires docker \
+  --token-command "paygress-cli wallet mint --mint https://testnut.cashu.space --amount 800"
 ```
 
-Then point the coordinator at it (`ngit-ci --runner socket-adapter
---adapter-socket /run/paygress-adapter.sock`). The adapter host needs `sshpass`.
-
-A CI job needs `bash`, `git`, `act` and a container daemon in the sandbox, which
-no Docker template provides — `act` cannot have the host's daemon socket without
-handing workflow code the host. Build a sandbox that carries its own daemon
-instead:
-
-| Provider backend | Build with | Spawn with |
-| --- | --- | --- |
-| LXD | `images/ci-sandbox/build-lxd.sh` on the provider host | `--image paygress-ci` |
-| KVM | `images/ci-sandbox/build.sh`, then `kvm_base_image_path` in the provider config | no `--image` — the base image is the sandbox |
-
-Both bake docker and act in. The LXD route runs the job's daemon nested inside
-an unprivileged container (`security.nesting=true`, which the backend already
-sets) and needs no `/dev/kvm`, so it works on a VPS. The KVM route gives each
-job its own kernel and is the one to serve third-party PRs from.
+`--requires` is checked against the provider's advertised capabilities **before
+its token is spent**, so a provider that cannot serve the job costs a search
+rather than a lease.
 
 ---
 
