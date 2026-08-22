@@ -16,6 +16,7 @@
 // 259-line scripts come from. With it, and a provider advertising `docker`,
 // the job talks to the sandbox's own daemon and the workflow needs nothing.
 
+mod deploy;
 mod up;
 
 use anyhow::Result;
@@ -31,10 +32,14 @@ pub struct CiArgs {
 pub enum CiCommand {
     /// Run the adapter and coordinator that give a repo CI on rented sandboxes
     Up(up::UpArgs),
+
+    /// Put the coordinator itself on rented compute, so no machine is yours
+    Deploy(deploy::DeployArgs),
 }
 
 pub async fn execute(args: CiArgs, verbose: bool) -> Result<()> {
     match args.command {
         CiCommand::Up(a) => up::execute(a, verbose).await,
+        CiCommand::Deploy(a) => deploy::execute(a, verbose).await,
     }
 }

@@ -13,6 +13,7 @@ fn sample_v1_warm_standby() -> EncryptedSpawnPodRequest {
         ssh_username: "user".to_string(),
         ssh_password: "pw".to_string(),
         template_slug: Some("nostr-relay".to_string()),
+        template_env: Default::default(),
         replication: Some(ReplicationMode::WarmStandby {
             standby_providers: vec!["npub1b".to_string(), "npub1c".to_string()],
         }),

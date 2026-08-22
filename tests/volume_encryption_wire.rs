@@ -13,6 +13,7 @@ fn base_request() -> EncryptedSpawnPodRequest {
         ssh_username: "root".to_string(),
         ssh_password: "p".to_string(),
         template_slug: None,
+        template_env: Default::default(),
         replication: None,
         primary_npub: None,
         workload_id: Some("wid-test".to_string()),

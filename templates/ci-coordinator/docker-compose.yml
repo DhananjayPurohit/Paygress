@@ -1,0 +1,53 @@
+# CI coordinator for a Nostr repo — watches proposals, buys a sandbox per job.
+#
+# The other half of Paygress CI. Jobs need a heavy, disposable sandbox that can
+# run Docker; the coordinator watching for them needs the opposite — small,
+# cheap, and long-lived. It runs no containers of its own, so it wants none of
+# the `docker` capability a job sandbox needs, and it runs on the basic tier.
+#
+# Inside, `paygress-cli ci up` runs both halves: an adapter buying job sandboxes
+# and an ngit-ci coordinator driving them over its socket.
+#
+# Smoke test:
+#   docker compose -f templates/ci-coordinator/docker-compose.yml up -d
+#   docker logs paygress-ci-coordinator   # → "Paygress CI" banner, then relay subscriptions
+services:
+  coordinator:
+    image: ghcr.io/dhananjaypurohit/paygress-ci-coordinator:latest
+    container_name: paygress-ci-coordinator
+    restart: unless-stopped
+    environment:
+      # The repo to watch. A bare npub watches every repo that key publishes,
+      # so a new repo under the same key is picked up without redeploying.
+      NGIT_CI_REPOS: "${NGIT_CI_REPOS}"
+
+      # Where job sandboxes are bought. Deliberately a different provider from
+      # the one hosting this container: a coordinator wants uptime, a job wants
+      # a machine that can run Docker and is about to be destroyed.
+      PAYGRESS_JOB_PROVIDER: "${PAYGRESS_JOB_PROVIDER}"
+      PAYGRESS_JOB_TIER: "${PAYGRESS_JOB_TIER:-ci}"
+      PAYGRESS_JOB_IMAGE: "${PAYGRESS_JOB_IMAGE:-paygress-ci}"
+      PAYGRESS_JOB_SATS: "${PAYGRESS_JOB_SATS:-800}"
+
+      # Funds job sandboxes. Whatever is in this wallet is what a dishonest
+      # host could take, so keep it small and top it up — see the template's
+      # summary. It is not the repo's money, only what has been staged here.
+      PAYGRESS_MINT: "${PAYGRESS_MINT}"
+
+      NGIT_CI_MAX_CONCURRENT_JOBS: "${NGIT_CI_MAX_CONCURRENT_JOBS:-1}"
+      NOSTR_RELAYS: "${NOSTR_RELAYS:-wss://relay.ngit.dev,wss://gitnostr.com}"
+    volumes:
+      # The coordinator's own Nostr identity and Cashu wallet. Survives a
+      # restart; on warm-standby failover the standby restores it from the
+      # latest checkpoint, so results keep coming from the same key.
+      - coordinator-state:/var/lib/paygress
+    healthcheck:
+      # There is no port to probe — the coordinator only makes outbound
+      # connections — so liveness is "the process is still there".
+      test: ["CMD-SHELL", "pgrep -f 'ci up' > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  coordinator-state:

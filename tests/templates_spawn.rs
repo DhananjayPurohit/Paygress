@@ -15,6 +15,7 @@ fn spawn_request(template_slug: Option<&str>) -> EncryptedSpawnPodRequest {
         ssh_username: "u".to_string(),
         ssh_password: "p".to_string(),
         template_slug: template_slug.map(str::to_string),
+        template_env: Default::default(),
         replication: None,
         primary_npub: None,
         workload_id: None,
