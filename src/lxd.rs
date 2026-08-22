@@ -12,19 +12,83 @@ pub struct LxdBackend {
     storage_pool: String,
     /// Whether launched containers may run containers of their own.
     nesting: bool,
+    privileged: bool,
 }
 
 /// Whether a provider advertising `capabilities` is offering nested containers.
 ///
-/// Kept next to the code that acts on it, and matched case-insensitively
-/// because these strings are hand-written in provider config files. A typo
-/// costs the provider CI work rather than granting something it did not mean
-/// to, which is the right way round for a capability that lets a renter run
-/// containers.
+/// A thin name over [`crate::capabilities::advertises`], so the grant here and
+/// the consumer-side check in `spawn` can never drift apart.
 pub fn nesting_from_capabilities<S: AsRef<str>>(capabilities: &[S]) -> bool {
-    capabilities
+    crate::capabilities::advertises(capabilities, "nesting")
+}
+
+/// Whether a provider is offering workloads a container runtime that actually
+/// works — the `docker` capability.
+///
+/// Unprivileged LXD is not enough for a Docker daemon however much nesting it
+/// has: containerd cannot write `net.ipv4.ip_unprivileged_port_start` in the
+/// container's netns, and overlayfs refuses to mount, so the daemon starts and
+/// then fails to run anything. Serving that as a CI sandbox means selling a box
+/// the buyer cannot use.
+///
+/// So `docker` is a separate, louder grant than `nesting`: it launches the
+/// container privileged, which is host root for the renter. That is defensible
+/// only because the workload is a lease on a box the operator expects to be
+/// destroyed — and it must stay the provider's decision, never a default.
+pub fn docker_from_capabilities<S: AsRef<str>>(capabilities: &[S]) -> bool {
+    crate::capabilities::advertises(capabilities, "docker")
+}
+
+/// `lxc launch` arguments for one workload.
+///
+/// Pure so the grants can be asserted in tests: the difference between an
+/// unprivileged container and host root is one flag, and it should not be
+/// possible to change it without a test noticing.
+pub(crate) fn launch_args(
+    image: &str,
+    name: &str,
+    pool: &str,
+    cpu_cores: u32,
+    memory_mb: u32,
+    nesting: bool,
+    privileged: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["launch", image, name, "-s", pool]
         .iter()
-        .any(|c| c.as_ref().trim().eq_ignore_ascii_case("nesting"))
+        .map(|s| s.to_string())
+        .collect();
+
+    for limit in [
+        format!("limits.cpu={}", cpu_cores),
+        format!("limits.memory={}MB", memory_mb),
+    ] {
+        args.push("-c".to_string());
+        args.push(limit);
+    }
+
+    let mut conf: Vec<String> = Vec::new();
+    if nesting || privileged {
+        conf.push("security.nesting=true".to_string());
+        // Docker's image extraction makes device nodes and sets trusted
+        // xattrs. Without these two the daemon runs but every `docker pull`
+        // fails partway through, which reads as a corrupt image rather than a
+        // missing permission.
+        conf.push("security.syscalls.intercept.mknod=true".to_string());
+        conf.push("security.syscalls.intercept.setxattr=true".to_string());
+    }
+    if privileged {
+        // Host root for the renter. Gated on the provider advertising
+        // `docker`, and defensible only for a lease that is expected to be
+        // destroyed.
+        conf.push("security.privileged=true".to_string());
+    }
+
+    for c in conf {
+        args.push("-c".to_string());
+        args.push(c);
+    }
+    args
 }
 
 impl LxdBackend {
@@ -35,10 +99,11 @@ impl LxdBackend {
     /// comes from the provider advertising the `nesting` capability rather than
     /// from a separate setting, so what an offer claims and what a container
     /// can actually do cannot drift apart.
-    pub fn new(storage_pool: &str, _network_device: &str, nesting: bool) -> Self {
+    pub fn new(storage_pool: &str, _network_device: &str, nesting: bool, privileged: bool) -> Self {
         Self {
             storage_pool: storage_pool.to_string(),
             nesting,
+            privileged,
         }
     }
 
@@ -160,24 +225,19 @@ impl ComputeBackend for LxdBackend {
 
         info!("Creating LXD container {} with image {}", name, image);
 
-        let cpu_limit = format!("limits.cpu={}", config.cpu_cores);
-        let mem_limit = format!("limits.memory={}MB", config.memory_mb);
-
         let pool = self.resolve_storage_pool().await?;
         info!("Using storage pool: {}", pool);
 
-        // Nesting is what lets a workload run its own containers — a CI job
-        // needing docker-in-docker cannot work without it. It is also a real
-        // grant: with it, everything the renter runs can create containers. So
-        // it is the provider's call, expressed by advertising the capability,
-        // and off for providers that do not.
-        let mut args = vec![
-            "launch", image, &name, "-s", &pool, "-c", &cpu_limit, "-c", &mem_limit,
-        ];
-        if self.nesting {
-            args.push("-c");
-            args.push("security.nesting=true");
-        }
+        let args = launch_args(
+            image,
+            &name,
+            &pool,
+            config.cpu_cores,
+            config.memory_mb,
+            self.nesting,
+            self.privileged,
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
         self.run_lxc(&args).await?;
 
@@ -369,7 +429,63 @@ impl ComputeBackend for LxdBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::nesting_from_capabilities;
+    use super::{docker_from_capabilities, launch_args, nesting_from_capabilities};
+
+    fn args_for(nesting: bool, privileged: bool) -> Vec<String> {
+        launch_args(
+            "ubuntu:24.04",
+            "pg-1",
+            "default",
+            2,
+            2048,
+            nesting,
+            privileged,
+        )
+    }
+
+    // The difference between an unprivileged container and host root is one
+    // flag, so each grant is pinned rather than left to review.
+    #[test]
+    fn a_plain_workload_gets_no_grants() {
+        let a = args_for(false, false);
+        assert!(!a.iter().any(|s| s.starts_with("security.")), "{a:?}");
+    }
+
+    #[test]
+    fn nesting_alone_never_grants_privileged() {
+        let a = args_for(true, false);
+        assert!(a.contains(&"security.nesting=true".to_string()));
+        assert!(a.contains(&"security.syscalls.intercept.mknod=true".to_string()));
+        assert!(a.contains(&"security.syscalls.intercept.setxattr=true".to_string()));
+        assert!(
+            !a.contains(&"security.privileged=true".to_string()),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn docker_implies_the_nesting_a_daemon_needs() {
+        let a = args_for(false, true);
+        assert!(a.contains(&"security.privileged=true".to_string()));
+        // Privileged without nesting is still a box that cannot run a
+        // container, which is the useless-lease outcome worth designing out.
+        assert!(a.contains(&"security.nesting=true".to_string()), "{a:?}");
+    }
+
+    #[test]
+    fn limits_and_pool_are_always_passed() {
+        let a = args_for(true, true);
+        assert!(a.contains(&"limits.cpu=2".to_string()));
+        assert!(a.contains(&"limits.memory=2048MB".to_string()));
+        assert_eq!(a[..5], ["launch", "ubuntu:24.04", "pg-1", "-s", "default"]);
+    }
+
+    #[test]
+    fn docker_is_a_separate_grant_from_nesting() {
+        assert!(docker_from_capabilities(&["lxc", "docker"]));
+        assert!(!docker_from_capabilities(&["lxc", "nesting"]));
+        assert!(!nesting_from_capabilities(&["lxc", "docker"]));
+    }
 
     #[test]
     fn advertising_nesting_enables_it() {

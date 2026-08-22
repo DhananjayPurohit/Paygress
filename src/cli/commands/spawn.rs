@@ -99,6 +99,10 @@ pub struct SpawnArgs {
     /// Minimum isolation tier, verified before the token is sent
     #[arg(long, value_parser = parse_isolation_level)]
     pub isolation_level: Option<IsolationLevel>,
+    /// Comma-separated capabilities the provider must advertise, verified
+    /// before the token is sent
+    #[arg(long, default_value = "")]
+    pub requires: String,
 }
 
 /// `Ok(None)` for the default, so the wire field stays absent for
@@ -260,6 +264,10 @@ pub struct NostrSpawnParams {
     pub workload_id: Option<String>,
     pub volume_encryption: Option<VolumeEncryption>,
     pub isolation_level: Option<IsolationLevel>,
+    /// Capabilities the provider must advertise. Checked before the token is
+    /// sent, so a provider that cannot serve the workload costs a search
+    /// rather than a lease.
+    pub required_capabilities: Vec<String>,
 }
 
 /// No stdout I/O — pure round-trip plus structured outcome.
@@ -285,6 +293,23 @@ pub async fn nostr_spawn_round_trip(
     // never spends it.
     if !provider.specs.iter().any(|s| s.id == params.tier) {
         anyhow::bail!("Tier '{}' not available on this provider", params.tier);
+    }
+
+    // A provider that has not advertised a capability is not offering it, so
+    // the spawn would either be refused or -- worse -- succeed and hand back a
+    // box the workload cannot use. Either way the token is already gone by the
+    // time that shows up, and it shows up looking like a bug in the workload.
+    let absent =
+        paygress::capabilities::missing(&provider.capabilities, &params.required_capabilities);
+    if !absent.is_empty() {
+        anyhow::bail!(
+            "provider `{}` does not advertise {}; it advertises [{}]. \
+             Find one that does with `paygress-cli list --capability {}`",
+            provider.hostname,
+            absent.join(", "),
+            provider.capabilities.join(", "),
+            absent[0],
+        );
     }
 
     if let Some(min_iso) = params.isolation_level {
@@ -473,6 +498,7 @@ async fn execute_nostr_spawn(
             workload_id,
             volume_encryption,
             isolation_level,
+            required_capabilities: paygress::capabilities::parse_list(&args.requires),
         },
         relays,
         nostr_key,

@@ -1,5 +1,6 @@
 pub mod blossom;
 pub mod blossom_crypto;
+pub mod capabilities;
 pub mod cashu;
 pub mod client;
 pub mod compute;

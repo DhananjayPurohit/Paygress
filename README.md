@@ -178,6 +178,7 @@ paygress-cli adapter \
   --socket /run/paygress-adapter.sock \
   --provider SwiftGoldenOwl \
   --image paygress-ci \
+  --requires docker \
   --token-command "paygress-cli wallet mint --mint https://testnut.cashu.space --amount 60"
 ```
 
@@ -194,10 +195,22 @@ instead:
 | LXD | `images/ci-sandbox/build-lxd.sh` on the provider host | `--image paygress-ci` |
 | KVM | `images/ci-sandbox/build.sh`, then `kvm_base_image_path` in the provider config | no `--image` — the base image is the sandbox |
 
-Both bake docker and act in. The LXD route runs the job's daemon nested inside
-an unprivileged container (`security.nesting=true`, which the backend already
-sets) and needs no `/dev/kvm`, so it works on a VPS. The KVM route gives each
-job its own kernel and is the one to serve third-party PRs from.
+Both bake docker and act in.
+
+A provider serving CI must also advertise the **`docker`** capability. It is a
+real grant, not a label: on LXD the backend launches the workload privileged,
+because an unprivileged container runs a Docker daemon that cannot start
+anything — containerd cannot write `net.ipv4.ip_unprivileged_port_start` in the
+container's netns, and overlayfs refuses to mount. Privileged is host root for
+the renter, defensible only because the workload is a lease on a box that is
+destroyed when the money runs out. On KVM each job gets its own kernel and the
+capability costs nothing extra.
+
+`--requires docker` is checked against the provider's advertised capabilities
+**before its token is spent**, so a provider that cannot serve CI costs a
+search rather than a lease.
+
+    "capabilities": ["lxc", "vm", "docker"]
 
 ---
 
