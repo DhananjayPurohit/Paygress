@@ -71,6 +71,7 @@ impl PaygressClient {
             ssh_username: request.ssh_username,
             ssh_password: request.ssh_password,
             template_slug: None,
+            template_env: Default::default(),
             replication: None,
             primary_npub: None,
             workload_id: None,

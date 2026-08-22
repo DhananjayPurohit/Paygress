@@ -328,6 +328,25 @@ async fn build_spawn_plan(
         })
         .unwrap_or_default();
 
+    // Consumer configuration, filtered to what the template asked for. The
+    // whitelist is the whole security property: a template exists so the
+    // provider builds the workload from its own registry rather than from
+    // whatever a stranger sent, and a key that is not on the list is a key the
+    // template never promised to treat as data.
+    if let Some(t) = template.as_ref() {
+        for (key, value) in &request.template_env {
+            if t.consumer_env.contains(&key.as_str()) {
+                template_env.insert(key.clone(), value.clone());
+            } else {
+                warn!(
+                    "template `{}` does not accept `{}`; dropping it",
+                    t.name.slug(),
+                    key
+                );
+            }
+        }
+    }
+
     // Templates that bake in the paygress-exec server default EXEC_USER/PASS to
     // empty and return 503 until they're set. Overlaying the same credentials
     // the consumer sees in AccessDetails is what unlocks /exec, and keeps it to

@@ -231,6 +231,7 @@ mod tests {
             ssh_username: "u".to_string(),
             ssh_password: "p".to_string(),
             template_slug: None,
+            template_env: Default::default(),
             replication,
             primary_npub: primary_npub.map(|s| s.to_string()),
             workload_id: Some("wid-test".to_string()),

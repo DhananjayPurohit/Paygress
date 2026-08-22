@@ -268,6 +268,10 @@ pub struct NostrSpawnParams {
     /// sent, so a provider that cannot serve the workload costs a search
     /// rather than a lease.
     pub required_capabilities: Vec<String>,
+    /// Template configuration. The provider drops anything the template has
+    /// not whitelisted, so sending more than it expects is silently useless
+    /// rather than dangerous.
+    pub template_env: std::collections::HashMap<String, String>,
 }
 
 /// No stdout I/O — pure round-trip plus structured outcome.
@@ -358,6 +362,7 @@ pub async fn nostr_spawn_round_trip(
         ssh_username: params.ssh_user,
         ssh_password: params.ssh_pass,
         template_slug: params.template_slug,
+        template_env: params.template_env,
         replication: params.replication,
         primary_npub: params.primary_id,
         workload_id: params.workload_id,
@@ -499,6 +504,7 @@ async fn execute_nostr_spawn(
             volume_encryption,
             isolation_level,
             required_capabilities: paygress::capabilities::parse_list(&args.requires),
+            template_env: Default::default(),
         },
         relays,
         nostr_key,

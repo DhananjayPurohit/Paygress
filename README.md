@@ -209,6 +209,37 @@ Build the sandbox image on the provider host:
 
 The adapter host needs `sshpass`.
 
+#### No machine of your own
+
+`ci up` still needs somewhere always-on to run it. `ci deploy` removes that too
+— the coordinator becomes a paygress workload like any other, so the only
+things a repo owner holds are a Nostr key and some ecash:
+
+```bash
+paygress-cli ci deploy \
+  --repo npub1yourkey... \
+  --provider CheapHost \
+  --job-provider SwiftGoldenOwl \
+  --mint https://testnut.cashu.space \
+  --token "cashuA..."
+```
+
+The two halves are bought separately on purpose. A coordinator wants to be
+small, cheap and still running next week — it runs no containers, so it needs
+no `docker` capability and fits the basic tier. A job wants Docker, eight
+gigabytes, and to be destroyed an hour later. It deploys with warm-standby
+replication, because a coordinator that is down is a repo whose proposals
+silently go untested.
+
+Two things to weigh before hosting a coordinator on someone else's machine:
+
+- **The staged wallet.** It funds job sandboxes and reaches the host through
+  the spawn request, which the host decrypts. Stage a few runs' worth and top
+  up; the cost of a dishonest host is capped at the balance.
+- **Repo secrets.** A coordinator injects `${{ secrets.* }}` into
+  maintainer-triggered runs, so hosting one elsewhere hands those over. Fine
+  for a repo with none — most open-source ones — and not fine otherwise.
+
 #### Driving it yourself
 
 `paygress-cli adapter` is the lower half on its own — a sandbox provider for any
