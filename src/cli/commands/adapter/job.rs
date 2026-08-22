@@ -14,6 +14,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tracing::{debug, warn};
 
+use nostr_sdk::prelude::*;
+
 use crate::commands::spawn::{nostr_spawn_round_trip, NostrSpawnOutcome, NostrSpawnParams};
 use crate::util::generate_password;
 
@@ -81,9 +83,32 @@ async fn mint_token(command: &str) -> Result<String> {
     Ok(token)
 }
 
+/// A throwaway Nostr identity for one spawn.
+///
+/// The spawn round-trip sends a DM and then waits for the next DM from that
+/// provider -- there is no request id on the wire to match a reply against. Two
+/// spawns in flight on the same key therefore both accept whichever access
+/// details arrive first, so both drive the same sandbox while each keeps the
+/// password it generated. The one whose password was not used fails
+/// authentication until it times out, and the sandbox it paid for is never
+/// touched by anyone.
+///
+/// A fresh key per spawn makes the reply addressable to exactly one request,
+/// which is what the protocol cannot express yet. It costs nothing here: the
+/// adapter never manages a lease afterwards -- no top-up, no status -- so it
+/// has no use for a stable identity, and the workload ends up owned by a key
+/// that exists only for it.
+fn ephemeral_identity() -> Result<String> {
+    Keys::generate()
+        .secret_key()
+        .to_bech32()
+        .map_err(|e| anyhow!("could not generate a spawn identity: {}", e))
+}
+
 pub async fn provision(cfg: &SandboxConfig) -> Result<Sandbox> {
     let token = mint_token(&cfg.token_command).await?;
     let password = generate_password(SSH_PASSWORD_LEN);
+    let identity = ephemeral_identity()?;
 
     let params = NostrSpawnParams {
         tier: cfg.tier.clone(),
@@ -100,7 +125,7 @@ pub async fn provision(cfg: &SandboxConfig) -> Result<Sandbox> {
         &cfg.provider,
         params,
         cfg.relays.clone(),
-        cfg.nostr_key.clone(),
+        identity,
         cfg.spawn_timeout_secs,
     )
     .await?;
@@ -248,4 +273,21 @@ pub async fn start(sandbox: &Sandbox, script: &str) -> Result<Child> {
     drop(stdin);
 
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ephemeral_identity;
+    use std::collections::HashSet;
+
+    // The whole point is that no two spawns share a key: a shared key is what
+    // lets one spawn accept another's access details.
+    #[test]
+    fn every_spawn_gets_a_key_of_its_own() {
+        let keys: HashSet<String> = (0..64)
+            .map(|_| ephemeral_identity().expect("generate"))
+            .collect();
+        assert_eq!(keys.len(), 64);
+        assert!(keys.iter().all(|k| k.starts_with("nsec1")));
+    }
 }
