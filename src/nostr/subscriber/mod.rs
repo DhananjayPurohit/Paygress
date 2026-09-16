@@ -12,11 +12,16 @@ use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, error, info, warn};
 
 use super::kinds::*;
 use super::wire::*;
+
+/// Requests handled at once before new ones are shed. High enough that honest
+/// traffic never reaches it; low enough that a stuck handler cannot accumulate
+/// tasks without bound.
+const MAX_CONCURRENT_REQUESTS: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -141,6 +146,14 @@ impl NostrRelaySubscriber {
         let _ = self.client.subscribe(revocation_filter, None).await;
         info!("Subscribed to NIP-04 / NIP-17 messages and KIND_LEASE_REVOCATION events addressed to this provider");
 
+        // Each request runs on its own task. `handle_notifications` awaits the
+        // handler inline, so anything that never returns -- a mint that stops
+        // answering mid-redemption, a wedged backend -- used to stop the
+        // listener for good: no reply, no log, no exit, while the heartbeat
+        // loop kept advertising the provider as healthy.
+        let handler = Arc::new(handler);
+        let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
         self.client
             .handle_notifications(|notification| async {
                 let RelayPoolNotification::Event { event, .. } = notification else {
@@ -148,15 +161,33 @@ impl NostrRelaySubscriber {
                 };
                 if let Some(decoded) = self.decode_inbound_event(&event).await {
                     let message_type = decoded.message_type.clone();
-                    match handler(decoded).await {
-                        Ok(()) => info!("Processed {} event {}", message_type, event.id),
-                        Err(e) => {
-                            error!(
-                                "Failed to process {} event {}: {}",
-                                message_type, event.id, e
-                            )
+                    let event_id = event.id;
+
+                    // A backstop against unbounded task growth, not a queue:
+                    // waiting here for a permit would reintroduce the stall.
+                    // Dropping leaves the caller's token unredeemed, so they
+                    // time out with their money intact and can retry.
+                    let Ok(permit) = slots.clone().try_acquire_owned() else {
+                        warn!(
+                            "Dropping {} event {}: {} requests already in flight",
+                            message_type, event_id, MAX_CONCURRENT_REQUESTS
+                        );
+                        return Ok(false);
+                    };
+
+                    let handler = handler.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match handler(decoded).await {
+                            Ok(()) => info!("Processed {} event {}", message_type, event_id),
+                            Err(e) => {
+                                error!(
+                                    "Failed to process {} event {}: {}",
+                                    message_type, event_id, e
+                                )
+                            }
                         }
-                    }
+                    });
                 }
                 Ok(false) // keep listening
             })

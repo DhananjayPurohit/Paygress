@@ -13,7 +13,9 @@ use crate::provider::persistence::{persist_standby_slots, persist_workloads, Wor
 use crate::provider::standby::{compute_warm_standby_role, StandbySlot};
 use crate::templates::{TemplateDefinition, TemplateName};
 
-use super::{generate_password, redeem_or_respond, send_error, unix_now, Handled, HandlerDeps};
+use super::{
+    bounded, generate_password, redeem_or_respond, send_error, unix_now, Handled, HandlerDeps,
+};
 
 /// Everything derived from the request that the container needs, kept together
 /// so the standby and primary branches build it exactly once.
@@ -148,10 +150,12 @@ pub(crate) async fn handle_spawn_request(
         payment_msats, duration_secs, spec.name
     );
 
-    let id = match deps
-        .backend
-        .find_available_id(config.vmid_range_start, config.vmid_range_end)
-        .await
+    let id = match bounded(
+        "find_available_id",
+        deps.backend
+            .find_available_id(config.vmid_range_start, config.vmid_range_end),
+    )
+    .await
     {
         Ok(id) => id,
         Err(e) => {
@@ -194,7 +198,12 @@ pub(crate) async fn handle_spawn_request(
     }
 
     debug!("Calling backend.create_container for workload {}", id);
-    if let Err(e) = deps.backend.create_container(&plan.container_config).await {
+    if let Err(e) = bounded(
+        "create_container",
+        deps.backend.create_container(&plan.container_config),
+    )
+    .await
+    {
         let err_msg = format!("Backend failed to create workload: {}", e);
         error!("{}", err_msg);
         send_error(

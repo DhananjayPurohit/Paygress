@@ -11,9 +11,11 @@ pub(crate) use status::handle_status_request;
 pub(crate) use topup::handle_topup_request;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::sync::Mutex;
 use tracing::error;
 
@@ -117,6 +119,23 @@ fn unix_now() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs())
+}
+
+/// Generous enough for a cold image unpack, which is the slowest honest case.
+const BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Backends shell out to `lxc` or `qm`, or call a remote API; none of them is
+/// guaranteed to return. A stall becomes an ordinary error, so the caller keeps
+/// its single error arm and the request fails instead of hanging.
+async fn bounded<T>(what: &str, call: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(BACKEND_CALL_TIMEOUT, call).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "backend call `{}` did not return within {}s",
+            what,
+            BACKEND_CALL_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Redeem `token` and report the amount in msats. Refusal means no container is

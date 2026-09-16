@@ -170,6 +170,34 @@ async fn mint_network_error_propagates_as_network_error() {
     }
 }
 
+/// A mint that accepts the connection and then stops answering. Before
+/// `validate_and_redeem` bounded the call, this parked the provider's request
+/// handler forever and every later request went unanswered.
+struct HangingRedeemer;
+
+#[async_trait]
+impl MintRedeemer for HangingRedeemer {
+    async fn redeem(&self, _token_str: &str) -> Result<u64, RedeemError> {
+        // Far beyond the bound; virtual time makes it instant.
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        Ok(100_000)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_mint_times_out_instead_of_hanging() {
+    let token = make_token(WHITELISTED_MINT, 100, "secret-mint-hang");
+
+    let err = validate_and_redeem(&HangingRedeemer, &whitelist(), &token)
+        .await
+        .expect_err("a mint that never answers must not hang the caller");
+
+    match err {
+        RedeemError::Network(msg) => assert!(msg.contains("did not answer")),
+        other => panic!("expected Network, got {:?}", other),
+    }
+}
+
 #[tokio::test]
 async fn malformed_token_is_rejected_as_invalid_token() {
     let redeemer = MockRedeemer::new();
