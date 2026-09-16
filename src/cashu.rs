@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cdk::cdk_database::{Error as DbError, WalletDatabase};
@@ -19,6 +20,11 @@ use cdk::Amount;
 use tokio::sync::Mutex;
 
 const MSAT_PER_SAT: u64 = 1000;
+
+/// Neither cdk's HTTP client nor reqwest sets one, so without this a mint that
+/// accepts the connection and then goes quiet parks the caller forever. This is
+/// the provider's first network call on a spawn.
+const REDEEM_TIMEOUT: Duration = Duration::from_secs(60);
 
 const REDB_MAGIC: &[u8] = b"redb\x1a\x0a\xa9\x0d\x0a";
 
@@ -111,7 +117,13 @@ pub async fn validate_and_redeem<R: MintRedeemer + ?Sized>(
         });
     }
 
-    redeemer.redeem(token_str).await
+    match tokio::time::timeout(REDEEM_TIMEOUT, redeemer.redeem(token_str)).await {
+        Ok(result) => result,
+        Err(_) => Err(RedeemError::Network(format!(
+            "mint did not answer within {}s",
+            REDEEM_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// One lazily-created `cdk` wallet per `(mint_url, unit)`, all sharing a single
