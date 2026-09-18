@@ -85,8 +85,10 @@ pub struct AdapterArgs {
     #[arg(long, default_value = "root")]
     pub ssh_user: String,
 
-    /// Seconds to wait for the provider's spawn reply
-    #[arg(long, default_value_t = 120)]
+    /// Seconds to wait for the provider's spawn reply. A concurrent spawn costs
+    /// an LXD provider 80-95s, so 120 raced it: the adapter gave up seconds
+    /// before the workload was handed over, having already paid for the lease.
+    #[arg(long, default_value_t = 180)]
     pub spawn_timeout_secs: u64,
 
     /// Seconds to wait for the sandbox to accept SSH
