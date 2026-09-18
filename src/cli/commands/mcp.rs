@@ -428,6 +428,12 @@ impl PaygressMcpServer {
                 "ssh_port": s.ssh_port,
                 "ssh_username": s.ssh_username,
             }),
+            NostrStatusOutcome::ProviderError(err) => serde_json::json!({
+                "status": "provider_error",
+                "error_type": err.error_type,
+                "message": err.message,
+                "details": err.details,
+            }),
             NostrStatusOutcome::UnparseableResponse(content) => serde_json::json!({
                 "status": "unknown_response",
                 "content": content,
