@@ -174,6 +174,25 @@ async fn spawn_pod(
         return payment_required_response();
     };
 
+    // Before the token is touched: see the same check on the Nostr path.
+    if let Ok(status) = state.backend.get_node_status().await {
+        if !status.has_disk_headroom(state.config.min_free_disk_gb) {
+            let free_gb = status.free_disk_bytes().unwrap_or(0) / (1024 * 1024 * 1024);
+            error!("[HTTP] spawn: low on disk ({} GB free)", free_gb);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "no_capacity",
+                    "message": format!(
+                        "Provider is low on disk: {} GB free, {} GB required",
+                        free_gb, state.config.min_free_disk_gb
+                    )
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let payment_msats = match decode_payment_msats(&cashu_token, "spawn").await {
         Ok(v) => v,
         Err(resp) => return resp,

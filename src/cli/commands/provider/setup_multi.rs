@@ -229,6 +229,8 @@ fn build_multi_config(
         lightning_address: args.lightning_address.clone(),
         kvm_base_image_path: None,
         kvm_base_image_url: None,
+        // Matches the serde default a config without the field parses to.
+        min_free_disk_gb: 10,
     }
 }
 

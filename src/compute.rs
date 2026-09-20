@@ -45,6 +45,27 @@ pub struct NodeStatus {
     pub disk_total: u64,
 }
 
+impl NodeStatus {
+    /// `None` when the backend does not measure disk -- Docker, KVM and Proxmox
+    /// report zeroes rather than a reading, and treating that as "no space" would
+    /// refuse every spawn they serve.
+    pub fn free_disk_bytes(&self) -> Option<u64> {
+        (self.disk_total > 0).then(|| self.disk_total.saturating_sub(self.disk_used))
+    }
+
+    /// Whether a spawn has room. Unknown disk is room enough: the alternative is
+    /// a check that takes three of four backends offline the day it ships.
+    pub fn has_disk_headroom(&self, min_free_gb: u64) -> bool {
+        if min_free_gb == 0 {
+            return true;
+        }
+        match self.free_disk_bytes() {
+            Some(free) => free >= min_free_gb.saturating_mul(1024 * 1024 * 1024),
+            None => true,
+        }
+    }
+}
+
 /// One published port mapping. Docker-only; LXD/Proxmox expose just SSH via
 /// `ContainerConfig::host_port`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +142,49 @@ pub enum ContainerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_with_disk(total: u64, used: u64) -> NodeStatus {
+        NodeStatus {
+            cpu_usage: 0.0,
+            memory_used: 0,
+            memory_total: 0,
+            disk_used: used,
+            disk_total: total,
+        }
+    }
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn a_full_disk_has_no_headroom() {
+        // The Sep 18 shape: 193G total, 437M free. The provider took payment and
+        // tried to build a container anyway.
+        let status = status_with_disk(193 * GB, 193 * GB - (437 * 1024 * 1024));
+        assert!(!status.has_disk_headroom(10));
+    }
+
+    #[test]
+    fn a_healthy_disk_has_headroom() {
+        assert!(status_with_disk(193 * GB, 67 * GB).has_disk_headroom(10));
+    }
+
+    #[test]
+    fn a_backend_that_does_not_measure_disk_is_not_refused() {
+        // Docker, KVM and Proxmox report zeroes.
+        assert!(status_with_disk(0, 0).has_disk_headroom(10));
+        assert_eq!(status_with_disk(0, 0).free_disk_bytes(), None);
+    }
+
+    #[test]
+    fn zero_threshold_disables_the_check() {
+        assert!(status_with_disk(193 * GB, 193 * GB).has_disk_headroom(0));
+    }
+
+    #[test]
+    fn used_over_total_does_not_underflow() {
+        assert_eq!(status_with_disk(10 * GB, 12 * GB).free_disk_bytes(), Some(0));
+        assert!(!status_with_disk(10 * GB, 12 * GB).has_disk_headroom(1));
+    }
 
     #[test]
     fn container_name_round_trips() {

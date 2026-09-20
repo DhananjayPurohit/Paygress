@@ -190,6 +190,8 @@ pub(super) async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()>
         http_bind_addr: None,
         kvm_base_image_path: args.kvm_base_image_path,
         kvm_base_image_url: args.kvm_base_image_url,
+        // Matches the serde default a config without the field parses to.
+        min_free_disk_gb: 10,
     };
 
     save_config(CONFIG_PATH, &config)?;
