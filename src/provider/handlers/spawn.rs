@@ -108,7 +108,14 @@ pub(crate) async fn handle_spawn_request(
                 config.min_free_disk_gb
             );
             warn!("{}", err_msg);
-            send_error(deps, requester_pubkey, message_type, "no_capacity", &err_msg).await?;
+            send_error(
+                deps,
+                requester_pubkey,
+                message_type,
+                "no_capacity",
+                &err_msg,
+            )
+            .await?;
             return Ok(());
         }
     }

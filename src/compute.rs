@@ -182,7 +182,10 @@ mod tests {
 
     #[test]
     fn used_over_total_does_not_underflow() {
-        assert_eq!(status_with_disk(10 * GB, 12 * GB).free_disk_bytes(), Some(0));
+        assert_eq!(
+            status_with_disk(10 * GB, 12 * GB).free_disk_bytes(),
+            Some(0)
+        );
         assert!(!status_with_disk(10 * GB, 12 * GB).has_disk_headroom(1));
     }
 
