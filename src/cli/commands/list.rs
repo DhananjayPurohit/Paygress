@@ -23,6 +23,12 @@ pub struct ListArgs {
     #[arg(long)]
     pub capability: Option<String>,
 
+    /// Only show providers advertising this sandbox image, e.g. `paygress-ci`.
+    /// Providers that advertise no images at all are still listed: silence
+    /// predates the field rather than denying it.
+    #[arg(long)]
+    pub image: Option<String>,
+
     /// Minimum isolation tier (stricter tiers also match)
     #[arg(long, value_parser = parse_isolation_level)]
     pub isolation_level: Option<paygress::nostr::IsolationLevel>,
@@ -80,6 +86,7 @@ async fn execute_nostr_list(args: ListArgs, verbose: bool) -> Result<()> {
 
     let filter = ProviderFilter {
         capability: args.capability,
+        image: args.image,
         min_uptime: None,
         min_memory_mb: None,
         min_cpu: None,

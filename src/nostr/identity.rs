@@ -72,6 +72,7 @@ mod offer_authenticity_tests {
             hostname: "attacker-chosen.example".to_string(),
             location: None,
             capabilities: vec![],
+            images: vec![],
             specs: vec![],
             whitelisted_mints: vec![],
             uptime_percent: 100.0,

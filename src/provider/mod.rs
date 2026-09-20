@@ -331,6 +331,7 @@ impl ProviderService {
             hostname: self.config.provider_name.clone(),
             location: self.config.provider_location.clone(),
             capabilities: self.config.capabilities.clone(),
+            images: self.config.available_images.clone(),
             specs: self.config.specs.clone(),
             whitelisted_mints: self.config.whitelisted_mints.clone(),
             uptime_percent: 100.0,
