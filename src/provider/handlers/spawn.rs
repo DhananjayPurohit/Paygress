@@ -98,6 +98,28 @@ pub(crate) async fn handle_spawn_request(
         return Ok(());
     }
 
+    // Also before redemption: a full host fails during provisioning with the
+    // token already spent, and the containers it cannot sweep keep it full.
+    if let Ok(status) = deps.backend.get_node_status().await {
+        if !status.has_disk_headroom(config.min_free_disk_gb) {
+            let err_msg = format!(
+                "provider is low on disk: {} GB free, {} GB required",
+                status.free_disk_bytes().unwrap_or(0) / (1024 * 1024 * 1024),
+                config.min_free_disk_gb
+            );
+            warn!("{}", err_msg);
+            send_error(
+                deps,
+                requester_pubkey,
+                message_type,
+                "no_capacity",
+                &err_msg,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let payment_msats = match redeem_or_respond(
         deps,
         requester_pubkey,

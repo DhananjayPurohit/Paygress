@@ -97,6 +97,14 @@ pub struct ProviderConfig {
     /// missing.
     #[serde(default)]
     pub kvm_base_image_url: Option<String>,
+
+    /// Refuse a spawn when the host has less than this much disk free, before
+    /// the token is redeemed. A provider that accepts work it cannot store takes
+    /// payment and then fails during provisioning -- or worse, succeeds and dies
+    /// later with leases it can no longer sweep. `0` disables the check, and so
+    /// does a backend that does not measure disk.
+    #[serde(default = "default_min_free_disk_gb")]
+    pub min_free_disk_gb: u64,
 }
 
 impl ProviderConfig {
@@ -121,6 +129,12 @@ fn default_standby_state_path() -> String {
 
 fn default_workload_state_path() -> String {
     "./paygress-workloads.json".to_string()
+}
+
+/// Room for the act runner image (~2.3 GB) plus a job's build output, with
+/// enough left that the cleanup sweep can still run.
+fn default_min_free_disk_gb() -> u64 {
+    10
 }
 
 impl Default for ProviderConfig {
@@ -168,6 +182,7 @@ impl Default for ProviderConfig {
             lightning_address: None,
             kvm_base_image_path: None,
             kvm_base_image_url: None,
+            min_free_disk_gb: default_min_free_disk_gb(),
         }
     }
 }
@@ -184,4 +199,76 @@ pub fn save_config(path: &str, config: &ProviderConfig) -> Result<()> {
     std::fs::write(path, content)
         .with_context(|| format!("Failed to write config file: {}", path))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod headroom_config_tests {
+    use super::*;
+
+    /// A provider config written before this field existed must keep loading --
+    /// the live CI provider's is one of them, and a parse failure there takes
+    /// the provider down rather than merely skipping the check.
+    #[test]
+    fn config_without_the_field_defaults_to_ten_gb() {
+        let json = r#"{
+            "backend_type": "LXD",
+            "proxmox_url": "https://127.0.0.1:8006/api2/json",
+            "proxmox_token_id": "unused",
+            "proxmox_token_secret": "unused",
+            "proxmox_node": "pve",
+            "proxmox_accept_invalid_certs": false,
+            "proxmox_storage": "default",
+            "proxmox_template": "ubuntu:24.04",
+            "proxmox_bridge": "lxdbr0",
+            "vmid_range_start": 2000,
+            "vmid_range_end": 2999,
+            "nostr_private_key": "nsec1example",
+            "nostr_relays": ["wss://nos.lol"],
+            "provider_name": "CIRunner",
+            "provider_location": "VPS",
+            "public_ip": "203.0.113.10",
+            "capabilities": ["lxc", "docker"],
+            "specs": [],
+            "whitelisted_mints": ["https://testnut.cashu.space"],
+            "heartbeat_interval_secs": 60,
+            "minimum_duration_seconds": 60,
+            "tunnel_enabled": false
+        }"#;
+
+        let config: ProviderConfig =
+            serde_json::from_str(json).expect("a config predating the field must still load");
+        assert_eq!(config.min_free_disk_gb, 10);
+    }
+
+    #[test]
+    fn an_explicit_zero_survives_the_round_trip() {
+        let json = r#"{
+            "backend_type": "LXD",
+            "proxmox_url": "https://127.0.0.1:8006/api2/json",
+            "proxmox_token_id": "unused",
+            "proxmox_token_secret": "unused",
+            "proxmox_node": "pve",
+            "proxmox_accept_invalid_certs": false,
+            "proxmox_storage": "default",
+            "proxmox_template": "ubuntu:24.04",
+            "proxmox_bridge": "lxdbr0",
+            "vmid_range_start": 2000,
+            "vmid_range_end": 2999,
+            "nostr_private_key": "nsec1example",
+            "nostr_relays": ["wss://nos.lol"],
+            "provider_name": "CIRunner",
+            "provider_location": "VPS",
+            "public_ip": "203.0.113.10",
+            "capabilities": ["lxc"],
+            "specs": [],
+            "whitelisted_mints": ["https://testnut.cashu.space"],
+            "heartbeat_interval_secs": 60,
+            "minimum_duration_seconds": 60,
+            "tunnel_enabled": false,
+            "min_free_disk_gb": 0
+        }"#;
+
+        let config: ProviderConfig = serde_json::from_str(json).expect("explicit zero must load");
+        assert_eq!(config.min_free_disk_gb, 0);
+    }
 }
