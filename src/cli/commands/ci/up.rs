@@ -159,7 +159,7 @@ fn adapter_args(args: &UpArgs) -> AdapterArgs {
         requires: REQUIRED_CAPABILITY.to_string(),
         max_concurrent_jobs: args.max_concurrent_jobs,
         ssh_user: "root".to_string(),
-        spawn_timeout_secs: 120,
+        spawn_timeout_secs: 180,
         ssh_ready_timeout_secs: 300,
         nostr_key: args.nostr_key.clone(),
         relays: args.relays.clone(),

@@ -73,9 +73,28 @@ async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> R
 #[derive(Debug, Clone)]
 pub enum NostrStatusOutcome {
     Success(paygress::nostr::StatusResponseContent),
+    /// Provider refused, and said why: an unknown workload, a lease that has
+    /// expired, a caller who does not own it.
+    ProviderError(paygress::nostr::ErrorResponseContent),
     /// Provider replied, but not with a status response we recognize.
     UnparseableResponse(String),
     Timeout,
+}
+
+/// Sort a provider's reply into an outcome. An error reply is a normal answer
+/// to a status request -- ask about a workload that does not exist and this is
+/// what comes back -- so it is tried before giving up on the body, the way the
+/// spawn and topup round trips already do.
+fn classify_status_response(content: String) -> NostrStatusOutcome {
+    use paygress::nostr::{ErrorResponseContent, StatusResponseContent};
+
+    if let Ok(status) = serde_json::from_str::<StatusResponseContent>(&content) {
+        NostrStatusOutcome::Success(status)
+    } else if let Ok(err) = serde_json::from_str::<ErrorResponseContent>(&content) {
+        NostrStatusOutcome::ProviderError(err)
+    } else {
+        NostrStatusOutcome::UnparseableResponse(content)
+    }
 }
 
 /// No stdout I/O — pure round-trip plus structured outcome.
@@ -87,7 +106,7 @@ pub async fn nostr_status_round_trip(
     timeout_secs: u64,
 ) -> Result<NostrStatusOutcome> {
     use paygress::discovery::DiscoveryClient;
-    use paygress::nostr::{StatusRequestContent, StatusResponseContent};
+    use paygress::nostr::StatusRequestContent;
 
     let client = DiscoveryClient::new_with_key(relays, nostr_key).await?;
 
@@ -106,10 +125,7 @@ pub async fn nostr_status_round_trip(
         .wait_for_decrypted_message(provider_npub, timeout_secs)
         .await
     {
-        Ok(response) => match serde_json::from_str::<StatusResponseContent>(&response.content) {
-            Ok(s) => Ok(NostrStatusOutcome::Success(s)),
-            Err(_) => Ok(NostrStatusOutcome::UnparseableResponse(response.content)),
-        },
+        Ok(response) => Ok(classify_status_response(response.content)),
         Err(_) => Ok(NostrStatusOutcome::Timeout),
     }
 }
@@ -145,6 +161,16 @@ async fn execute_nostr_status(
                 Some(&status_resp.expires_at),
                 Some(status_resp.time_remaining_seconds),
             );
+            Ok(())
+        }
+        NostrStatusOutcome::ProviderError(err) => {
+            println!("{}", "Status unavailable".red().bold());
+            println!("  Type:    {}", err.error_type);
+            println!("  Message: {}", err.message);
+            if let Some(details) = err.details.as_deref() {
+                println!("  Details: {}", details);
+            }
+            println!();
             Ok(())
         }
         NostrStatusOutcome::UnparseableResponse(body) => Err(anyhow::anyhow!(
@@ -223,5 +249,45 @@ fn format_time_left(remaining: u64) -> String {
         time_str.yellow().to_string()
     } else {
         time_str.green().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim from a live provider: asking about a workload it does not have.
+    /// This used to surface as "unrecognized status response".
+    const NOT_FOUND: &str = r#"{"error_type":"not_found","message":"Workload 9999 not found or you don't have access","details":null}"#;
+
+    #[test]
+    fn provider_error_is_reported_as_an_error_not_an_unparseable_body() {
+        match classify_status_response(NOT_FOUND.to_string()) {
+            NostrStatusOutcome::ProviderError(err) => {
+                assert_eq!(err.error_type, "not_found");
+                assert!(err.message.contains("9999"));
+            }
+            other => panic!("expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn status_response_still_wins_over_the_error_shape() {
+        let body = r#"{"pod_id":"2000","status":"Running","expires_at":"2026-09-17T13:00:00Z",
+            "time_remaining_seconds":600,"cpu_millicores":4000,"memory_mb":8192,
+            "ssh_host":"72.61.173.244","ssh_port":2000,"ssh_username":"root"}"#;
+
+        match classify_status_response(body.to_string()) {
+            NostrStatusOutcome::Success(s) => assert_eq!(s.pod_id, "2000"),
+            other => panic!("expected Success, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_body_of_neither_shape_stays_unparseable() {
+        match classify_status_response("{\"hello\":\"world\"}".to_string()) {
+            NostrStatusOutcome::UnparseableResponse(body) => assert!(body.contains("hello")),
+            other => panic!("expected UnparseableResponse, got {:?}", other),
+        }
     }
 }
