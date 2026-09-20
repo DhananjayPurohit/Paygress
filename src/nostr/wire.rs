@@ -278,6 +278,16 @@ pub struct ProviderOfferContent {
     pub location: Option<String>,
     /// e.g. `["lxc", "vm"]`.
     pub capabilities: Vec<String>,
+    /// Sandbox images this provider will actually serve, named the way a
+    /// spawn asks for them: LXD aliases, Docker references. Operator-declared
+    /// rather than scanned, because having an image on the box is not the same
+    /// as offering it, and KVM has no per-workload image at all.
+    ///
+    /// Empty means "did not say", not "serves nothing": a consumer must not
+    /// exclude a provider for silence, or every provider predating this field
+    /// disappears from discovery.
+    #[serde(default)]
+    pub images: Vec<String>,
     pub specs: Vec<PodSpec>,
     pub whitelisted_mints: Vec<String>,
     pub uptime_percent: f32,
@@ -349,6 +359,9 @@ pub struct ProviderInfo {
     pub hostname: String,
     pub location: Option<String>,
     pub capabilities: Vec<String>,
+    /// Images the provider advertises. Empty means it did not say.
+    #[serde(default)]
+    pub images: Vec<String>,
     pub specs: Vec<PodSpec>,
     pub whitelisted_mints: Vec<String>,
     pub uptime_percent: f32,
@@ -361,6 +374,10 @@ pub struct ProviderInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ProviderFilter {
     pub capability: Option<String>,
+    /// Sandbox image the job needs. A provider advertising images without this
+    /// one is skipped; one advertising none is kept, since silence predates the
+    /// field rather than denying it.
+    pub image: Option<String>,
     pub min_uptime: Option<f32>,
     pub min_memory_mb: Option<u64>,
     pub min_cpu: Option<u64>,

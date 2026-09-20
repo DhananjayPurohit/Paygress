@@ -73,6 +73,7 @@ impl DiscoveryClient {
                 hostname: offer.hostname,
                 location: offer.location,
                 capabilities: offer.capabilities,
+                images: offer.images,
                 specs: offer.specs,
                 whitelisted_mints: offer.whitelisted_mints,
                 uptime_percent: offer.uptime_percent,
@@ -380,6 +381,19 @@ fn matches_filter(p: &ProviderInfo, f: &ProviderFilter) -> bool {
             return false;
         }
     }
+    if let Some(ref image) = f.image {
+        // Silence is not a denial: a provider that advertises no images at all
+        // predates the field, and excluding it would empty discovery of every
+        // provider running an older build.
+        if !p.images.is_empty()
+            && !p
+                .images
+                .iter()
+                .any(|i| i.trim().eq_ignore_ascii_case(image.trim()))
+        {
+            return false;
+        }
+    }
     if f.min_uptime.is_some_and(|min| p.uptime_percent < min) {
         return false;
     }
@@ -534,6 +548,77 @@ mod tests {
         assert!(result.contains("+1"), "missing overflow suffix");
     }
 
+    fn provider_advertising(images: &[&str]) -> ProviderInfo {
+        ProviderInfo {
+            npub: "npub123".to_string(),
+            hostname: "Test Provider".to_string(),
+            location: None,
+            capabilities: vec!["lxc".to_string(), "docker".to_string()],
+            images: images.iter().map(|i| i.to_string()).collect(),
+            specs: vec![],
+            whitelisted_mints: vec![],
+            uptime_percent: 99.0,
+            total_jobs_completed: 0,
+            last_seen: 0,
+            is_online: true,
+            isolation_level: crate::nostr::IsolationLevel::SharedKernel,
+        }
+    }
+
+    fn wants_image(image: &str) -> ProviderFilter {
+        ProviderFilter {
+            image: Some(image.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn image_filter_matches_a_provider_that_advertises_it() {
+        let p = provider_advertising(&["paygress-ci", "ubuntu:24.04"]);
+        assert!(matches_filter(&p, &wants_image("paygress-ci")));
+    }
+
+    #[test]
+    fn image_filter_skips_a_provider_serving_other_images() {
+        let p = provider_advertising(&["ubuntu:24.04"]);
+        assert!(!matches_filter(&p, &wants_image("paygress-ci")));
+    }
+
+    /// The property that keeps the network usable while it upgrades: every
+    /// provider running a build from before this field advertises nothing, and
+    /// excluding them would empty discovery rather than narrow it.
+    #[test]
+    fn image_filter_keeps_a_provider_that_advertises_nothing() {
+        let p = provider_advertising(&[]);
+        assert!(matches_filter(&p, &wants_image("paygress-ci")));
+    }
+
+    #[test]
+    fn image_match_ignores_case_and_surrounding_space() {
+        let p = provider_advertising(&[" Paygress-CI "]);
+        assert!(matches_filter(&p, &wants_image("paygress-ci")));
+    }
+
+    /// Offers already sitting on relays have no `images` key at all.
+    #[test]
+    fn an_offer_without_images_still_deserializes() {
+        let json = r#"{
+            "provider_npub": "abc",
+            "hostname": "Old Provider",
+            "location": null,
+            "capabilities": ["lxc"],
+            "specs": [],
+            "whitelisted_mints": [],
+            "uptime_percent": 100.0,
+            "total_jobs_completed": 0,
+            "api_endpoint": null
+        }"#;
+
+        let offer: crate::nostr::ProviderOfferContent =
+            serde_json::from_str(json).expect("pre-images offers must still load");
+        assert!(offer.images.is_empty());
+    }
+
     #[test]
     fn test_format_provider_table() {
         let providers = vec![ProviderInfo {
@@ -541,6 +626,7 @@ mod tests {
             hostname: "Test Provider".to_string(),
             location: Some("US-East".to_string()),
             capabilities: vec!["lxc".to_string()],
+            images: vec![],
             specs: vec![PodSpec {
                 id: "basic".to_string(),
                 name: "Basic".to_string(),

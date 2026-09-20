@@ -212,6 +212,7 @@ fn build_multi_config(
         provider_name: provider_name.clone(),
         provider_location: None,
         capabilities: vec!["lxc".to_string(), "vm".to_string()],
+        available_images: Vec::new(),
         specs,
         whitelisted_mints: mints,
         heartbeat_interval_secs: 60,

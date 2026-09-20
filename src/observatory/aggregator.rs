@@ -149,6 +149,7 @@ mod tests {
             hostname: hostname.to_string(),
             location: location.map(|s| s.to_string()),
             capabilities: vec!["lxc".to_string()],
+            images: vec![],
             specs: vec![],
             whitelisted_mints: vec!["https://mint.example".to_string()],
             uptime_percent: 99.0,

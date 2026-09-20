@@ -45,6 +45,17 @@ pub struct ProviderConfig {
     pub public_ip: String,
     pub capabilities: Vec<String>,
 
+    /// Sandbox images this provider serves, advertised in its offer so a
+    /// consumer can tell before paying whether the image its job needs is
+    /// here. A CI provider lists the alias `images/ci-sandbox/build-lxd.sh`
+    /// publishes, normally `paygress-ci`.
+    ///
+    /// Empty advertises nothing and refuses nothing: discovery reads silence
+    /// as "unknown", so an operator who has not declared images is still
+    /// reachable by consumers that name one explicitly.
+    #[serde(default)]
+    pub available_images: Vec<String>,
+
     pub specs: Vec<PodSpec>,
     pub whitelisted_mints: Vec<String>,
 
@@ -160,6 +171,7 @@ impl Default for ProviderConfig {
             provider_location: None,
             public_ip: "127.0.0.1".to_string(),
             capabilities: vec!["lxc".to_string()],
+            available_images: Vec::new(),
             specs: vec![PodSpec {
                 id: "basic".to_string(),
                 name: "Basic".to_string(),

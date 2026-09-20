@@ -12,6 +12,7 @@ fn sample_offer() -> ProviderOfferContent {
         hostname: "host.example".to_string(),
         location: Some("BER".to_string()),
         capabilities: vec!["lxc".to_string()],
+        images: vec!["paygress-ci".to_string()],
         specs: vec![PodSpec {
             id: "basic".to_string(),
             name: "Basic".to_string(),
@@ -52,6 +53,9 @@ fn offer_v1_roundtrip() {
     assert_eq!(back.provider_npub, offer.provider_npub);
     assert_eq!(back.version, SCHEMA_VERSION);
     assert_eq!(back.isolation_level, IsolationLevel::SharedKernel);
+    // Discovery picks a provider by the image its job needs, so the advertised
+    // list has to survive the wire intact.
+    assert_eq!(back.images, vec!["paygress-ci".to_string()]);
 }
 
 #[test]
@@ -81,6 +85,10 @@ fn offer_v0_payload_defaults_to_v1_schema() {
     let parsed: ProviderOfferContent = serde_json::from_value(v0_json).expect("v0 must parse");
     assert_eq!(parsed.version, SCHEMA_VERSION);
     assert_eq!(parsed.isolation_level, IsolationLevel::SharedKernel);
+    // A publisher predating the field advertises no images. Consumers must read
+    // that as "did not say" rather than "serves nothing", or every provider
+    // running an older build drops out of discovery the day this ships.
+    assert!(parsed.images.is_empty());
 }
 
 #[test]

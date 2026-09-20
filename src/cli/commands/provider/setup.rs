@@ -175,6 +175,7 @@ pub(super) async fn execute_setup(args: SetupArgs, _verbose: bool) -> Result<()>
         provider_name: args.name,
         provider_location: args.location,
         capabilities: vec!["lxc".to_string(), "vm".to_string()],
+        available_images: Vec::new(),
         specs,
         whitelisted_mints: split_csv(&args.mints),
         heartbeat_interval_secs: 60,

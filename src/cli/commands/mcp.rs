@@ -257,6 +257,7 @@ impl PaygressMcpServer {
         let filter = if params.capability.is_some() || params.min_uptime.is_some() {
             Some(ProviderFilter {
                 capability: params.capability,
+                image: None,
                 min_uptime: params.min_uptime,
                 min_memory_mb: None,
                 min_cpu: None,
