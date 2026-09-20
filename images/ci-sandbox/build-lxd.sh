@@ -30,8 +30,12 @@ ALIAS="paygress-ci"
 BASE_IMAGE="ubuntu:24.04"
 # ngit-ci requires act >= 0.2.86.
 ACT_VERSION="v0.2.89"
-# ngit-ci's default act platform mapping is the catthehacker medium images.
-SEED_IMAGE="catthehacker/ubuntu:act-24.04"
+# Must match ngit-ci's DEFAULT_ACT_PLATFORMS entry for the `runs-on` the repo
+# uses, registry prefix included: `ubuntu-latest` resolves to the image below,
+# while a workflow on `ubuntu-24.04` wants ghcr.io/catthehacker/ubuntu:act-24.04.
+# Docker treats `catthehacker/ubuntu:act-24.04` and the ghcr.io-prefixed name as
+# unrelated images, so a near-miss here seeds nothing act will ever look for.
+SEED_IMAGE="ghcr.io/catthehacker/ubuntu:act-latest"
 BUILDER="paygress-ci-build"
 
 usage() {
@@ -89,6 +93,18 @@ lxc exec "$BUILDER" -- bash -eu -c '
     act --version
     git --version
 '
+
+# A seed under the wrong name is worse than no seed: the build looks like it
+# worked, and every job silently re-pulls ~2 GB into a sandbox it is paying for
+# by the second -- which is also what fills the provider's disk.
+if [ -n "$SEED_IMAGE" ]; then
+    echo "==> verifying $SEED_IMAGE is stored under the name act asks for"
+    lxc exec "$BUILDER" -- bash -eu -c "
+        systemctl start docker
+        for i in \$(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker image inspect '$SEED_IMAGE' >/dev/null
+    " || { echo "seed $SEED_IMAGE is missing from the built image" >&2; exit 1; }
+fi
 
 echo "==> cleaning instance identity"
 lxc exec "$BUILDER" -- bash -eu -c '
